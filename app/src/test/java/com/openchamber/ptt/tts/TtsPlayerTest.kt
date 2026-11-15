@@ -1,0 +1,380 @@
+package com.openchamber.ptt.tts
+
+import com.openchamber.ptt.network.OpenChamberHttp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runTest
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okio.Buffer
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import java.util.concurrent.atomic.AtomicBoolean
+
+class TtsPlayerTest {
+    private lateinit var server: MockWebServer
+
+    @Before
+    fun setUp() {
+        server = MockWebServer()
+        server.start()
+    }
+
+    @After
+    fun tearDown() {
+        server.shutdown()
+    }
+
+    @Test
+    fun `speak sanitizes text synthesizes WAV and plays PCM via track player`() = runTest {
+        val pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04)
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = pcm,
+        )
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Sanitized text."}"""))
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+
+        var playedWav: WavAudio? = null
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playedWav = wav
+            }
+
+            override fun stopNow() = Unit
+        }
+        val spokenBySystemTts = mutableListOf<String>()
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+                spokenBySystemTts += text
+            }
+
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        player.speak(baseUrl, "Markdown **text**")
+
+        assertEquals(24000, playedWav?.sampleRate)
+        assertArrayEquals(pcm, playedWav?.pcmData)
+        assertTrue(spokenBySystemTts.isEmpty())
+        assertFalse(player.isSpeaking)
+    }
+
+    @Test
+    fun `speak falls back to Android TextToSpeech when all network TTS endpoints fail`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Spoken fallback."}"""))
+        server.enqueue(MockResponse().setResponseCode(503))
+        server.enqueue(MockResponse().setResponseCode(503))
+
+        val spokenBySystemTts = mutableListOf<String>()
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+                spokenBySystemTts += text
+            }
+
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        player.speak(baseUrl, "Original text")
+
+        assertEquals(listOf("Spoken fallback."), spokenBySystemTts)
+    }
+
+    @Test
+    fun `stop immediately cancels active PCM playback without falling back to system TTS`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(1, 2, 3, 4),
+        )
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Long response."}"""))
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+
+        val playbackStarted = CompletableDeferred<Unit>()
+        val playbackGate = CompletableDeferred<Unit>()
+        val trackStopped = AtomicBoolean(false)
+        val systemTtsStopped = AtomicBoolean(false)
+        val systemTtsCalled = AtomicBoolean(false)
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playbackStarted.complete(Unit)
+                playbackGate.await()
+            }
+
+            override fun stopNow() {
+                trackStopped.set(true)
+                playbackGate.cancel(CancellationException("Stopped"))
+            }
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+                systemTtsCalled.set(true)
+            }
+
+            override fun stop() {
+                systemTtsStopped.set(true)
+            }
+
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        val job = launch {
+            player.speak(baseUrl, "Long response.")
+        }
+        playbackStarted.await()
+        assertTrue(player.isSpeaking)
+
+        player.stop()
+        job.join()
+
+        assertTrue(trackStopped.get())
+        assertTrue(systemTtsStopped.get())
+        assertFalse(systemTtsCalled.get())
+        assertFalse(player.isSpeaking)
+    }
+
+    @Test
+    fun `respects configured TTS engine enablement and fallback order`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x05, 0x06, 0x07, 0x08),
+        )
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Ordered audio."}"""))
+        // 1st enabled engine is LOCAL_KOKORO -> fails with 503
+        server.enqueue(MockResponse().setResponseCode(503))
+        // 2nd enabled engine is OPENAI_CLOUD (GEMINI_BRIDGE is disabled!) -> succeeds without baseURL
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+
+        var playedWav: WavAudio? = null
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playedWav = wav
+            }
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val customPipeline = listOf(
+            TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = false),
+            TtsEngineOption(TtsEngine.LOCAL_KOKORO, enabled = true),
+            TtsEngineOption(TtsEngine.OPENAI_CLOUD, enabled = true),
+            TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = false),
+        )
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { customPipeline },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        player.speak(baseUrl, "Ordered audio.")
+
+        assertEquals(24000, playedWav?.sampleRate)
+        server.takeRequest() // summarize
+        val firstSynth = server.takeRequest()
+        assertEquals("/api/dictation/tts/speak", firstSynth.path)
+        val secondSynth = server.takeRequest()
+        assertEquals("/api/tts/speak", secondSynth.path)
+        assertFalse(secondSynth.body.readUtf8().contains("baseURL"))
+    }
+
+    @Test
+    fun `falls back from ML Kit GenAI TTS to Android System TTS without replacing it`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Hello on device."}"""))
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val spokenBySystem = mutableListOf<String>()
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+                spokenBySystem += text
+            }
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+        val mlKitAttempts = mutableListOf<String>()
+        val fakeMlKitTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+                mlKitAttempts += text
+                throw TtsException(message = "ML Kit GenAI TTS unavailable")
+            }
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val pipeline = listOf(
+            TtsEngineOption(TtsEngine.MLKIT_GENAI, enabled = true),
+            TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true),
+        )
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            mlKitTtsSpeaker = fakeMlKitTts,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { pipeline },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        player.speak(baseUrl, "Hello on device.")
+
+        assertEquals(listOf("Hello on device."), mlKitAttempts)
+        assertEquals(listOf("Hello on device."), spokenBySystem)
+    }
+
+    @Test
+    fun `OPENAI_CLOUD uses openAiVoiceProvider instead of Gemini voice`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"OpenAI voice check."}"""))
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.OPENAI_CLOUD, enabled = true)) },
+            openAiVoiceProvider = { "onyx" },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        player.speak(baseUrl, "OpenAI voice check.", voice = "Sulafat")
+
+        server.takeRequest() // summarize
+        val synthReq = server.takeRequest()
+        assertEquals("POST", synthReq.method)
+        assertEquals("/api/tts/speak", synthReq.path)
+        val body = synthReq.body.readUtf8()
+        assertTrue(body.contains("\"voice\":\"onyx\""))
+        assertFalse(body.contains("Sulafat"))
+    }
+
+    @Test
+    fun `speak preserves 401 statusCode when all enabled engines fail with 401`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Auth check."}"""))
+        server.enqueue(MockResponse().setResponseCode(401).setBody("Unauthorized"))
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        try {
+            player.speak(baseUrl, "Auth check.")
+            org.junit.Assert.fail("Expected TtsException")
+        } catch (ex: TtsException) {
+            assertEquals(401, ex.statusCode)
+        }
+    }
+
+    @Test
+    fun `splitTextForSpeech splits long text along word boundaries`() {
+        val text = "alpha beta gamma delta epsilon zeta eta theta"
+        val chunks = splitTextForSpeech(text, maxLen = 18)
+        assertTrue(chunks.size >= 3)
+        assertTrue(chunks.all { it.length <= 18 })
+        assertEquals(text, chunks.joinToString(" "))
+    }
+}

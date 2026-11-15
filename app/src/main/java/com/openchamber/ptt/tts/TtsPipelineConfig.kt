@@ -1,0 +1,154 @@
+package com.openchamber.ptt.tts
+
+import kotlinx.serialization.Serializable
+
+@Serializable
+enum class TtsEngine(
+    val title: String,
+    val shortTitle: String,
+    val subtitle: String,
+) {
+    GEMINI_BRIDGE(
+        title = "Gemini Bridge",
+        shortTitle = "Gemini",
+        subtitle = "Cloud via :4005 bridge",
+    ),
+    LOCAL_KOKORO(
+        title = "Local Kokoro",
+        shortTitle = "Kokoro",
+        subtitle = "On-host sherpa-onnx WAV",
+    ),
+    MLKIT_GENAI(
+        title = "ML Kit GenAI TTS",
+        shortTitle = "ML Kit",
+        subtitle = "On-device Gemini Nano voices",
+    ),
+    ANDROID_SYSTEM(
+        title = "Android System TTS",
+        shortTitle = "System",
+        subtitle = "On-device OS TextToSpeech",
+    ),
+    OPENAI_CLOUD(
+        title = "OpenAI Cloud",
+        shortTitle = "OpenAI",
+        subtitle = "Direct /api/tts/speak",
+    ),
+}
+
+@Serializable
+data class TtsEngineOption(
+    val engine: TtsEngine,
+    val enabled: Boolean,
+)
+
+@Serializable
+enum class SttEngine(
+    val title: String,
+    val subtitle: String,
+) {
+    OPENCHAMBER_PARAKEET(
+        title = "OpenChamber Parakeet",
+        subtitle = "Host sherpa-onnx WS + Small Model cleanup",
+    ),
+    MLKIT_GENAI_ADVANCED(
+        title = "ML Kit GenAI (Advanced)",
+        subtitle = "On-device Gemini Nano speech recognition",
+    ),
+    MLKIT_GENAI_BASIC(
+        title = "ML Kit GenAI (Basic)",
+        subtitle = "On-device ML Kit standard model (API 31+)",
+    ),
+}
+
+data class OpenAiVoicePreset(
+    val id: String,
+    val label: String,
+    val description: String,
+)
+
+object VoicePipelineDefaults {
+    const val DEFAULT_OPENAI_VOICE = "alloy"
+
+    val openAiVoices: List<OpenAiVoicePreset> = listOf(
+        OpenAiVoicePreset("alloy", "Alloy", "Neutral and balanced"),
+        OpenAiVoicePreset("ash", "Ash", "Clear and conversational"),
+        OpenAiVoicePreset("ballad", "Ballad", "Warm and expressive"),
+        OpenAiVoicePreset("coral", "Coral", "Bright and friendly"),
+        OpenAiVoicePreset("echo", "Echo", "Smooth male timbre"),
+        OpenAiVoicePreset("fable", "Fable", "Animated storyteller"),
+        OpenAiVoicePreset("onyx", "Onyx", "Deep and authoritative"),
+        OpenAiVoicePreset("nova", "Nova", "Crisp and upbeat"),
+        OpenAiVoicePreset("sage", "Sage", "Calm and measured"),
+        OpenAiVoicePreset("shimmer", "Shimmer", "Soft and gentle"),
+    )
+
+    private val mlKitVoiceProfiles: Map<String, String> = mapOf(
+        "star02" to "Female · medium pitch",
+        "star04" to "Male · medium-high pitch",
+        "star05" to "Male · low pitch",
+        "star08" to "Female · low pitch",
+        "star11" to "Male · medium pitch, youthful",
+        "star12" to "Female · medium-high pitch",
+        "star13" to "Male · medium pitch",
+        "star16" to "Female · medium-low pitch",
+    )
+
+    fun describeMlKitVoice(name: String, genderLabel: String, localeTag: String): String {
+        val profile = mlKitVoiceProfiles[name.lowercase()]
+        val parts = buildList {
+            if (profile != null) {
+                add(profile)
+            } else if (genderLabel.isNotBlank()) {
+                add(genderLabel)
+            }
+            if (localeTag.isNotBlank()) {
+                add(localeTag)
+            }
+        }
+        return parts.joinToString(" · ")
+    }
+
+    val defaultTtsPipeline: List<TtsEngineOption> = listOf(
+        TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true),
+        TtsEngineOption(TtsEngine.LOCAL_KOKORO, enabled = true),
+        TtsEngineOption(TtsEngine.MLKIT_GENAI, enabled = true),
+        TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true),
+        TtsEngineOption(TtsEngine.OPENAI_CLOUD, enabled = false),
+    )
+
+    fun normalizeTtsPipeline(raw: List<TtsEngineOption>): List<TtsEngineOption> {
+        val seen = LinkedHashSet<TtsEngine>()
+        val normalized = mutableListOf<TtsEngineOption>()
+        for (item in raw) {
+            if (seen.add(item.engine)) {
+                normalized += item
+            }
+        }
+        for (fallback in defaultTtsPipeline) {
+            if (seen.add(fallback.engine)) {
+                normalized += fallback
+            }
+        }
+        return normalized
+    }
+
+    fun primaryEnabledEngine(pipeline: List<TtsEngineOption>): TtsEngine? =
+        pipeline.firstOrNull { it.enabled }?.engine
+
+    fun resolveActiveVoiceChipLabel(
+        pipeline: List<TtsEngineOption>,
+        geminiVoice: String,
+        mlKitVoice: String?,
+        openAiVoice: String,
+        systemVoiceLabel: String?,
+    ): String {
+        return when (primaryEnabledEngine(pipeline)) {
+            TtsEngine.GEMINI_BRIDGE -> "Gemini · ${geminiVoice.ifBlank { "Kore" }}"
+            TtsEngine.MLKIT_GENAI -> "ML Kit · ${mlKitVoice?.takeIf { it.isNotBlank() } ?: "Auto"}"
+            TtsEngine.OPENAI_CLOUD -> "OpenAI · ${openAiVoice.ifBlank { DEFAULT_OPENAI_VOICE }}"
+            TtsEngine.LOCAL_KOKORO -> "Kokoro · Host"
+            TtsEngine.ANDROID_SYSTEM -> "System · ${systemVoiceLabel?.takeIf { it.isNotBlank() } ?: "Default"}"
+            null -> "TTS disabled"
+        }
+    }
+}
