@@ -235,4 +235,162 @@ class TtsClientTest {
         assertEquals("/api/guests/gemini-tts-bridge/service/request", req.path)
         assertTrue(req.body.readUtf8().contains("/v1/audio/voices"))
     }
+
+    @Test
+    fun `prepareTextForTts SUMMARIZED translates via small-model and skips destructive server sanitize`() = runTest {
+        val longReply = "Detailed build output: ".repeat(15) // >= 180 chars
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"text":"The build succeeded **cleanly** in `TtsClient.kt`."}"""),
+        )
+
+        val ttsClient = TtsClient(httpClient = OpenChamberHttp.createClient(tokenProvider = { "oc_tok" }))
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        val prepared = ttsClient.prepareTextForTts(baseUrl, longReply, TtsInputMode.SUMMARIZED)
+        assertEquals("The build succeeded cleanly in TtsClient.kt.", prepared)
+        assertEquals(1, server.requestCount)
+
+        val smallModelReq = server.takeRequest()
+        assertEquals("/api/small-model/generate", smallModelReq.path)
+        val smallBody = json.parseToJsonElement(smallModelReq.body.readUtf8()).jsonObject
+        assertEquals(longReply.trim(), smallBody["prompt"]?.jsonPrimitive?.content)
+        assertEquals(TtsClient.SUMMARIZE_SYSTEM_PROMPT, smallBody["system"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `prepareTextForTts SUMMARIZED falls back to sanitized original on 404 and skips network for short plain text`() = runTest {
+        val longReply = "Long reply text. ".repeat(20)
+        server.enqueue(MockResponse().setResponseCode(404).setBody("""{"error":"No small model"}"""))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Fallback sanitized long reply."}"""))
+
+        val ttsClient = TtsClient(httpClient = OpenChamberHttp.createClient())
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        assertEquals(
+            "Fallback sanitized long reply.",
+            ttsClient.prepareTextForTts(baseUrl, longReply, TtsInputMode.SUMMARIZED),
+        )
+        assertEquals("/api/small-model/generate", server.takeRequest().path)
+        assertEquals("/api/text/summarize", server.takeRequest().path)
+
+        // Short plain prose skips both network calls
+        assertEquals(
+            "Short reply.",
+            ttsClient.prepareTextForTts(baseUrl, "Short **reply**.", TtsInputMode.SUMMARIZED),
+        )
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test
+    fun `prepareTextForTts SUMMARIZED translates short text with code backticks or markdown lists`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"text":"Updated TtsClient dot kt. Want me to run tests?"}"""),
+        )
+
+        val ttsClient = TtsClient(httpClient = OpenChamberHttp.createClient())
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        val prepared = ttsClient.prepareTextForTts(
+            serverUrl = baseUrl,
+            text = "Updated `TtsClient.kt`.",
+            inputMode = TtsInputMode.SUMMARIZED,
+            detailLevel = SpokenDetailLevel.DETAILED,
+        )
+        assertEquals("Updated TtsClient dot kt. Want me to run tests?", prepared)
+        val req = server.takeRequest()
+        assertEquals("/api/small-model/generate", req.path)
+        val sys = json.parseToJsonElement(req.body.readUtf8()).jsonObject["system"]?.jsonPrimitive?.content.orEmpty()
+        assertTrue(sys.contains("Abstraction level — Detailed"))
+        assertTrue(sys.contains("openui-lang"))
+        assertTrue(sys.contains("NEVER omit"))
+    }
+
+    @Test
+    fun `normalizeSpokenOutput inserts period after unpunctuated headers, strips italics and pause tags, and preserves symbols`() {
+        val raw = "Session: Bluetooth Controls\n\n*Important* note about `TtsClient.kt` <short pause> and **bold** text."
+        val cleaned = TtsClient.normalizeSpokenOutput(raw)
+        assertEquals(
+            "Session: Bluetooth Controls. Important note about TtsClient.kt and bold text.",
+            cleaned,
+        )
+    }
+
+    @Test
+    fun `prepareTextForTts SUMMARIZED propagates 401 and RAW skips network calls`() = runTest {
+        val longReply = "Auth check reply. ".repeat(20)
+        server.enqueue(MockResponse().setResponseCode(401).setBody("Unauthorized"))
+
+        val ttsClient = TtsClient(httpClient = OpenChamberHttp.createClient())
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        assertEquals(
+            "Keep **raw** text",
+            ttsClient.prepareTextForTts(baseUrl, "  Keep **raw** text  ", TtsInputMode.RAW),
+        )
+        assertEquals(0, server.requestCount)
+
+        try {
+            ttsClient.prepareTextForTts(baseUrl, longReply, TtsInputMode.SUMMARIZED)
+            fail("Expected TtsException(401)")
+        } catch (ex: TtsException) {
+            assertEquals(401, ex.statusCode)
+        }
+    }
+
+    @Test
+    fun `prepareTextForTts SUMMARIZED includes Session context and abstraction guidance for ESSENTIALS`() = runTest {
+        val longReply = "Test run completed with 3 snapshot mismatches. ".repeat(10)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"text":"Payments session -- three snapshot tests FAILED. Want me to update them?"}"""),
+        )
+
+        val ttsClient = TtsClient(httpClient = OpenChamberHttp.createClient(tokenProvider = { "oc_tok" }))
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        val prepared = ttsClient.prepareTextForTts(
+            serverUrl = baseUrl,
+            text = longReply,
+            inputMode = TtsInputMode.SUMMARIZED,
+            sessionLabel = "Payments",
+            detailLevel = SpokenDetailLevel.ESSENTIALS,
+        )
+        assertEquals("Payments session -- three snapshot tests FAILED. Want me to update them?", prepared)
+
+        val smallModelReq = server.takeRequest()
+        val smallBody = json.parseToJsonElement(smallModelReq.body.readUtf8()).jsonObject
+        val systemPrompt = smallBody["system"]?.jsonPrimitive?.content.orEmpty()
+        assertTrue(systemPrompt.contains("written-to-spoken translator"))
+        assertTrue(systemPrompt.contains("Abstraction level — Essentials"))
+        assertEquals(
+            "Session: Payments\n\nAssistant reply:\n${longReply.trim()}",
+            smallBody["prompt"]?.jsonPrimitive?.content,
+        )
+    }
+
+    @Test
+    fun `summarizeForSpeech uses bounded summarizeTimeoutMs instead of 90s TTS timeout`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"text":"Delayed response"}""")
+                .setBodyDelay(500, java.util.concurrent.TimeUnit.MILLISECONDS),
+        )
+
+        val ttsClient = TtsClient(
+            httpClient = OpenChamberHttp.createClient(),
+            summarizeTimeoutMs = 150L,
+        )
+        assertEquals(150, ttsClient.summarizeHttpClient.readTimeoutMillis)
+        assertEquals(TtsClient.DEFAULT_TTS_READ_TIMEOUT_MS.toInt(), ttsClient.ttsHttpClient.readTimeoutMillis)
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        val res = ttsClient.summarizeForSpeech(baseUrl, "Long text ".repeat(30))
+        org.junit.Assert.assertNull(res)
+    }
 }

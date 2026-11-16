@@ -1,11 +1,17 @@
 package com.openchamber.ptt.network
 
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 object OpenChamberHttp {
     const val HEADER_AUTHORIZATION = "Authorization"
@@ -13,6 +19,29 @@ object OpenChamberHttp {
     const val HEADER_DIRECTORY = "x-opencode-directory"
     const val HEADER_DIRECTORY_ENCODING = "x-opencode-directory-encoding"
     const val DIRECTORY_ENCODING_URI = "uri"
+    const val SMALL_MODEL_GENERATE_PATH = "/api/small-model/generate"
+
+    suspend fun executeText(client: OkHttpClient, request: Request): Pair<Int, String> =
+        suspendCancellableCoroutine { cont ->
+            val call = client.newCall(request)
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) cont.resumeWithException(e)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        response.use { resp ->
+                            val text = resp.body?.string().orEmpty()
+                            if (cont.isActive) cont.resume(resp.code to text)
+                        }
+                    } catch (e: IOException) {
+                        if (cont.isActive) cont.resumeWithException(e)
+                    }
+                }
+            })
+        }
 
     fun createClient(
         tokenProvider: () -> String? = { null },

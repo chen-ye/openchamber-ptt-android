@@ -72,6 +72,7 @@ class TtsPlayerTest {
             pcmPlayerFactory = { fakeTrack },
             systemTtsSpeaker = fakeSystemTts,
             ioDispatcher = Dispatchers.Unconfined,
+            inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
         val baseUrl = server.url("/").toString().trimEnd('/')
@@ -108,6 +109,7 @@ class TtsPlayerTest {
             pcmPlayerFactory = { fakeTrack },
             systemTtsSpeaker = fakeSystemTts,
             ioDispatcher = Dispatchers.Unconfined,
+            inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
         val baseUrl = server.url("/").toString().trimEnd('/')
@@ -166,6 +168,7 @@ class TtsPlayerTest {
             pcmPlayerFactory = { fakeTrack },
             systemTtsSpeaker = fakeSystemTts,
             ioDispatcher = Dispatchers.Unconfined,
+            inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
         val baseUrl = server.url("/").toString().trimEnd('/')
@@ -229,6 +232,7 @@ class TtsPlayerTest {
             systemTtsSpeaker = fakeSystemTts,
             ioDispatcher = Dispatchers.Unconfined,
             pipelineProvider = { customPipeline },
+            inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
         val baseUrl = server.url("/").toString().trimEnd('/')
@@ -281,6 +285,7 @@ class TtsPlayerTest {
             mlKitTtsSpeaker = fakeMlKitTts,
             ioDispatcher = Dispatchers.Unconfined,
             pipelineProvider = { pipeline },
+            inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
         val baseUrl = server.url("/").toString().trimEnd('/')
@@ -323,6 +328,7 @@ class TtsPlayerTest {
             ioDispatcher = Dispatchers.Unconfined,
             pipelineProvider = { listOf(TtsEngineOption(TtsEngine.OPENAI_CLOUD, enabled = true)) },
             openAiVoiceProvider = { "onyx" },
+            inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
         val baseUrl = server.url("/").toString().trimEnd('/')
@@ -358,6 +364,7 @@ class TtsPlayerTest {
             systemTtsSpeaker = fakeSystemTts,
             ioDispatcher = Dispatchers.Unconfined,
             pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
         val baseUrl = server.url("/").toString().trimEnd('/')
@@ -376,5 +383,98 @@ class TtsPlayerTest {
         assertTrue(chunks.size >= 3)
         assertTrue(chunks.all { it.length <= 18 })
         assertEquals(text, chunks.joinToString(" "))
+    }
+
+    @Test
+    fun `speak with RAW inputMode skips summarize and sends exact text`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        player.speak(baseUrl, "Literal `code` text")
+
+        assertEquals(1, server.requestCount)
+        val req = server.takeRequest()
+        assertEquals("/api/tts/speak", req.path)
+        assertTrue(req.body.readUtf8().contains("Literal `code` text"))
+    }
+
+    @Test
+    fun `speak with inputModeOverride RAW overrides SUMMARIZED and reports TtsSpeakStats`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+
+        val stats = mutableListOf<TtsSpeakStats>()
+        val synthesizedTexts = mutableListOf<String>()
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.SUMMARIZED },
+            onSpokenTextSynthesized = { synthesizedTexts += it },
+            onSpeakStats = { stats += it },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        val draftText = "Organized multi-sentence draft preview. ".repeat(20)
+        player.speak(baseUrl, draftText, inputModeOverride = TtsInputMode.RAW)
+
+        assertEquals(1, server.requestCount)
+        assertEquals("/api/tts/speak", server.takeRequest().path)
+        assertEquals(listOf(draftText.trim()), synthesizedTexts)
+        assertEquals(1, stats.size)
+        assertEquals(TtsInputMode.RAW, stats.first().inputMode)
+        assertEquals(TtsEngine.GEMINI_BRIDGE, stats.first().engine)
     }
 }

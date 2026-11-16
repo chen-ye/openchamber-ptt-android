@@ -1,9 +1,11 @@
 package com.openchamber.ptt.storage
 
 import android.content.SharedPreferences
+import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.SttEngine
 import com.openchamber.ptt.tts.TtsEngine
 import com.openchamber.ptt.tts.TtsEngineOption
+import com.openchamber.ptt.tts.TtsInputMode
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -119,11 +121,97 @@ class TokenStoreTest {
         assertFalse(store.getEffectiveSttFallbackToParakeet(srvB.id))
         assertEquals(TtsEngine.MLKIT_GENAI, store.getEffectiveTtsPipeline(srvB.id).first().engine)
 
+        assertEquals(TtsInputMode.SUMMARIZED, store.getEffectiveTtsInputMode(srvA.id))
+        assertEquals(TtsInputMode.SUMMARIZED, store.getEffectiveTtsInputMode(srvB.id))
+
+        store.saveTtsInputMode(TtsInputMode.SANITIZED, customServerId = srvB.id)
+        assertEquals(TtsInputMode.SUMMARIZED, store.getEffectiveTtsInputMode(srvA.id))
+        assertEquals(TtsInputMode.SANITIZED, store.getEffectiveTtsInputMode(srvB.id))
+
+        assertEquals(SpokenDetailLevel.BALANCED, store.getEffectiveSpokenDetailLevel(srvA.id))
+        store.saveSpokenDetailLevel(SpokenDetailLevel.DETAILED, customServerId = srvB.id)
+        assertEquals(SpokenDetailLevel.BALANCED, store.getEffectiveSpokenDetailLevel(srvA.id))
+        assertEquals(SpokenDetailLevel.DETAILED, store.getEffectiveSpokenDetailLevel(srvB.id))
+
         // Resetting Server B restores global defaults
         store.setServerVoiceOverride(srvB.id, null)
         assertNotNull(store.getServer(srvB.id))
         assertEquals("Sulafat", store.getEffectiveTtsVoice(srvB.id))
         assertEquals(SttEngine.OPENCHAMBER_PARAKEET, store.getEffectiveSttEngine(srvB.id))
+        assertEquals(TtsInputMode.SUMMARIZED, store.getEffectiveTtsInputMode(srvB.id))
+        assertEquals(SpokenDetailLevel.BALANCED, store.getEffectiveSpokenDetailLevel(srvB.id))
+    }
+
+    @Test
+    fun `staged drafts persist per session key and clear independently`() {
+        val store = TokenStore(InMemorySharedPreferences())
+        val keyA = TokenStore.sessionKeyFor("srv1", PinnedSession("ses1", "/repo/a", "Repo A"))
+        val keyB = TokenStore.sessionKeyFor("srv1", PinnedSession("ses2", "/repo/b", "Repo B"))
+
+        store.saveStagedDraft(
+            StagedDraft(
+                sessionKey = keyA,
+                rawBursts = listOf("first burst", "second burst"),
+                organizedText = "Combined organized prompt.",
+                previousOrganizedText = "First draft.",
+                updatedAtMs = 12345L,
+            ),
+        )
+        store.saveStagedDraft(
+            StagedDraft(
+                sessionKey = keyB,
+                rawBursts = listOf("other"),
+                organizedText = "Other session draft.",
+                updatedAtMs = 12346L,
+            ),
+        )
+
+        val restoredA = store.getStagedDraft(keyA)
+        assertNotNull(restoredA)
+        assertEquals("Combined organized prompt.", restoredA?.organizedText)
+        assertEquals(2, restoredA?.rawBursts?.size)
+
+        store.clearStagedDraft(keyA)
+        assertNull(store.getStagedDraft(keyA))
+        assertEquals("Other session draft.", store.getStagedDraft(keyB)?.organizedText)
+    }
+
+    @Test
+    fun `changes flow increments on server, voice, and draft mutations`() {
+        val store = TokenStore(InMemorySharedPreferences())
+        val initial = store.changes.value
+        val srv = store.upsertServer("http://127.0.0.1:4096", token = "tok")
+        assertTrue(store.changes.value > initial)
+
+        val afterUpsert = store.changes.value
+        store.saveSpokenDetailLevel(SpokenDetailLevel.DETAILED, customServerId = srv.id)
+        assertTrue(store.changes.value > afterUpsert)
+
+        val afterVoice = store.changes.value
+        store.saveStagedDraft(
+            StagedDraft(
+                sessionKey = TokenStore.sessionKeyFor(srv.id, PinnedSession("s1", "/tmp", "Demo")),
+                rawBursts = listOf("hi"),
+                organizedText = "hi",
+            ),
+        )
+        assertTrue(store.changes.value > afterVoice)
+    }
+
+    @Test
+    fun `changes flow broadcasts across separate TokenStore instances`() {
+        val sharedPrefs = InMemorySharedPreferences()
+        val storeA = TokenStore(sharedPrefs)
+        val storeB = TokenStore(sharedPrefs)
+
+        val before = storeB.changes.value
+        val srv = storeA.upsertServer("http://127.0.0.1:4096", token = "tok_shared")
+        assertTrue(storeB.changes.value > before)
+
+        val afterUpsert = storeB.changes.value
+        storeA.saveSpokenDetailLevel(SpokenDetailLevel.ESSENTIALS, customServerId = srv.id)
+        assertTrue(storeB.changes.value > afterUpsert)
+        assertEquals(SpokenDetailLevel.ESSENTIALS, storeB.getEffectiveSpokenDetailLevel(srv.id))
     }
 
     private class InMemorySharedPreferences : SharedPreferences {

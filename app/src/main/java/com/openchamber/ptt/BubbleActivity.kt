@@ -1,12 +1,9 @@
 package com.openchamber.ptt
 
-import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
 import androidx.activity.ComponentActivity
@@ -14,12 +11,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -36,41 +37,31 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.openchamber.ptt.network.OpenChamberHttp
-import com.openchamber.ptt.network.OpenChamberLauncher
 import com.openchamber.ptt.service.PttForegroundService
 import com.openchamber.ptt.service.PttState
-import com.openchamber.ptt.session.ServerSessionsResult
 import com.openchamber.ptt.session.SessionRepository
-import com.openchamber.ptt.session.SessionSummary
-import com.openchamber.ptt.storage.PinnedSession
-import com.openchamber.ptt.storage.ServerProfile
 import com.openchamber.ptt.storage.TokenStore
+import com.openchamber.ptt.tts.TtsClient
+import com.openchamber.ptt.tts.TtsInputMode
 import com.openchamber.ptt.ui.HeroPttControl
 import com.openchamber.ptt.ui.PermissionWarningBanner
-import com.openchamber.ptt.ui.SessionPickerSheet
 import com.openchamber.ptt.ui.SessionPill
+import com.openchamber.ptt.ui.SpokenDetailSlider
+import com.openchamber.ptt.ui.StagedDraftCard
 import com.openchamber.ptt.ui.StatusPill
 import com.openchamber.ptt.ui.TurnTranscriptPanel
+import com.openchamber.ptt.ui.VoiceCockpitSheets
+import com.openchamber.ptt.ui.rememberVoiceCockpitState
 import com.openchamber.ptt.ui.theme.OpenChamberPttTheme
-import kotlinx.coroutines.launch
 
 class BubbleActivity : ComponentActivity() {
     private var boundService by mutableStateOf<PttForegroundService?>(null)
@@ -95,18 +86,21 @@ class BubbleActivity : ComponentActivity() {
         val tokenStore = TokenStore(appContext)
         val httpClient = OpenChamberHttp.createClient(
             tokenForUrlProvider = { url -> tokenStore.getTokenForUrl(url) },
+            directoryForUrlProvider = { url -> tokenStore.getDirectoryForUrl(url) },
         )
         val sessionRepository = SessionRepository(httpClient)
+        val ttsClient = TtsClient(httpClient)
 
         setContent {
             OpenChamberPttTheme {
                 Surface(
-                    color = MaterialTheme.colorScheme.surface,
+                    color = MaterialTheme.colorScheme.background,
                     modifier = Modifier.fillMaxSize(),
                 ) {
                     BubbleCockpitScreen(
                         tokenStore = tokenStore,
                         sessionRepository = sessionRepository,
+                        ttsClient = ttsClient,
                         boundService = boundService,
                         onOpenFullApp = {
                             val launchIntent = Intent(this, MainActivity::class.java).apply {
@@ -136,119 +130,30 @@ class BubbleActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun BubbleCockpitScreen(
     tokenStore: TokenStore,
     sessionRepository: SessionRepository,
+    ttsClient: TtsClient,
     boundService: PttForegroundService?,
     onOpenFullApp: () -> Unit,
 ) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
-
-    var servers by remember { mutableStateOf(tokenStore.getServers()) }
-    var activeServer by remember { mutableStateOf(tokenStore.getActiveServer()) }
-    val serverUrl = activeServer?.serverUrl.orEmpty()
-    val hasActiveToken = !activeServer?.token.isNullOrBlank()
-    val isConnected = servers.any { it.isSignedIn }
-    val hasMic = ContextCompat.checkSelfPermission(
-        context,
-        Manifest.permission.RECORD_AUDIO,
-    ) == PackageManager.PERMISSION_GRANTED
-    val isReadyForVoice = hasMic && isConnected
-
-    var pinnedSession by remember { mutableStateOf(tokenStore.getPinnedSession()) }
-    var serverGroups by remember { mutableStateOf<List<ServerSessionsResult>>(emptyList()) }
-    var isLoadingSessions by remember { mutableStateOf(false) }
-    var sessionsError by remember { mutableStateOf<String?>(null) }
-    var showSessionPicker by remember { mutableStateOf(false) }
-
-    var pinSco by remember { mutableStateOf(boundService?.pinBluetoothSco ?: false) }
-
-    val pttState = boundService?.state?.collectAsState()?.value ?: PttState.DISARMED
-    val statusText = boundService?.statusText?.collectAsState()?.value ?: "Connecting…"
-    val lastTranscript = boundService?.lastTranscript?.collectAsState()?.value
-    val lastReply = boundService?.lastReply?.collectAsState()?.value
-    val lastTtsInfo = boundService?.lastTtsInfo?.collectAsState()?.value
-    val serviceError = boundService?.lastError?.collectAsState()?.value
-    val permissionPrompt = boundService?.permissionPrompt?.collectAsState()?.value
-    val recordingStartedAt = boundService?.recordingStartedAtElapsedMs?.collectAsState()?.value
-    val servicePinSco = boundService?.pinBluetoothScoFlow?.collectAsState()?.value
-
-    LaunchedEffect(servicePinSco) {
-        if (servicePinSco != null) {
-            pinSco = servicePinSco
-        }
-    }
-
-    fun syncServerStateFromStore() {
-        val list = tokenStore.getServers()
-        val active = tokenStore.getActiveServer()
-        servers = list
-        activeServer = active
-        pinnedSession = active?.lastPinnedSession
-    }
-
-    DisposableEffect(lifecycleOwner, boundService) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                syncServerStateFromStore()
-                boundService?.refreshLatestTurn(forceClearOnSessionChange = false)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
-    }
-
-    fun refreshSessions() {
-        val currentServers = tokenStore.getServers()
-        servers = currentServers
-        activeServer = tokenStore.getActiveServer()
-        if (currentServers.none { it.isSignedIn }) return
-        scope.launch {
-            isLoadingSessions = true
-            sessionsError = null
-            try {
-                val results = sessionRepository.listAllServerSessions(currentServers)
-                results.filter { it.isUnauthorized && it.server.isSignedIn }.forEach { failed ->
-                    if (failed.server.id == tokenStore.getActiveServer()?.id) {
-                        boundService?.disarm()
-                    }
-                    tokenStore.clearAuth(failed.server.id)
-                }
-                val updatedServers = tokenStore.getServers()
-                syncServerStateFromStore()
-                serverGroups = results.map { res ->
-                    val freshServer = updatedServers.firstOrNull { it.id == res.server.id } ?: res.server
-                    res.copy(server = freshServer)
-                }
-            } catch (t: Throwable) {
-                sessionsError = t.message ?: "Failed to load sessions"
-            } finally {
-                isLoadingSessions = false
-            }
-        }
-    }
-
-    LaunchedEffect(isReadyForVoice) {
-        if (isReadyForVoice) {
-            refreshSessions()
-        }
-    }
-
-    LaunchedEffect(boundService, isReadyForVoice, pinnedSession?.sessionId) {
-        if (boundService != null && isReadyForVoice && pinnedSession != null) {
-            boundService.refreshLatestTurn()
-        }
-    }
+    val cockpit = rememberVoiceCockpitState(
+        tokenStore = tokenStore,
+        sessionRepository = sessionRepository,
+        ttsClient = ttsClient,
+        boundService = boundService,
+        defaultStatusText = "Connecting…",
+        requireMicForAutoLoad = true,
+    )
+    val isReadyForVoice = cockpit.isOperateReady
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.safeDrawing)
+            .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 14.dp, vertical = 6.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -258,11 +163,11 @@ private fun BubbleCockpitScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            StatusPill(pttState = pttState)
+            StatusPill(pttState = cockpit.pttState)
             Row(verticalAlignment = Alignment.CenterVertically) {
-                if (pttState != PttState.DISARMED) {
+                if (cockpit.pttState != PttState.DISARMED) {
                     TextButton(
-                        onClick = { boundService?.disarm() },
+                        onClick = { cockpit.disarmPtt() },
                         modifier = Modifier.heightIn(min = 48.dp),
                     ) {
                         Icon(
@@ -312,78 +217,54 @@ private fun BubbleCockpitScreen(
             }
         } else {
             SessionPill(
-                pinnedSession = pinnedSession,
+                pinnedSession = cockpit.pinnedSession,
                 isConnected = true,
-                isLoading = isLoadingSessions,
-                serverLabel = activeServer?.displayLabel,
-                showServerLabel = servers.size > 1,
-                onClick = {
-                    if (serverGroups.isEmpty()) refreshSessions()
-                    showSessionPicker = true
-                },
+                isLoading = cockpit.isLoadingSessions,
+                serverLabel = cockpit.activeServer?.displayLabel,
+                showServerLabel = cockpit.servers.size > 1,
+                onClick = { cockpit.openSessionPicker() },
             )
 
-            if (pttState == PttState.PERMISSION_BLOCKED) {
+            if (!cockpit.sessionsError.isNullOrBlank()) {
+                Text(
+                    text = cockpit.sessionsError.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            if (cockpit.pttState == PttState.PERMISSION_BLOCKED) {
                 PermissionWarningBanner(
-                    toolName = permissionPrompt ?: "tool",
-                    canReArm = pinnedSession != null && hasActiveToken,
-                    onOpenOpenChamber = {
-                        OpenChamberLauncher.openInOfficialApp(
-                            context = context,
-                            sessionId = pinnedSession?.sessionId,
-                            directory = pinnedSession?.directory,
-                            fallbackServerUrl = serverUrl,
-                        )
-                    },
-                    onReArm = {
-                        val intent = PttForegroundService.startIntent(
-                            context = context,
-                            action = PttForegroundService.ACTION_ARM,
-                            pinSco = pinSco,
-                        )
-                        ContextCompat.startForegroundService(context, intent)
-                    },
+                    toolName = cockpit.permissionPrompt ?: "tool",
+                    canReArm = cockpit.canArm,
+                    onOpenOpenChamber = { cockpit.openInOfficialApp() },
+                    onReArm = { cockpit.armPtt() },
                 )
             }
 
             HeroPttControl(
-                pttState = pttState,
-                statusText = statusText,
-                recordingStartedAtElapsedMs = recordingStartedAt,
-                canArm = pinnedSession != null && hasActiveToken,
+                pttState = cockpit.pttState,
+                statusText = cockpit.statusText,
+                recordingStartedAtElapsedMs = cockpit.recordingStartedAt,
+                canArm = cockpit.canArm,
                 compact = true,
-                onArm = {
-                    val intent = PttForegroundService.startIntent(
-                        context = context,
-                        action = PttForegroundService.ACTION_ARM,
-                        pinSco = pinSco,
-                    )
-                    ContextCompat.startForegroundService(context, intent)
-                },
-                onTapPtt = {
-                    if (boundService != null) {
-                        boundService.onMediaButtonTap()
-                    } else {
-                        val intent = PttForegroundService.startIntent(
-                            context = context,
-                            action = PttForegroundService.ACTION_TOGGLE_PTT,
-                        )
-                        ContextCompat.startForegroundService(context, intent)
-                    }
-                },
+                onArm = { cockpit.armPtt() },
+                onTapPtt = { cockpit.tapPtt() },
+                onStageCapture = { cockpit.stageCurrentRecording() },
+                onDiscard = { cockpit.discardCurrent() },
+                onPullBackToDraft = { cockpit.pullBackToDraft() },
+                sendGraceRemainingMs = cockpit.sendGraceRemainingMs,
+                pendingQuickTranscript = cockpit.pendingQuickTranscript,
             )
 
-            Row(
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 FilterChip(
-                    selected = pinSco,
-                    onClick = {
-                        val next = !pinSco
-                        pinSco = next
-                        boundService?.pinBluetoothSco = next
-                    },
+                    selected = cockpit.pinSco,
+                    onClick = { cockpit.togglePinSco() },
                     label = { Text("Headset mic") },
                     leadingIcon = {
                         Icon(
@@ -392,30 +273,59 @@ private fun BubbleCockpitScreen(
                             modifier = Modifier.size(18.dp),
                         )
                     },
-                    modifier = Modifier.heightIn(min = 48.dp),
+                )
+
+                AssistChip(
+                    onClick = { cockpit.openVoicePicker() },
+                    label = {
+                        Text(
+                            text = cockpit.activeVoiceChipLabel,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_graphic_eq),
+                            contentDescription = "Voice",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    },
                 )
             }
 
-            val canReadAloud = pinnedSession != null &&
-                hasActiveToken &&
-                (pttState == PttState.DISARMED || pttState == PttState.ARMED_IDLE || pttState == PttState.SPEAKING_TTS)
+            if (cockpit.ttsInputMode == TtsInputMode.SUMMARIZED) {
+                SpokenDetailSlider(
+                    detailLevel = cockpit.spokenDetailLevel,
+                    onSelectLevel = { cockpit.selectSpokenDetailLevel(it) },
+                )
+            }
+
+            val activeDraft = cockpit.activeDraft
+            if (activeDraft != null && cockpit.pttState != PttState.WAITING_AGENT) {
+                StagedDraftCard(
+                    draft = activeDraft,
+                    pttState = cockpit.pttState,
+                    isOrganizing = cockpit.isOrganizingDraft,
+                    onUpdateDraftText = { cockpit.updateDraftText(it) },
+                    onCommitDraft = { cockpit.commitStagedDraft() },
+                    onReorganizeDraft = { cockpit.reorganizeCurrentDraft() },
+                    onRevertDraft = { cockpit.revertDraftToPrevious() },
+                    onDiscardDraft = { cockpit.discardStagedDraft(activeDraft) },
+                )
+            }
+
             TurnTranscriptPanel(
-                lastTranscript = lastTranscript,
-                lastReply = lastReply,
-                lastTtsInfo = lastTtsInfo,
-                serviceError = serviceError,
-                isSpeaking = pttState == PttState.SPEAKING_TTS,
-                canReadAloud = canReadAloud,
-                onReadAloudClick = { boundService?.readPreviousMessage() },
-                onOpenInOpenChamber = if (pinnedSession != null || serverUrl.isNotBlank()) {
-                    {
-                        OpenChamberLauncher.openInOfficialApp(
-                            context = context,
-                            sessionId = pinnedSession?.sessionId,
-                            directory = pinnedSession?.directory,
-                            fallbackServerUrl = serverUrl,
-                        )
-                    }
+                lastTranscript = cockpit.lastTranscript,
+                lastReply = cockpit.lastReply,
+                lastSpokenSummary = cockpit.lastSpokenSummary,
+                lastTtsInfo = cockpit.lastTtsInfo,
+                serviceError = cockpit.serviceError,
+                isSpeaking = cockpit.pttState == PttState.SPEAKING_TTS,
+                canReadAloud = cockpit.canReadAloud,
+                onReadAloudClick = { cockpit.readPreviousMessage() },
+                onOpenInOpenChamber = if (cockpit.pinnedSession != null || cockpit.activeServerUrl.isNotBlank()) {
+                    { cockpit.openInOfficialApp() }
                 } else {
                     null
                 },
@@ -423,29 +333,10 @@ private fun BubbleCockpitScreen(
         }
     }
 
-    if (showSessionPicker) {
-        SessionPickerSheet(
-            serverGroups = serverGroups,
-            activeServerId = activeServer?.id,
-            pinnedSession = pinnedSession,
-            isLoading = isLoadingSessions,
-            error = sessionsError,
-            onRefresh = { refreshSessions() },
-            onSelect = { targetServer: ServerProfile, summary: SessionSummary ->
-                val updated = PinnedSession(
-                    sessionId = summary.id,
-                    directory = summary.directory,
-                    title = summary.title,
-                )
-                tokenStore.setActiveServer(targetServer.id)
-                tokenStore.updatePinnedSession(targetServer.id, updated)
-                servers = tokenStore.getServers()
-                activeServer = tokenStore.getActiveServer()
-                pinnedSession = updated
-                boundService?.onActiveSessionOrServerChanged()
-                showSessionPicker = false
-            },
-            onDismiss = { showSessionPicker = false },
-        )
-    }
+    VoiceCockpitSheets(
+        state = cockpit,
+        onSignInServer = { onOpenFullApp() },
+        onAddServer = onOpenFullApp,
+        onOpenSettings = onOpenFullApp,
+    )
 }

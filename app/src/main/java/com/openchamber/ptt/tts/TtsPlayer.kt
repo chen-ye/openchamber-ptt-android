@@ -49,6 +49,15 @@ internal interface SystemTtsSpeaker {
     fun shutdown()
 }
 
+data class TtsSpeakStats(
+    val inputMode: TtsInputMode,
+    val prepareMs: Long,
+    val rawChars: Int,
+    val spokenChars: Int,
+    val engine: TtsEngine,
+    val kind: String = "reply",
+)
+
 class TtsPlayer internal constructor(
     private val ttsClient: TtsClient,
     private val pcmPlayerFactory: () -> PcmTrackPlayer,
@@ -58,7 +67,11 @@ class TtsPlayer internal constructor(
     private val useCommunicationUsage: () -> Boolean = { false },
     private val pipelineProvider: () -> List<TtsEngineOption> = { VoicePipelineDefaults.defaultTtsPipeline },
     private val openAiVoiceProvider: () -> String = { VoicePipelineDefaults.DEFAULT_OPENAI_VOICE },
+    private val inputModeProvider: () -> TtsInputMode = { TtsInputMode.SUMMARIZED },
+    private val detailLevelProvider: () -> SpokenDetailLevel = { SpokenDetailLevel.BALANCED },
     private val onStatusEvent: (String) -> Unit = {},
+    private val onSpokenTextSynthesized: ((String) -> Unit)? = null,
+    private val onSpeakStats: ((TtsSpeakStats) -> Unit)? = null,
 ) {
     constructor(
         context: Context,
@@ -68,7 +81,11 @@ class TtsPlayer internal constructor(
         mlKitVoiceNameProvider: () -> String? = { null },
         openAiVoiceProvider: () -> String = { VoicePipelineDefaults.DEFAULT_OPENAI_VOICE },
         systemVoiceNameProvider: () -> String? = { null },
+        inputModeProvider: () -> TtsInputMode = { TtsInputMode.SUMMARIZED },
+        detailLevelProvider: () -> SpokenDetailLevel = { SpokenDetailLevel.BALANCED },
         onStatusEvent: (String) -> Unit = {},
+        onSpokenTextSynthesized: ((String) -> Unit)? = null,
+        onSpeakStats: ((TtsSpeakStats) -> Unit)? = null,
     ) : this(
         ttsClient = ttsClient,
         pcmPlayerFactory = { AndroidAudioTrackPlayer(context.applicationContext) },
@@ -81,7 +98,11 @@ class TtsPlayer internal constructor(
         useCommunicationUsage = useCommunicationUsage,
         pipelineProvider = pipelineProvider,
         openAiVoiceProvider = openAiVoiceProvider,
+        inputModeProvider = inputModeProvider,
+        detailLevelProvider = detailLevelProvider,
         onStatusEvent = onStatusEvent,
+        onSpokenTextSynthesized = onSpokenTextSynthesized,
+        onSpeakStats = onSpeakStats,
     )
 
     private val lock = Any()
@@ -97,15 +118,28 @@ class TtsPlayer internal constructor(
         serverUrl: String,
         text: String,
         voice: String = TtsClient.DEFAULT_TTS_VOICE,
+        sessionLabel: String? = null,
+        inputModeOverride: TtsInputMode? = null,
+        kind: String = "reply",
+        notifySpokenSummary: Boolean = true,
     ) {
         val rawTrimmed = text.trim()
         if (rawTrimmed.isEmpty()) return
 
         val myGeneration = beginPlaybackSession()
         try {
-            val spokenText = ttsClient.sanitizeForTts(serverUrl, rawTrimmed)
+            val effectiveMode = inputModeOverride ?: inputModeProvider()
+            val prepareStartMs = System.currentTimeMillis()
+            val spokenText = ttsClient.prepareTextForTts(
+                serverUrl = serverUrl,
+                text = rawTrimmed,
+                inputMode = effectiveMode,
+                sessionLabel = sessionLabel,
+                detailLevel = detailLevelProvider(),
+            )
                 .trim()
                 .ifEmpty { rawTrimmed }
+            val prepareElapsedMs = (System.currentTimeMillis() - prepareStartMs).coerceAtLeast(0L)
 
             ensureGenerationActive(myGeneration)
 
@@ -118,6 +152,7 @@ class TtsPlayer internal constructor(
             val failures = mutableListOf<String>()
             var lastStatusCode: Int? = null
             var played = false
+            var usedEngine: TtsEngine? = null
 
             for (option in enabledPipeline) {
                 ensureGenerationActive(myGeneration)
@@ -129,12 +164,14 @@ class TtsPlayer internal constructor(
                                 ?: throw TtsException(message = "ML Kit GenAI TTS speaker not configured")
                             val routeLabel = if (useComm) "SCO" else "Media"
                             onStatusEvent("ML Kit GenAI TTS ($routeLabel)")
+                            if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
                             speaker.speak(spokenText, useComm)
                             true
                         }
                         TtsEngine.ANDROID_SYSTEM -> {
                             val routeLabel = if (useComm) "SCO" else "Media"
                             onStatusEvent("Android System TTS ($routeLabel)")
+                            if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
                             systemTtsSpeaker.speak(spokenText, useComm)
                             true
                         }
@@ -148,6 +185,7 @@ class TtsPlayer internal constructor(
                             }
                             val audio = ttsClient.synthesizeWithEngine(serverUrl, spokenText, engineVoice, engine)
                             ensureGenerationActive(myGeneration)
+                            if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
                             val routeLabel = if (useComm) "SCO" else "Media"
                             if (isRiffWav(audio.bytes)) {
                                 val wav = WavParser.parse(audio.bytes)
@@ -180,6 +218,7 @@ class TtsPlayer internal constructor(
                 }
                 if (success) {
                     played = true
+                    usedEngine = engine
                     break
                 }
             }
@@ -188,6 +227,18 @@ class TtsPlayer internal constructor(
                 throw TtsException(
                     statusCode = lastStatusCode,
                     message = "TTS failed (${failures.joinToString("; ")})",
+                )
+            }
+            if (usedEngine != null) {
+                onSpeakStats?.invoke(
+                    TtsSpeakStats(
+                        inputMode = effectiveMode,
+                        prepareMs = prepareElapsedMs,
+                        rawChars = rawTrimmed.length,
+                        spokenChars = spokenText.length,
+                        engine = usedEngine,
+                        kind = kind,
+                    ),
                 )
             }
         } finally {

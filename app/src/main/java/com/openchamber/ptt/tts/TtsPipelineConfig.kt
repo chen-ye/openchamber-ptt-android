@@ -42,6 +42,44 @@ data class TtsEngineOption(
 )
 
 @Serializable
+enum class TtsInputMode(
+    val title: String,
+    val subtitle: String,
+) {
+    SUMMARIZED(
+        title = "Spoken",
+        subtitle = "Translate technical replies for eyes-free listening at your chosen detail level",
+    ),
+    SANITIZED(
+        title = "Sanitized",
+        subtitle = "Strip markdown, code blocks, and URLs via /api/text/summarize",
+    ),
+    RAW(
+        title = "Raw",
+        subtitle = "Speak exact reply text without translating or sanitizing",
+    ),
+}
+
+@Serializable
+enum class SpokenDetailLevel(
+    val title: String,
+    val subtitle: String,
+) {
+    ESSENTIALS(
+        title = "Essentials",
+        subtitle = "All outcomes, options, and questions — abstracts away internal code mechanics",
+    ),
+    BALANCED(
+        title = "Balanced",
+        subtitle = "Outcomes, options, and named files or modules in spoken prose",
+    ),
+    DETAILED(
+        title = "Detailed",
+        subtitle = "Full technical briefing — explains behavior, symbols, metrics, and options",
+    ),
+}
+
+@Serializable
 enum class SttEngine(
     val title: String,
     val subtitle: String,

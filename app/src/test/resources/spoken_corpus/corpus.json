@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "description": "Genericized corpus of representative coding-agent assistant replies derived from recent sessions for testing SpokenDetailLevel translation prompts and TtsClient normalization.",
+  "samples": [
+    {
+      "id": "01_short_plain_no_translate",
+      "category": "short_confirmation",
+      "sessionLabel": "Auth Service",
+      "expectTranslate": false,
+      "reply": "All unit tests passed with zero warnings. Ready for your next instruction."
+    },
+    {
+      "id": "02_short_with_backticks_and_path",
+      "category": "short_code_question",
+      "sessionLabel": "Auth Service",
+      "expectTranslate": true,
+      "reply": "Updated `AuthService.kt` in `src/auth/AuthService.kt` to enforce a 5-second timeout. Want me to run the auth suite?"
+    },
+    {
+      "id": "03_subagent_wait_status",
+      "category": "async_status",
+      "sessionLabel": "Docs Sync",
+      "expectTranslate": true,
+      "reply": "`librarian` finished cataloging the Markdown formatting spec (`FormatHelpAction.jspa`). Waiting for the `explore` task covering project-specific conventions (`ses_demo_9f8a7b6c`) to finish before giving you the combined answer and updating the plan."
+    },
+    {
+      "id": "04_research_openui_table_and_urls",
+      "category": "research_openui_urls",
+      "sessionLabel": "Voice Coding Research",
+      "expectTranslate": true,
+      "reply": "Research into 2025–2026 voice-driven agentic coding shows a shift from dictating literal syntax to hybrid supervisory control—speaking intent (~150 WPM) while reserving screen and keyboard for diffs and approvals.\n\n```openui-lang\nroot = Stack([loop_card, stack_card])\nloop_card = Card(\"Hybrid Supervisory Control Loop (2026)\", [loop_steps])\nloop_steps = Steps([{title: \"1. Plan (Voice)\"}, {title: \"2. Monitor / Wait\"}, {title: \"3. Review (Screen)\"}, {title: \"4. Teach / Fix\"}], \"row\")\nstack_card = Card(\"2025–2026 Voice Stack Benchmarks\", [model_table])\nmodel_table = Table([\"Model\", \"Runtime\", \"Latency\", \"Caveats\"], [[\"Parakeet TDT 0.6B v3\", \"Local CPU/GPU\", \"~30x RT on CPU\", \"~6.3% WER; batch\"], [\"Kokoro 82M\", \"Local CPU/GPU\", \"~200x RT GPU (<300ms)\", \"0.90% WER; Apache 2.0\"], [\"Inworld TTS-2 Flash\", \"Cloud API\", \"81ms avg TTFA\", \"Fastest cloud TTFA\"]])\n```\n\n### Key Findings\n* **Thinking-Pause Trap ([Endpoint Docs](https://docs.example.com/voice/endpoint-detection)):** Mid-sentence pauses run **600–900 ms**; tight VAD (<500 ms) cuts developers off.\n* **Code ASR Errors ([ArXiv Study](https://arxiv.example.org/html/2601.15339v1)):** Baseline WER exceeds **40–60%** (`\"async\"` → `\"a sink\"`), improved **20.95% WER** via LLM cleanup.\n* **Mobile Walk-Away ([Field Notes, 2026](https://notes.example.org/2026/01/02/mobile-agents/)):** Overlay VPN + Mosh + `tmux` per git worktree."
+    },
+    {
+      "id": "05_capability_matrix_and_hex",
+      "category": "hardware_matrix_hex",
+      "sessionLabel": "Bluetooth Controls",
+      "expectTranslate": true,
+      "reply": "Over Bluetooth, you reliably have **three discrete triggers** (**Single tap**, **Double tap / `NEXT`**, and **Triple tap / `PREVIOUS`**)—**not** press-and-hold or volume buttons.\n\n| Bluetooth Input | Reaches App? | Reliability & Quirk |\n|---|---|---|\n| Single tap (`PLAY` `0x44`, `PAUSE` `0x46`, `PLAY_PAUSE`, `HEADSETHOOK`) | Yes | Universal. AVRCP has no `PLAY_PAUSE` opcode—headsets alternate `PLAY` and `PAUSE`. |\n| Double tap / `NEXT` (`KEYCODE_MEDIA_NEXT` `0x4B`) | Yes | Near-universal. Default `MediaSession` doesn't synthesize double-tap from `PLAY`/`PAUSE`, so `onMediaButtonEvent` must count rapid taps itself. |\n| Triple tap / `PREVIOUS` (`KEYCODE_MEDIA_PREVIOUS` `0x4C`) | Yes | Common on earbuds; absent on bare 1-button earpieces. |\n| Long-press / Hold-to-Talk | No | AVRCP never generates `FLAG_LONG_PRESS`. Earbud holds trigger ANC or HFP `AT+BVRA=1` (OS Assistant). |\n| Headset Volume `+` / `-` | No | Handled internally by AVRCP Absolute Volume / HFP `AT+VGS`. |\n\nSide note: setting `ROLE_ASSISTANT` is the only way headset hold reaches a custom app, which replaces the system assistant globally."
+    },
+    {
+      "id": "06_state_machine_spec_with_question",
+      "category": "state_table_decision",
+      "sessionLabel": "Voice UX Spec",
+      "expectTranslate": true,
+      "reply": "That locks down the full UX spec—adding **automatic TTS readback of the organized draft** on Pause & Stage and **durable per-session draft persistence**.\n\n| State | 1x Tap | 2x Tap or NEXT | 3x Tap, PREV, or X | Studio Earcon |\n|---|---|---|---|---|\n| `ARMED_IDLE` | Start Recording | Read aloud last reply | Disarm (UI / STOP) | `toggle-on.ogg` |\n| `RECORDING` | Stop -> 2.5s Send Grace | Pause, Organize & Readback -> `STAGED_DRAFT` | Discard burst | `start.ogg` |\n| `SEND_GRACE` (2.5s) | Undo -> `STAGED_DRAFT` | Undo -> `STAGED_DRAFT` | Discard | `queued.ogg` -> `send.ogg` |\n| `STAGED_DRAFT` | Append new burst | Commit & Send | Discard draft | `pause.ogg` + TTS |\n\nWould you like me to start implementing this plan now?"
+    },
+    {
+      "id": "07_code_review_findings_and_line_refs",
+      "category": "review_findings_signatures",
+      "sessionLabel": "Guardrail Review",
+      "expectTranslate": true,
+      "reply": "All 14 findings from Round 0 have been verified against the updated diff and test suite (`bun run typecheck`, `bun run lint`, and `bun test`: **83 pass, 0 fail across 21 files**), with no newly introduced regressions.\n\n### Status of Prior Findings\n- **Finding #1 (`notepadToolsEnabled: false` feature-gate)** (`src/tools/notepad-tools.ts:42-88`, `src/index.ts`): **fixed** — `createNotepadTools` enforces `enabled === false` internally, and `setup()` threads `notepadToolsEnabled` through `prepareSubagentPrompt` (`SUBAGENT_CONTRACT_NO_NOTEPAD_DIRECTIVE`).\n- **Finding #2 (Fail-closed escalation guards)** (`src/guards/escalation-guard.ts:115-162`): **fixed** — `getHiddenToolNames({ agent, sessionId })` fails closed when `!enabled` or `agent` is omitted, and both tool `execute` handlers verify `targetAgents`.\n- **Finding #3 (`Tool.Error` banners & `exit: 0` safety)** (`src/types.ts`, `src/guards/output-truncator.ts`): **fixed** — `OpenCodeToolHookEvent` adds `error?: unknown`, and `isToolFailure` returns `exitCode !== 0` immediately so `exit: 0` commands with `\"Error:\"` in stdout never trigger false strikes."
+    },
+    {
+      "id": "08_docker_port_reconfig_and_cli",
+      "category": "infra_paths_cli",
+      "sessionLabel": "Local Services",
+      "expectTranslate": true,
+      "reply": "Done — `media-mcp` is now moved to port **`3034`** (`http://127.0.0.1:3034/mcp`), alongside `tab-helper` (`3033`), leaving port **`3000`** free for `oauth-callback-proxy`.\n\n### What Changed & Verified\n1. **Docker Compose** ([`/home/dev/workspace/media-mcp/docker-compose.yml`](/home/dev/workspace/media-mcp/docker-compose.yml)):\n   - Updated host port mapping from `${PORT:-3000}:3000` to `${PORT:-3034}:3000` and recreated `media-mcp-1` (`127.0.0.1:3034->3000/tcp`). *(Left uncommitted in `/home/dev/workspace/media-mcp` — let me know if you want that committed too.)*\n2. **Global Config** ([`/home/dev/.config/agent/config.jsonc`](/home/dev/.config/agent/config.jsonc)):\n   - Updated via `agent mcp add media --global --url http://127.0.0.1:3034/mcp`.\n3. **Live Verification**:\n   - Port `3000` is unbound (`curl http://127.0.0.1:3000/health` → connection refused).\n   - `agent mcp list` shows `✓ media connected` and `media_whoami()` returned authenticated with all 37 tools active.\n\nRun OAuth reauth anytime without stopping containers:\n```sh\nagent auth login oauth --server http://127.0.0.1:4096\n```"
+    },
+    {
+      "id": "09_benchmark_math_and_openui_chart",
+      "category": "benchmark_math_chart",
+      "sessionLabel": "Decision Model Bench",
+      "expectTranslate": true,
+      "reply": "Ran a controlled **$N = 3$ head-to-head benchmark** on `dashboard-layout.png` comparing standalone VLM extraction (`flash-lite` vs `flash-standard`) against CV box proposal + `decision-classifier-1`.\n\n```openui-lang\nroot = Stack([bench_card])\nbench_card = Card(\"Measured Latency Breakdown (N = 3)\", [bench_chart, bench_note])\nbench_chart = BarChart([\"Flash Lite\", \"Flash Standard\", \"CV + Decision-1\"], [Series(\"p50 ms\", [1420, 2810, 690]), Series(\"p95 ms\", [1680, 3240, 840])], \"ms\")\nbench_note = Callout(\"CV proposer + Decision-1 cuts p50 latency by 51% vs Flash Lite while preserving 98.4% target-hit accuracy.\", \"success\")\n```\n\n**Caveat:** `flash-lite` dropped 2 nested toolbar icons on dense 1080p frames; `CV + Decision-1` requires the local classifier daemon on port `4006`."
+    },
+    {
+      "id": "10_package_update_openui_table_digests",
+      "category": "openui_table_digests",
+      "sessionLabel": "Skills Sync",
+      "expectTranslate": true,
+      "reply": "All 5 skills with clean upstream updates have been updated in place inside `/home/dev/.agent/skills/` and recorded in `/home/dev/.agent/.skill-lock.json` without modifying symlinks or touching your customized `principle-*` skills.\n\n```openui-lang\nroot = Stack([tbl])\ntbl = Table([\"Skill\", \"Source\", \"Updated Digest\", \"Status\"], [\n  [\"edge-workers\", \"example-cloud/skills\", \"600913aa4e\", \"Updated in place\"],\n  [\"review-cli\", \"example-tools/crit\", \"6c6ad378e0\", \"Updated in place\"],\n  [\"browser-cli\", \"example-vendor/browser\", \"cc70f6e5f0\", \"Updated in place\"],\n  [\"debugging\", \"example-team/patterns\", \"774f23e27e\", \"Updated in place\"],\n  [\"telemetry\", \"docs.example-metrics.com\", \"sha256:3a6e6363a8a6\", \"Updated in place\"]\n])\n```"
+    }
+  ]
+}

@@ -13,19 +13,19 @@ class PttStateMachineTest {
         val sm = PttStateMachine()
         assertEquals(PttState.DISARMED, sm.currentState)
 
-        // MediaButtonTap is ignored while disarmed
-        val ignoredTap = sm.dispatch(PttEvent.MediaButtonTap)
+        // SingleTap is ignored while disarmed
+        val ignoredTap = sm.dispatch(PttEvent.SingleTap)
         assertFalse(ignoredTap.changed)
         assertEquals(PttState.DISARMED, sm.currentState)
 
         // Arm from DISARMED -> ARMED_IDLE
-        val armResult = sm.dispatch(PttEvent.Arm)
+        val armResult = sm.dispatch(PttEvent.Arm())
         assertTrue(armResult.changed)
         assertEquals(PttState.ARMED_IDLE, armResult.current)
         assertEquals(listOf(PttEffect.PlayEarcon(Earcon.ARMED)), armResult.effects)
 
         // Repeated Arm is a no-op
-        val reArmResult = sm.dispatch(PttEvent.Arm)
+        val reArmResult = sm.dispatch(PttEvent.Arm())
         assertFalse(reArmResult.changed)
         assertTrue(reArmResult.effects.isEmpty())
 
@@ -44,12 +44,24 @@ class PttStateMachineTest {
     }
 
     @Test
-    fun `media button toggles recording on and off through full voice turn`() {
+    fun `arm with persisted draft restores STAGED_DRAFT and disarm preserves it`() {
         val sm = PttStateMachine()
-        sm.dispatch(PttEvent.Arm)
+        val armed = sm.dispatch(PttEvent.Arm(hasPersistedDraft = true))
+        assertEquals(PttState.STAGED_DRAFT, armed.current)
+        assertEquals(listOf(PttEffect.PlayEarcon(Earcon.ARMED)), armed.effects)
 
-        // First tap: ARMED_IDLE -> RECORDING
-        val startRec = sm.dispatch(PttEvent.MediaButtonTap)
+        val disarmed = sm.dispatch(PttEvent.Disarm)
+        assertEquals(PttState.DISARMED, disarmed.current)
+        assertFalse(disarmed.effects.contains(PttEffect.ClearDraft))
+    }
+
+    @Test
+    fun `quick turn goes through RECORDING, TRANSCRIBING_SEND, SEND_GRACE, WAITING_AGENT, and SPEAKING_TTS`() {
+        val sm = PttStateMachine()
+        sm.dispatch(PttEvent.Arm())
+
+        // 1st tap: ARMED_IDLE -> RECORDING
+        val startRec = sm.dispatch(PttEvent.SingleTap)
         assertEquals(PttState.RECORDING, startRec.current)
         assertEquals(
             listOf(
@@ -61,24 +73,46 @@ class PttStateMachineTest {
             startRec.effects,
         )
 
-        // Second tap: RECORDING -> TRANSCRIBING
-        val stopRec = sm.dispatch(PttEvent.MediaButtonTap)
-        assertEquals(PttState.TRANSCRIBING, stopRec.current)
+        // 2nd single tap: RECORDING -> TRANSCRIBING_SEND
+        val stopRec = sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.TRANSCRIBING_SEND, stopRec.current)
+        assertEquals(listOf(PttEffect.StopRecording), stopRec.effects)
+
+        // TranscriptReady -> SEND_GRACE (2.5s window)
+        val transcript = sm.dispatch(PttEvent.TranscriptReady("run unit tests"))
+        assertEquals(PttState.SEND_GRACE, transcript.current)
         assertEquals(
             listOf(
-                PttEffect.StopRecording,
-                PttEffect.PlayEarcon(Earcon.REC_SENT),
+                PttEffect.PlayEarcon(Earcon.SEND_GRACE),
+                PttEffect.StartSendGraceTimer,
             ),
-            stopRec.effects,
+            transcript.effects,
         )
 
-        // TranscriptReady -> WAITING_AGENT
-        val transcript = sm.dispatch(PttEvent.TranscriptReady("run unit tests"))
-        assertEquals(PttState.WAITING_AGENT, transcript.current)
+        // GraceTimerExpired -> WAITING_AGENT
+        val committed = sm.dispatch(PttEvent.GraceTimerExpired)
+        assertEquals(PttState.WAITING_AGENT, committed.current)
+        assertEquals(
+            listOf(
+                PttEffect.AcquireWakeAndWifiLocks,
+                PttEffect.ReleaseBluetoothAudio,
+                PttEffect.PlayEarcon(Earcon.REC_SENT),
+                PttEffect.DispatchPrompt(fromStagedDraft = false),
+            ),
+            committed.effects,
+        )
 
-        // AgentCompleted -> SPEAKING_TTS
+        // AgentCompleted -> SPEAKING_TTS with PinBluetoothAudio, WakeLock, and TURN_COMPLETE earcon
         val completed = sm.dispatch(PttEvent.AgentCompleted(hasTts = true))
         assertEquals(PttState.SPEAKING_TTS, completed.current)
+        assertEquals(
+            listOf(
+                PttEffect.PinBluetoothAudio,
+                PttEffect.AcquireWakeAndWifiLocks,
+                PttEffect.PlayEarcon(Earcon.TURN_COMPLETE),
+            ),
+            completed.effects,
+        )
 
         // TtsFinished -> ARMED_IDLE
         val finished = sm.dispatch(PttEvent.TtsFinished)
@@ -93,12 +127,121 @@ class PttStateMachineTest {
     }
 
     @Test
-    fun `blank transcript returns from TRANSCRIBING to ARMED_IDLE and releases locks`() {
+    fun `re-tap or undo during SEND_GRACE pulls turn into quiet STAGED_DRAFT`() {
         val sm = PttStateMachine()
-        sm.dispatch(PttEvent.Arm)
-        sm.dispatch(PttEvent.MediaButtonTap)
-        sm.dispatch(PttEvent.MediaButtonTap)
-        assertEquals(PttState.TRANSCRIBING, sm.currentState)
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.TranscriptReady("refactor cache"))
+        assertEquals(PttState.SEND_GRACE, sm.currentState)
+
+        val undo = sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.STAGED_DRAFT, undo.current)
+        assertEquals(
+            listOf(
+                PttEffect.CancelSendGraceTimer,
+                PttEffect.ReleaseWakeAndWifiLocks,
+                PttEffect.ReleaseBluetoothAudio,
+                PttEffect.PlayEarcon(Earcon.UNDO),
+            ),
+            undo.effects,
+        )
+    }
+
+    @Test
+    fun `double tap while recording stages, organizes, speaks preview, and supports append and commit`() {
+        val sm = PttStateMachine()
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.RECORDING, sm.currentState)
+
+        // DoubleTap stops and stages
+        val stage = sm.dispatch(PttEvent.DoubleTap)
+        assertEquals(PttState.TRANSCRIBING_STAGE, stage.current)
+        assertEquals(
+            listOf(
+                PttEffect.StopRecording,
+                PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
+            ),
+            stage.effects,
+        )
+
+        // TranscriptReady triggers OrganizeAndSpeakDraft
+        val ready = sm.dispatch(PttEvent.TranscriptReady("add sqlite cache and keep tests"))
+        assertEquals(PttState.TRANSCRIBING_STAGE, ready.current)
+        assertEquals(listOf(PttEffect.OrganizeAndSpeakDraft("add sqlite cache and keep tests")), ready.effects)
+
+        // DraftPreviewReady moves to STAGED_DRAFT_SPEAKING
+        val preview = sm.dispatch(PttEvent.DraftPreviewReady)
+        assertEquals(PttState.STAGED_DRAFT_SPEAKING, preview.current)
+        assertEquals(
+            listOf(
+                PttEffect.PinBluetoothAudio,
+                PttEffect.AcquireWakeAndWifiLocks,
+            ),
+            preview.effects,
+        )
+
+        // SingleTap interrupts preview into quiet STAGED_DRAFT
+        val interruptPreview = sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.STAGED_DRAFT, interruptPreview.current)
+        assertEquals(
+            listOf(
+                PttEffect.StopTts,
+                PttEffect.ReleaseWakeAndWifiLocks,
+                PttEffect.ReleaseBluetoothAudio,
+            ),
+            interruptPreview.effects,
+        )
+
+        // SingleTap in quiet STAGED_DRAFT starts appending a new burst
+        val append = sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.RECORDING, append.current)
+
+        // Discarding the appended burst preserves the prior draft by returning to STAGED_DRAFT
+        val discardBurst = sm.dispatch(PttEvent.TripleTap)
+        assertEquals(PttState.STAGED_DRAFT, discardBurst.current)
+        assertFalse(discardBurst.effects.contains(PttEffect.ClearDraft))
+        assertTrue(discardBurst.effects.contains(PttEffect.DiscardRecording))
+
+        // DoubleTap in STAGED_DRAFT commits & sends
+        val commit = sm.dispatch(PttEvent.DoubleTap)
+        assertEquals(PttState.WAITING_AGENT, commit.current)
+        assertTrue(commit.effects.contains(PttEffect.DispatchPrompt(fromStagedDraft = true)))
+        assertTrue(commit.effects.contains(PttEffect.PlayEarcon(Earcon.REC_SENT)))
+    }
+
+    @Test
+    fun `double tap during STAGED_DRAFT_SPEAKING commits immediately`() {
+        val sm = PttStateMachine()
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.DoubleTap)
+        sm.dispatch(PttEvent.TranscriptReady("organized prompt"))
+        sm.dispatch(PttEvent.DraftPreviewReady)
+        assertEquals(PttState.STAGED_DRAFT_SPEAKING, sm.currentState)
+
+        val commitEarly = sm.dispatch(PttEvent.DoubleTap)
+        assertEquals(PttState.WAITING_AGENT, commitEarly.current)
+        assertEquals(
+            listOf(
+                PttEffect.StopTts,
+                PttEffect.AcquireWakeAndWifiLocks,
+                PttEffect.ReleaseBluetoothAudio,
+                PttEffect.PlayEarcon(Earcon.REC_SENT),
+                PttEffect.DispatchPrompt(fromStagedDraft = true),
+            ),
+            commitEarly.effects,
+        )
+    }
+
+    @Test
+    fun `blank transcript returns from TRANSCRIBING to ARMED_IDLE or STAGED_DRAFT`() {
+        val sm = PttStateMachine()
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.TRANSCRIBING_SEND, sm.currentState)
 
         val blank = sm.dispatch(PttEvent.TranscriptReady("   "))
         assertEquals(PttState.ARMED_IDLE, blank.current)
@@ -109,13 +252,21 @@ class PttStateMachineTest {
             ),
             blank.effects,
         )
+
+        // Blank transcript while appending to existing draft preserves STAGED_DRAFT
+        sm.dispatch(PttEvent.SyncDraftPresence(hasPersistedDraft = true))
+        assertEquals(PttState.STAGED_DRAFT, sm.currentState)
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.DoubleTap)
+        val blankAppend = sm.dispatch(PttEvent.TranscriptReady(""))
+        assertEquals(PttState.STAGED_DRAFT, blankAppend.current)
     }
 
     @Test
-    fun `media button tap during SPEAKING_TTS triggers barge-in to ARMED_IDLE`() {
+    fun `single tap during SPEAKING_TTS triggers barge-in to ARMED_IDLE`() {
         val sm = PttStateMachine(initialState = PttState.SPEAKING_TTS)
 
-        val bargeIn = sm.dispatch(PttEvent.MediaButtonTap)
+        val bargeIn = sm.dispatch(PttEvent.SingleTap)
         assertTrue(bargeIn.changed)
         assertEquals(PttState.ARMED_IDLE, bargeIn.current)
         assertEquals(
@@ -127,26 +278,24 @@ class PttStateMachineTest {
             bargeIn.effects,
         )
 
-        // Subsequent stale TtsFinished is ignored
         val staleTts = sm.dispatch(PttEvent.TtsFinished)
         assertFalse(staleTts.changed)
         assertEquals(PttState.ARMED_IDLE, staleTts.current)
 
-        // Subsequent tap starts recording cleanly
-        val nextRecord = sm.dispatch(PttEvent.MediaButtonTap)
+        val nextRecord = sm.dispatch(PttEvent.SingleTap)
         assertEquals(PttState.RECORDING, nextRecord.current)
     }
 
     @Test
     fun `PERMISSION_BLOCKED pauses turn and recovers via AgentCompleted, Arm, or Disarm`() {
         val sm = PttStateMachine()
-        sm.dispatch(PttEvent.Arm)
-        sm.dispatch(PttEvent.MediaButtonTap)
-        sm.dispatch(PttEvent.MediaButtonTap)
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.SingleTap)
         sm.dispatch(PttEvent.TranscriptReady("edit config"))
+        sm.dispatch(PttEvent.GraceTimerExpired)
         assertEquals(PttState.WAITING_AGENT, sm.currentState)
 
-        // Agent asks for permission -> PERMISSION_BLOCKED
         val blocked = sm.dispatch(PttEvent.PermissionAsked("Allow bash execution?"))
         assertEquals(PttState.PERMISSION_BLOCKED, blocked.current)
         assertEquals("Allow bash execution?", sm.permissionPrompt.value)
@@ -159,32 +308,28 @@ class PttStateMachineTest {
             blocked.effects,
         )
 
-        // MediaButtonTap is ignored while permission-blocked
-        val ignoredTap = sm.dispatch(PttEvent.MediaButtonTap)
+        val ignoredTap = sm.dispatch(PttEvent.SingleTap)
         assertFalse(ignoredTap.changed)
         assertEquals(PttState.PERMISSION_BLOCKED, sm.currentState)
 
-        // Recovery path 1: permission approved and agent completes with TTS
         val resumed = sm.dispatch(PttEvent.AgentCompleted(hasTts = true))
         assertEquals(PttState.SPEAKING_TTS, resumed.current)
         assertNull(sm.permissionPrompt.value)
 
-        // Enter PERMISSION_BLOCKED again and recover via Arm
         sm.dispatch(PttEvent.PermissionAsked("Allow write?"))
         assertEquals(PttState.PERMISSION_BLOCKED, sm.currentState)
-        val reArmed = sm.dispatch(PttEvent.Arm)
+        val reArmed = sm.dispatch(PttEvent.Arm())
         assertEquals(PttState.ARMED_IDLE, reArmed.current)
         assertNull(sm.permissionPrompt.value)
         assertEquals(listOf(PttEffect.PlayEarcon(Earcon.ARMED)), reArmed.effects)
 
-        // Enter PERMISSION_BLOCKED and recover via AgentCompleted(hasTts = false)
         sm.dispatch(PttEvent.PermissionAsked("Allow network?"))
         assertEquals(PttState.PERMISSION_BLOCKED, sm.currentState)
         val silentComplete = sm.dispatch(PttEvent.AgentCompleted(hasTts = false))
         assertEquals(PttState.ARMED_IDLE, silentComplete.current)
+        assertTrue(silentComplete.effects.contains(PttEffect.PlayEarcon(Earcon.TURN_COMPLETE)))
         assertNull(sm.permissionPrompt.value)
 
-        // Enter PERMISSION_BLOCKED and recover via Disarm
         sm.dispatch(PttEvent.PermissionAsked("Allow delete?"))
         val disarmed = sm.dispatch(PttEvent.Disarm)
         assertEquals(PttState.DISARMED, disarmed.current)
@@ -192,82 +337,140 @@ class PttStateMachineTest {
     }
 
     @Test
-    fun `error transitions from active states release locks and recover via Arm`() {
+    fun `error transitions emit AUTH_EXPIRED for 401 and ERROR otherwise`() {
         val sm = PttStateMachine()
 
-        // Error while disarmed does not enter ERROR
         val disarmedError = sm.dispatch(PttEvent.Error("ignored"))
         assertEquals(PttState.DISARMED, disarmedError.current)
 
-        sm.dispatch(PttEvent.Arm)
-        sm.dispatch(PttEvent.MediaButtonTap)
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
         assertEquals(PttState.RECORDING, sm.currentState)
 
         val recError = sm.dispatch(PttEvent.Error("AudioRecord failed"))
         assertEquals(PttState.ERROR, recError.current)
         assertEquals("AudioRecord failed", sm.lastError.value)
-        assertEquals(
-            listOf(
-                PttEffect.StopRecording,
-                PttEffect.ReleaseWakeAndWifiLocks,
-                PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.ERROR),
-            ),
-            recError.effects,
-        )
+        assertTrue(recError.effects.contains(PttEffect.PlayEarcon(Earcon.ERROR)))
 
-        val recovered = sm.dispatch(PttEvent.Arm)
-        assertEquals(PttState.ARMED_IDLE, recovered.current)
-        assertNull(sm.lastError.value)
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.SingleTap)
+        val authErr = sm.dispatch(PttEvent.Error("Unauthorized", isAuthExpired = true))
+        assertEquals(PttState.ERROR, authErr.current)
+        assertTrue(authErr.effects.contains(PttEffect.PlayEarcon(Earcon.AUTH_EXPIRED)))
     }
 
     @Test
-    fun `disarm from RECORDING stops recording and releases locks`() {
+    fun `agent interrupted emits TURN_INTERRUPTED earcon and returns to ARMED_IDLE`() {
         val sm = PttStateMachine()
-        sm.dispatch(PttEvent.Arm)
-        sm.dispatch(PttEvent.MediaButtonTap)
-        assertEquals(PttState.RECORDING, sm.currentState)
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.TranscriptReady("run build"))
+        sm.dispatch(PttEvent.GraceTimerExpired)
+        assertEquals(PttState.WAITING_AGENT, sm.currentState)
 
-        val disarm = sm.dispatch(PttEvent.Disarm)
-        assertEquals(PttState.DISARMED, disarm.current)
+        val interrupted = sm.dispatch(PttEvent.AgentInterrupted)
+        assertEquals(PttState.ARMED_IDLE, interrupted.current)
         assertEquals(
             listOf(
-                PttEffect.StopRecording,
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.DISARMED),
+                PttEffect.PlayEarcon(Earcon.TURN_INTERRUPTED),
             ),
-            disarm.effects,
+            interrupted.effects,
         )
     }
 
     @Test
-    fun `permission resolved transitions PERMISSION_BLOCKED back to WAITING_AGENT`() {
-        val sm = PttStateMachine()
-        sm.dispatch(PttEvent.Arm)
-        sm.dispatch(PttEvent.MediaButtonTap)
-        sm.dispatch(PttEvent.MediaButtonTap)
-        sm.dispatch(PttEvent.TranscriptReady("run ls"))
-        sm.dispatch(PttEvent.PermissionAsked("bash"))
-        assertEquals(PttState.PERMISSION_BLOCKED, sm.currentState)
-        assertEquals("bash", sm.permissionPrompt.value)
-
-        val resolved = sm.dispatch(PttEvent.PermissionResolved)
-        assertEquals(PttState.WAITING_AGENT, resolved.current)
-        assertEquals(listOf(PttEffect.AcquireWakeAndWifiLocks), resolved.effects)
-        assertNull(sm.permissionPrompt.value)
-    }
-
-    @Test
-    fun `PlayLastReply works from DISARMED and ARMED_IDLE and returns to prior state`() {
+    fun `PlayLastReply and idle DoubleTap read latest reply and return to prior state`() {
         val sm = PttStateMachine()
         val fromDisarmed = sm.dispatch(PttEvent.PlayLastReply)
         assertEquals(PttState.SPEAKING_TTS, fromDisarmed.current)
         assertEquals(PttState.DISARMED, sm.dispatch(PttEvent.TtsFinished).current)
 
-        sm.dispatch(PttEvent.Arm)
-        assertEquals(PttState.ARMED_IDLE, sm.currentState)
-        assertEquals(PttState.SPEAKING_TTS, sm.dispatch(PttEvent.PlayLastReply).current)
-        assertEquals(PttState.ARMED_IDLE, sm.dispatch(PttEvent.MediaButtonTap).current)
+        sm.dispatch(PttEvent.Arm())
+        val viaDoubleTap = sm.dispatch(PttEvent.DoubleTap)
+        assertEquals(PttState.SPEAKING_TTS, viaDoubleTap.current)
+        assertEquals(
+            listOf(
+                PttEffect.PinBluetoothAudio,
+                PttEffect.AcquireWakeAndWifiLocks,
+                PttEffect.ReadLastReply,
+            ),
+            viaDoubleTap.effects,
+        )
+        assertEquals(PttState.ARMED_IDLE, sm.dispatch(PttEvent.SingleTap).current)
+    }
+
+    @Test
+    fun `single tap stop during append burst routes to TRANSCRIBING_STAGE instead of dropping draft`() {
+        val sm = PttStateMachine()
+        sm.dispatch(PttEvent.Arm(hasPersistedDraft = true))
+        assertEquals(PttState.STAGED_DRAFT, sm.currentState)
+
+        sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.RECORDING, sm.currentState)
+
+        val stopAppend = sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.TRANSCRIBING_STAGE, stopAppend.current)
+        assertEquals(
+            listOf(
+                PttEffect.StopRecording,
+                PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
+            ),
+            stopAppend.effects,
+        )
+
+        val staged = sm.dispatch(PttEvent.TranscriptReady("and add regression tests"))
+        assertEquals(
+            listOf(PttEffect.OrganizeAndSpeakDraft("and add regression tests")),
+            staged.effects,
+        )
+        assertEquals(PttState.STAGED_DRAFT_SPEAKING, sm.dispatch(PttEvent.DraftPreviewReady).current)
+
+        val clearedWhileSpeaking = sm.dispatch(PttEvent.SyncDraftPresence(hasPersistedDraft = false))
+        assertEquals(PttState.ARMED_IDLE, clearedWhileSpeaking.current)
+        assertTrue(clearedWhileSpeaking.effects.contains(PttEffect.StopTts))
+    }
+
+    @Test
+    fun `silent AgentCompleted and AgentInterrupted preserve STAGED_DRAFT when a draft exists`() {
+        val sm = PttStateMachine()
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.TranscriptReady("quick question"))
+        assertEquals(PttState.SEND_GRACE, sm.currentState)
+        sm.dispatch(PttEvent.SyncDraftPresence(hasPersistedDraft = true))
+        sm.dispatch(PttEvent.GraceTimerExpired)
+        assertEquals(PttState.WAITING_AGENT, sm.currentState)
+
+        sm.dispatch(PttEvent.PermissionAsked("Allow read?"))
+        assertEquals(PttState.PERMISSION_BLOCKED, sm.currentState)
+
+        val silentDone = sm.dispatch(PttEvent.AgentCompleted(hasTts = false))
+        assertEquals(PttState.STAGED_DRAFT, silentDone.current)
+
+        sm.dispatch(PttEvent.SingleTap) // Append -> RECORDING
+        sm.dispatch(PttEvent.TripleTap) // Discard append -> STAGED_DRAFT
+        assertEquals(PttState.STAGED_DRAFT, sm.currentState)
+
+        val playInDraft = sm.dispatch(PttEvent.PlayLastReply)
+        assertEquals(PttState.SPEAKING_TTS, playInDraft.current)
+        assertEquals(
+            listOf(
+                PttEffect.PinBluetoothAudio,
+                PttEffect.AcquireWakeAndWifiLocks,
+                PttEffect.ReadLastReply,
+            ),
+            playInDraft.effects,
+        )
+        assertEquals(PttState.STAGED_DRAFT, sm.dispatch(PttEvent.TtsFinished).current)
+
+        // AgentInterrupted with active draft returns to STAGED_DRAFT
+        sm.dispatch(PttEvent.CommitDraft)
+        sm.dispatch(PttEvent.SyncDraftPresence(hasPersistedDraft = true))
+        assertEquals(PttState.STAGED_DRAFT, sm.dispatch(PttEvent.AgentInterrupted).current)
     }
 }

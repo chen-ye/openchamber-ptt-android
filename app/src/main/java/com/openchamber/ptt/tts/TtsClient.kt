@@ -74,6 +74,7 @@ data class TtsAudio(
 class TtsClient(
     private val httpClient: OkHttpClient,
     private val json: Json = DefaultJson,
+    private val summarizeTimeoutMs: Long = DEFAULT_SUMMARIZE_TIMEOUT_MS,
 ) {
     internal val ttsHttpClient: OkHttpClient = if (httpClient.readTimeoutMillis < MIN_TTS_READ_TIMEOUT_MS) {
         httpClient.newBuilder()
@@ -81,6 +82,94 @@ class TtsClient(
             .build()
     } else {
         httpClient
+    }
+
+    internal val summarizeHttpClient: OkHttpClient = httpClient.newBuilder()
+        .callTimeout(summarizeTimeoutMs, TimeUnit.MILLISECONDS)
+        .readTimeout(summarizeTimeoutMs, TimeUnit.MILLISECONDS)
+        .build()
+
+    suspend fun prepareTextForTts(
+        serverUrl: String,
+        text: String,
+        inputMode: TtsInputMode,
+        sessionLabel: String? = null,
+        detailLevel: SpokenDetailLevel = SpokenDetailLevel.BALANCED,
+    ): String {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return ""
+        return when (inputMode) {
+            TtsInputMode.RAW -> trimmed
+            TtsInputMode.SANITIZED -> sanitizeForTts(serverUrl, trimmed)
+            TtsInputMode.SUMMARIZED -> {
+                if (shouldTranslateForSpeech(trimmed)) {
+                    val translated = summarizeForSpeech(
+                        serverUrl = serverUrl,
+                        text = trimmed,
+                        sessionLabel = sessionLabel,
+                        detailLevel = detailLevel,
+                    )
+                    if (translated != null) {
+                        return normalizeSpokenOutput(translated).ifEmpty { trimmed }
+                    }
+                } else {
+                    return normalizeSpokenOutput(trimmed).ifEmpty { trimmed }
+                }
+                sanitizeForTts(serverUrl, trimmed)
+            }
+        }
+    }
+
+    suspend fun summarizeForSpeech(
+        serverUrl: String,
+        text: String,
+        sessionLabel: String? = null,
+        detailLevel: SpokenDetailLevel = SpokenDetailLevel.BALANCED,
+    ): String? {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return null
+
+        val cleanLabel = sessionLabel?.trim()?.takeIf { it.isNotEmpty() }
+        val prompt = if (cleanLabel != null) {
+            "Session: $cleanLabel\n\nAssistant reply:\n$trimmed"
+        } else {
+            trimmed
+        }
+
+        val baseUrl = OpenChamberHttp.normalizeBaseUrl(serverUrl)
+        val payload = json.encodeToString(
+            SmallModelGenerateRequest(
+                prompt = prompt,
+                system = buildSpokenSystemPrompt(detailLevel),
+            ),
+        )
+        val request = Request.Builder()
+            .url("$baseUrl$SMALL_MODEL_GENERATE_PATH")
+            .post(payload.toRequestBody(JSON_MEDIA_TYPE))
+            .header("Accept", "application/json")
+            .build()
+
+        return try {
+            val response = executeBytes(summarizeHttpClient, request, "summarizing text for TTS")
+            if (response.statusCode == 401) {
+                throw TtsException(statusCode = 401, message = "Unauthorized summarizing text for TTS")
+            }
+            if (response.statusCode !in 200..299 || response.bytes.isEmpty()) {
+                return null
+            }
+            val bodyText = response.bytes.toString(Charsets.UTF_8).trim()
+            if (bodyText.isEmpty()) return null
+            val obj = runCatching { json.parseToJsonElement(bodyText) as? JsonObject }.getOrNull()
+                ?: return null
+            obj.stringOrNull("text")?.trim()?.takeIf { it.isNotEmpty() }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (te: TtsException) {
+            if (te.statusCode == 401) throw te
+            null
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     suspend fun sanitizeForTts(
@@ -100,6 +189,9 @@ class TtsClient(
 
         return try {
             val response = executeBytes(httpClient, request, "sanitizing text for TTS")
+            if (response.statusCode == 401) {
+                throw TtsException(statusCode = 401, message = "Unauthorized sanitizing text for TTS")
+            }
             if (response.statusCode !in 200..299 || response.bytes.isEmpty()) {
                 return trimmed
             }
@@ -110,6 +202,9 @@ class TtsClient(
             extractSummaryText(bodyText) ?: trimmed
         } catch (ce: CancellationException) {
             throw ce
+        } catch (te: TtsException) {
+            if (te.statusCode == 401) throw te
+            trimmed
         } catch (_: Throwable) {
             trimmed
         }
@@ -389,6 +484,12 @@ class TtsClient(
     )
 
     @Serializable
+    private data class SmallModelGenerateRequest(
+        val prompt: String,
+        val system: String,
+    )
+
+    @Serializable
     private data class TtsSpeakRequest(
         val text: String,
         val baseURL: String = DEFAULT_TTS_BASE_URL,
@@ -414,12 +515,82 @@ class TtsClient(
 
     companion object {
         const val SUMMARIZE_PATH = "/api/text/summarize"
+        const val SMALL_MODEL_GENERATE_PATH = OpenChamberHttp.SMALL_MODEL_GENERATE_PATH
         const val TTS_SPEAK_PATH = "/api/tts/speak"
         const val KOKORO_SPEAK_PATH = "/api/dictation/tts/speak"
         const val GUEST_TTS_SERVICE_REQUEST_PATH = "/api/guests/gemini-tts-bridge/service/request"
         const val VOICES_PATH = "/v1/audio/voices"
 
         const val SUMMARIZE_MODE_TTS = "tts"
+        const val TTS_SUMMARIZE_MIN_CHARS = 180
+
+        fun buildSpokenSystemPrompt(detailLevel: SpokenDetailLevel): String {
+            val abstractionGuidance = when (detailLevel) {
+                SpokenDetailLevel.ESSENTIALS ->
+                    "Abstraction level — Essentials: Target 2 to 5 concise sentences unless listing actionable user choices: preserve EVERY actionable decision, choice/option, blocker, caveat, and closing question, " +
+                        "while summarizing informational benchmark/reference tables into a one-sentence takeaway without per-row metrics, citation domains, filenames, class names, hex codes, API routes, or protocol internals. " +
+                        "Only ask a closing question if the original reply asks one."
+                SpokenDetailLevel.BALANCED ->
+                    "Abstraction level — Balanced: Cover every outcome, option, tradeoff, caveat, and closing question, " +
+                        "naming key files or components with spoken extensions (for example, 'docker-compose dot yml', never full directory prefixes) and omitting opaque commit SHAs, lockfile digests, UUIDs, and session IDs."
+                SpokenDetailLevel.DETAILED ->
+                    "Abstraction level — Detailed: Deliver a thorough technical briefing for the ear—walk through all options, behaviors, state/method/endpoint roles, " +
+                        "metrics, error details, and edge cases in logical order, translating tables and code into clear spoken explanations (refer to hex codes, SHAs, digests, and IDs by meaning rather than spelling them character-by-character, and drop boilerplate home-directory prefixes)."
+            }
+            return "You are a written-to-spoken translator for a software engineer working eyes-free with no screen access. " +
+                "NEVER omit actionable user options, choices, questions, warnings, caveats, or key outcomes (distinguish user choices from informational reference tables). " +
+                "Translate markdown, tables, bullet lists, URLs, and code into natural spoken prose in the same language as the reply.\n" +
+                "UI blocks & tables:\n" +
+                "- Treat fenced `openui-lang` blocks as visual cards, steps, charts, and tables: speak ONLY the domain titles, steps, and data rows inside them (count data rows, never header columns as options); NEVER narrate DSL container primitives (`Stack`, `Card`, `Steps`, `Table`, `BarChart`, `Series`, `Callout`, `row`, or tone arguments like `success`/`warning`/`info`/`error`).\n" +
+                "- When a table column header lists alternate triggers or aliases (for example `2x Tap or NEXT` and `3x Tap, PREV, or X`), state that mapping once up front before reading the rows, and keep state-level metadata columns (such as earcons) bound to the state itself rather than inventing per-action side effects.\n" +
+                "Spoken phrasing rules:\n" +
+                "- Never speak literal separator names like 'underscore', 'dash', or 'slash' chains: " +
+                "turn `SEND_GRACE` into 'Send Grace', `gemini-3.8-flash-lite-tts` into 'Gemini 3.8 Flash Lite TTS', `openchamber_api35` into 'openchamber API 35', " +
+                "and `src/auth/AuthService.kt` into 'AuthService dot kt under src auth'.\n" +
+                "- Expand shorthands cleanly: say 'single tap', 'double tap', 'triple tap' (never 'one times tap'), 'or' for `/` between triggers (never 'for'), 'Previous' (never 'Prev'), 'undoes' (never 'undos'), '2025 to 2026' for ranges, and 'reduced by' vs 'down to' accurately.\n" +
+                "- Never read hex codes, commit SHAs, SHA-256 digests, UUIDs, or opaque session IDs aloud—refer to them by meaning ('the PLAY opcode', 'updated digest', 'the explore task') unless comparing two exact hashes is the main subject; keep 4-digit port numbers as normal numbers ('port 4006') and turn HTTP codes into speech ('four oh one unauthorized').\n" +
+                "- Cite URLs by source or bare domain only ('on granda dot org', 'on arXiv'), and paraphrase CLI commands/loopback URLs ('with the server flag on localhost port 4096') without raw `http://` or `--`.\n" +
+                "- Use commas, periods, double dashes (--), ellipses (...), and sparing ALL CAPS on critical status words for pacing. Never output markdown syntax, bullet characters, backticks, bracketed/angle-bracket audio tags, SSML, or IPA.\n" +
+                abstractionGuidance
+        }
+
+        val SUMMARIZE_SYSTEM_PROMPT: String = buildSpokenSystemPrompt(SpokenDetailLevel.BALANCED)
+
+        internal fun shouldTranslateForSpeech(text: String): Boolean {
+            val trimmed = text.trim()
+            if (trimmed.isEmpty()) return false
+            if (trimmed.length >= TTS_SUMMARIZE_MIN_CHARS) return true
+            return trimmed.contains("```") ||
+                trimmed.contains('`') ||
+                trimmed.contains("http://") ||
+                trimmed.contains("https://") ||
+                trimmed.contains("](") ||
+                MARKDOWN_LINE_REGEX.containsMatchIn(trimmed) ||
+                PATH_LIKE_REGEX.containsMatchIn(trimmed)
+        }
+
+        internal fun normalizeSpokenOutput(text: String): String {
+            return text
+                .replace(Regex("""\[([^\]]+)]\(([^)]+)\)"""), "$1")
+                .replace(Regex("""\[\s*(?:short|medium|long)?\s*pause\s*]""", RegexOption.IGNORE_CASE), " ")
+                .replace(Regex("""<\s*/?\s*(?:(?:short|medium|long)?\s*pause|sigh|laugh|gasp|uhm|break\b[^>]*)\s*>""", RegexOption.IGNORE_CASE), " ")
+                .replace(Regex("""https?://"""), "")
+                .replace("```", " ")
+                .replace("`", "")
+                .replace("**", "")
+                .replace("__", "")
+                .replace(Regex("""(?m)^\s{0,3}#{1,6}\s+"""), "")
+                .replace(Regex("""(?m)^\s*[-*+]\s+"""), "")
+                .replace(Regex("""(?<!\*)\*([^*\n]+?)\*(?!\*)"""), "$1")
+                .replace(Regex("""(?<=[\p{L}\p{N}])_(?=[\p{L}\p{N}])"""), " ")
+                .replace(Regex("""(?<=[\p{L}\p{N})])\h*\n+\s*"""), ". ")
+                .replace(Regex("""\h+([.!?,;:])"""), "$1")
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+        }
+
+        private val MARKDOWN_LINE_REGEX = Regex("""(?m)^\s*(?:#{1,6}\s+|[-*+]\s+|\d+\.\s+|\|.+\|)""")
+        private val PATH_LIKE_REGEX = Regex("""(?:^|\s)(?:~?/|[\w.-]+/[\w./-]+)""")
         const val DEFAULT_TTS_BASE_URL = "http://127.0.0.1:4005/v1"
         const val DEFAULT_TTS_VOICE = "Kore"
         const val DEFAULT_TTS_MODEL = "google/gemini-3.8-flash-lite-tts"
@@ -433,6 +604,7 @@ class TtsClient(
         const val DEFAULT_KOKORO_SPEAKER_ID = 0
         const val MIN_TTS_READ_TIMEOUT_MS = 60_000L
         const val DEFAULT_TTS_READ_TIMEOUT_MS = 90_000L
+        const val DEFAULT_SUMMARIZE_TIMEOUT_MS = 10_000L
 
         private const val DEFAULT_AUDIO_CONTENT_TYPE = "audio/wav"
         private const val AUDIO_ACCEPT_HEADER = "audio/wav, audio/*;q=0.9, application/octet-stream;q=0.8"

@@ -1,15 +1,21 @@
 package com.openchamber.ptt.service
 
+import com.openchamber.ptt.storage.PinnedSession
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PttForegroundServiceHelpersTest {
     @Test
-    fun `audio capture constants match 16kHz mono PCM16LE 200ms chunks and 90s cap`() {
+    fun `audio capture constants match 16kHz mono PCM16LE 200ms chunks and 5m safety cap`() {
         assertEquals(16_000, PttForegroundService.SAMPLE_RATE_HZ)
         assertEquals(200, PttForegroundService.CHUNK_DURATION_MS)
         assertEquals(6_400, PttForegroundService.CHUNK_SIZE_BYTES)
-        assertEquals(90_000L, PttForegroundService.MAX_UTTERANCE_MS)
+        assertEquals(300_000L, PttForegroundService.MAX_UTTERANCE_MS)
+        assertEquals(285_000L, PttForegroundService.MAX_UTTERANCE_WARNING_MS)
+        assertEquals(2_500L, PttForegroundService.SEND_GRACE_MS)
         assertEquals(150L, PttForegroundService.BARGE_IN_COOLDOWN_MS)
     }
 
@@ -43,5 +49,67 @@ class PttForegroundServiceHelpersTest {
             PttForegroundService.formatVoicePrompt("  check git status  "),
         )
         assertEquals("", PttForegroundService.formatVoicePrompt("   "))
+    }
+
+    @Test
+    fun `formatSpeechSessionLabel prefers title and falls back to directory basename`() {
+        assertEquals(
+            "Payments refactor",
+            PttForegroundService.formatSpeechSessionLabel(
+                PinnedSession(
+                    sessionId = "s1",
+                    directory = "/home/user/payments",
+                    title = "  Payments refactor  ",
+                ),
+            ),
+        )
+        assertEquals(
+            "openchamber-ptt-android",
+            PttForegroundService.formatSpeechSessionLabel(
+                PinnedSession(
+                    sessionId = "s2",
+                    directory = "/home/dev/Projects/openchamber-ptt-android/",
+                    title = "   ",
+                ),
+            ),
+        )
+        assertNull(
+            PttForegroundService.formatSpeechSessionLabel(
+                PinnedSession(sessionId = "s3", directory = "  ", title = ""),
+            ),
+        )
+    }
+
+    @Test
+    fun `shouldCancelTurnOnIdleReturn cancels abandoned turns for both ARMED_IDLE and STAGED_DRAFT`() {
+        val armToStaged = PttTransition(
+            previous = PttState.PERMISSION_BLOCKED,
+            current = PttState.STAGED_DRAFT,
+            event = PttEvent.Arm(hasPersistedDraft = true),
+            effects = emptyList(),
+        )
+        val bargeInToStaged = PttTransition(
+            previous = PttState.SPEAKING_TTS,
+            current = PttState.STAGED_DRAFT,
+            event = PttEvent.SingleTap,
+            effects = emptyList(),
+        )
+        val armToIdle = PttTransition(
+            previous = PttState.PERMISSION_BLOCKED,
+            current = PttState.ARMED_IDLE,
+            event = PttEvent.Arm(hasPersistedDraft = false),
+            effects = emptyList(),
+        )
+        val normalPullBack = PttTransition(
+            previous = PttState.SEND_GRACE,
+            current = PttState.STAGED_DRAFT,
+            event = PttEvent.SingleTap,
+            effects = emptyList(),
+        )
+
+        assertTrue(PttForegroundService.shouldCancelTurnOnIdleReturn(armToStaged))
+        assertTrue(PttForegroundService.shouldCancelTurnOnIdleReturn(bargeInToStaged))
+        assertTrue(PttForegroundService.shouldCancelTurnOnIdleReturn(armToIdle))
+        assertFalse(PttForegroundService.shouldCancelTurnOnIdleReturn(normalPullBack))
     }
 }

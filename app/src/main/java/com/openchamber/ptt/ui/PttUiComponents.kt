@@ -1,11 +1,11 @@
 package com.openchamber.ptt.ui
 
 import android.content.Context
-import android.content.Intent
-import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
 import android.widget.Toast
+import androidx.annotation.DrawableRes
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -14,41 +14,37 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.annotation.DrawableRes
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -63,28 +59,24 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.openchamber.ptt.R
 import com.openchamber.ptt.service.PttState
-import com.openchamber.ptt.session.ServerSessionsResult
-import com.openchamber.ptt.session.SessionSummary
 import com.openchamber.ptt.storage.PinnedSession
-import com.openchamber.ptt.storage.ServerProfile
-import com.openchamber.ptt.tts.MlKitTtsVoiceSummary
-import com.openchamber.ptt.tts.SystemTtsVoiceSummary
-import com.openchamber.ptt.tts.TtsEngine
-import com.openchamber.ptt.tts.TtsEngineOption
-import com.openchamber.ptt.tts.TtsVoice
-import com.openchamber.ptt.tts.VoicePipelineDefaults
-import com.openchamber.ptt.voice.MlKitAvailability
-import com.openchamber.ptt.voice.MlKitStatusReport
-import com.openchamber.ptt.voice.MlKitSttClient
+import com.openchamber.ptt.storage.StagedDraft
+import com.openchamber.ptt.tts.SpokenDetailLevel
 import kotlinx.coroutines.delay
+import java.util.Locale
 
 internal data class PttStateVisuals(
     val label: String,
@@ -115,11 +107,35 @@ internal fun rememberStateVisuals(pttState: PttState): PttStateVisuals {
             contentColor = scheme.onErrorContainer,
             dotColor = scheme.error,
         )
-        PttState.TRANSCRIBING -> PttStateVisuals(
+        PttState.TRANSCRIBING_SEND -> PttStateVisuals(
             label = "Transcribing",
             containerColor = scheme.secondaryContainer,
             contentColor = scheme.onSecondaryContainer,
             dotColor = scheme.secondary,
+        )
+        PttState.TRANSCRIBING_STAGE -> PttStateVisuals(
+            label = "Organizing draft",
+            containerColor = scheme.secondaryContainer,
+            contentColor = scheme.onSecondaryContainer,
+            dotColor = scheme.secondary,
+        )
+        PttState.SEND_GRACE -> PttStateVisuals(
+            label = "Sending soon",
+            containerColor = scheme.tertiaryContainer,
+            contentColor = scheme.onTertiaryContainer,
+            dotColor = scheme.tertiary,
+        )
+        PttState.STAGED_DRAFT -> PttStateVisuals(
+            label = "Draft staged",
+            containerColor = scheme.primaryContainer,
+            contentColor = scheme.onPrimaryContainer,
+            dotColor = scheme.primary,
+        )
+        PttState.STAGED_DRAFT_SPEAKING -> PttStateVisuals(
+            label = "Reading draft",
+            containerColor = scheme.tertiaryContainer,
+            contentColor = scheme.onTertiaryContainer,
+            dotColor = scheme.tertiary,
         )
         PttState.WAITING_AGENT -> PttStateVisuals(
             label = "Thinking",
@@ -168,7 +184,9 @@ internal fun StatusPill(
         color = visuals.containerColor,
         contentColor = visuals.contentColor,
         shape = RoundedCornerShape(50),
-        modifier = modifier,
+        modifier = modifier.semantics(mergeDescendants = true) {
+            liveRegion = LiveRegionMode.Polite
+        },
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -268,6 +286,7 @@ internal fun SessionPill(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun HeroPttControl(
     pttState: PttState,
@@ -277,6 +296,11 @@ internal fun HeroPttControl(
     compact: Boolean,
     onArm: () -> Unit,
     onTapPtt: () -> Unit,
+    onStageCapture: (() -> Unit)? = null,
+    onDiscard: (() -> Unit)? = null,
+    onPullBackToDraft: (() -> Unit)? = null,
+    sendGraceRemainingMs: Long? = null,
+    pendingQuickTranscript: String? = null,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -297,8 +321,14 @@ internal fun HeroPttControl(
 
     val isActionable = when (pttState) {
         PttState.DISARMED, PttState.ERROR, PttState.PERMISSION_BLOCKED -> canArm
-        PttState.ARMED_IDLE, PttState.RECORDING, PttState.SPEAKING_TTS -> true
-        PttState.TRANSCRIBING, PttState.WAITING_AGENT -> false
+        PttState.ARMED_IDLE,
+        PttState.RECORDING,
+        PttState.SEND_GRACE,
+        PttState.STAGED_DRAFT,
+        PttState.STAGED_DRAFT_SPEAKING,
+        PttState.SPEAKING_TTS,
+        -> true
+        PttState.TRANSCRIBING_SEND, PttState.TRANSCRIBING_STAGE, PttState.WAITING_AGENT -> false
     }
 
     val targetContainerColor = when (pttState) {
@@ -307,10 +337,16 @@ internal fun HeroPttControl(
         } else {
             MaterialTheme.colorScheme.surfaceContainerHigh
         }
-        PttState.ARMED_IDLE -> MaterialTheme.colorScheme.primaryContainer
+        PttState.ARMED_IDLE, PttState.STAGED_DRAFT -> MaterialTheme.colorScheme.primaryContainer
         PttState.RECORDING -> MaterialTheme.colorScheme.error
-        PttState.TRANSCRIBING, PttState.WAITING_AGENT -> MaterialTheme.colorScheme.secondaryContainer
-        PttState.SPEAKING_TTS -> MaterialTheme.colorScheme.tertiaryContainer
+        PttState.TRANSCRIBING_SEND,
+        PttState.TRANSCRIBING_STAGE,
+        PttState.WAITING_AGENT,
+        -> MaterialTheme.colorScheme.secondaryContainer
+        PttState.SEND_GRACE,
+        PttState.STAGED_DRAFT_SPEAKING,
+        PttState.SPEAKING_TTS,
+        -> MaterialTheme.colorScheme.tertiaryContainer
         PttState.PERMISSION_BLOCKED, PttState.ERROR -> MaterialTheme.colorScheme.errorContainer
     }
     val targetContentColor = when (pttState) {
@@ -319,10 +355,16 @@ internal fun HeroPttControl(
         } else {
             MaterialTheme.colorScheme.onSurfaceVariant
         }
-        PttState.ARMED_IDLE -> MaterialTheme.colorScheme.onPrimaryContainer
+        PttState.ARMED_IDLE, PttState.STAGED_DRAFT -> MaterialTheme.colorScheme.onPrimaryContainer
         PttState.RECORDING -> MaterialTheme.colorScheme.onError
-        PttState.TRANSCRIBING, PttState.WAITING_AGENT -> MaterialTheme.colorScheme.onSecondaryContainer
-        PttState.SPEAKING_TTS -> MaterialTheme.colorScheme.onTertiaryContainer
+        PttState.TRANSCRIBING_SEND,
+        PttState.TRANSCRIBING_STAGE,
+        PttState.WAITING_AGENT,
+        -> MaterialTheme.colorScheme.onSecondaryContainer
+        PttState.SEND_GRACE,
+        PttState.STAGED_DRAFT_SPEAKING,
+        PttState.SPEAKING_TTS,
+        -> MaterialTheme.colorScheme.onTertiaryContainer
         PttState.PERMISSION_BLOCKED, PttState.ERROR -> MaterialTheme.colorScheme.onErrorContainer
     }
 
@@ -337,7 +379,11 @@ internal fun HeroPttControl(
         label = "pttButtonFg",
     )
 
-    val pulseScale = if (animationsEnabled && (pttState == PttState.RECORDING || pttState == PttState.SPEAKING_TTS)) {
+    val isPulsing = pttState == PttState.RECORDING ||
+        pttState == PttState.SPEAKING_TTS ||
+        pttState == PttState.STAGED_DRAFT_SPEAKING ||
+        pttState == PttState.SEND_GRACE
+    val pulseScale = if (animationsEnabled && isPulsing) {
         val infiniteTransition = rememberInfiniteTransition(label = "pttPulse")
         val animatedScale by infiniteTransition.animateFloat(
             initialValue = 1.0f,
@@ -358,10 +404,11 @@ internal fun HeroPttControl(
 
     @DrawableRes val iconRes: Int = when (pttState) {
         PttState.DISARMED -> R.drawable.ic_headset_mic
-        PttState.ARMED_IDLE -> R.drawable.ic_ptt_mic
+        PttState.ARMED_IDLE, PttState.STAGED_DRAFT -> R.drawable.ic_ptt_mic
         PttState.RECORDING -> R.drawable.ic_stop
-        PttState.TRANSCRIBING, PttState.WAITING_AGENT -> R.drawable.ic_hourglass_top
-        PttState.SPEAKING_TTS -> R.drawable.ic_volume_off
+        PttState.SEND_GRACE -> R.drawable.ic_undo
+        PttState.TRANSCRIBING_SEND, PttState.TRANSCRIBING_STAGE, PttState.WAITING_AGENT -> R.drawable.ic_hourglass_top
+        PttState.SPEAKING_TTS, PttState.STAGED_DRAFT_SPEAKING -> R.drawable.ic_volume_off
         PttState.PERMISSION_BLOCKED -> R.drawable.ic_warning_amber
         PttState.ERROR -> R.drawable.ic_error_outline
     }
@@ -374,7 +421,14 @@ internal fun HeroPttControl(
             val secs = elapsedSeconds % 60L
             "Stop & Send · $mins:${secs.toString().padStart(2, '0')}"
         }
-        PttState.TRANSCRIBING -> "Transcribing…"
+        PttState.TRANSCRIBING_SEND -> "Transcribing…"
+        PttState.TRANSCRIBING_STAGE -> "Organizing Draft…"
+        PttState.SEND_GRACE -> {
+            val secsText = sendGraceRemainingMs?.let { String.format(Locale.US, "%.1fs", it / 1000.0) } ?: "2.5s"
+            "Tap to Undo · $secsText"
+        }
+        PttState.STAGED_DRAFT -> "Append Voice"
+        PttState.STAGED_DRAFT_SPEAKING -> "Stop Preview"
         PttState.WAITING_AGENT -> "Agent Thinking…"
         PttState.SPEAKING_TTS -> "Tap to Interrupt"
         PttState.PERMISSION_BLOCKED -> "Tap to Re-Arm"
@@ -387,9 +441,13 @@ internal fun HeroPttControl(
         } else {
             "Select a pinned session above to arm"
         }
-        PttState.ARMED_IDLE -> "Headset play/pause button also toggles talk"
-        PttState.RECORDING -> "Speak clearly, then tap again or press headset button"
-        PttState.TRANSCRIBING, PttState.WAITING_AGENT -> statusText
+        PttState.ARMED_IDLE -> "1x headset tap: talk · 2x/Next: read latest reply"
+        PttState.RECORDING -> "1x: quick send · 2x/Next: stage & organize · 3x/Prev: discard"
+        PttState.TRANSCRIBING_SEND, PttState.TRANSCRIBING_STAGE, PttState.WAITING_AGENT -> statusText
+        PttState.SEND_GRACE -> pendingQuickTranscript?.takeIf { it.isNotBlank() }
+            ?: "Sending shortly — tap anywhere to pull into staged draft"
+        PttState.STAGED_DRAFT -> "1x: append voice · 2x/Next: send draft · 3x/Prev: discard"
+        PttState.STAGED_DRAFT_SPEAKING -> "1x: pause preview · 2x/Next: send now · 3x/Prev: discard"
         PttState.SPEAKING_TTS -> "Tap anytime to barge in and interrupt speech"
         PttState.PERMISSION_BLOCKED -> statusText
         PttState.ERROR -> statusText
@@ -406,7 +464,7 @@ internal fun HeroPttControl(
             contentAlignment = Alignment.Center,
             modifier = Modifier.size(buttonSize + 14.dp),
         ) {
-            if (pttState == PttState.RECORDING || pttState == PttState.SPEAKING_TTS) {
+            if (isPulsing) {
                 Box(
                     modifier = Modifier
                         .size(buttonSize + 14.dp)
@@ -422,8 +480,14 @@ internal fun HeroPttControl(
                 onClick = {
                     when (pttState) {
                         PttState.DISARMED, PttState.ERROR, PttState.PERMISSION_BLOCKED -> onArm()
-                        PttState.ARMED_IDLE, PttState.RECORDING, PttState.SPEAKING_TTS -> onTapPtt()
-                        PttState.TRANSCRIBING, PttState.WAITING_AGENT -> Unit
+                        PttState.SEND_GRACE -> (onPullBackToDraft ?: onTapPtt)()
+                        PttState.ARMED_IDLE,
+                        PttState.RECORDING,
+                        PttState.STAGED_DRAFT,
+                        PttState.STAGED_DRAFT_SPEAKING,
+                        PttState.SPEAKING_TTS,
+                        -> onTapPtt()
+                        PttState.TRANSCRIBING_SEND, PttState.TRANSCRIBING_STAGE, PttState.WAITING_AGENT -> Unit
                     }
                 },
                 enabled = isActionable,
@@ -437,7 +501,7 @@ internal fun HeroPttControl(
                     .semantics { contentDescription = primaryLabel },
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    if (pttState == PttState.TRANSCRIBING || pttState == PttState.WAITING_AGENT) {
+                    if (pttState.isTranscribing || pttState == PttState.WAITING_AGENT) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(iconSize),
                             strokeWidth = 3.dp,
@@ -459,7 +523,7 @@ internal fun HeroPttControl(
             style = if (compact) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
+            maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
 
@@ -471,12 +535,214 @@ internal fun HeroPttControl(
             } else {
                 MaterialTheme.colorScheme.onSurfaceVariant
             },
-            maxLines = 2,
+            maxLines = 3,
             overflow = TextOverflow.Ellipsis,
         )
+
+        if (pttState == PttState.RECORDING && (onStageCapture != null || onDiscard != null)) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (onStageCapture != null) {
+                    FilledTonalButton(
+                        onClick = onStageCapture,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_pause),
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Stage Draft")
+                    }
+                }
+                if (onDiscard != null) {
+                    OutlinedButton(
+                        onClick = onDiscard,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_close),
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Discard")
+                    }
+                }
+            }
+        } else if (pttState == PttState.SEND_GRACE && onDiscard != null) {
+            OutlinedButton(
+                onClick = onDiscard,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_close),
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Discard")
+            }
+        }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+internal fun StagedDraftCard(
+    draft: StagedDraft,
+    pttState: PttState,
+    isOrganizing: Boolean,
+    onUpdateDraftText: (String) -> Unit,
+    onCommitDraft: () -> Unit,
+    onReorganizeDraft: () -> Unit,
+    onRevertDraft: () -> Unit,
+    onDiscardDraft: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var editedText by remember(draft.sessionKey, draft.organizedText) {
+        mutableStateOf(draft.organizedText)
+    }
+    val hasUnsavedEdits = editedText.trim() != draft.organizedText.trim()
+    val canCommit = pttState == PttState.STAGED_DRAFT || pttState == PttState.STAGED_DRAFT_SPEAKING
+    val canEditOrDiscard = pttState != PttState.RECORDING && !pttState.isTranscribing
+
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = RoundedCornerShape(16.dp),
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (pttState == PttState.DISARMED) {
+                            "Saved Draft (Arm PTT to append or send)"
+                        } else {
+                            "Staged Draft"
+                        },
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "${draft.rawBursts.size} spoken burst${if (draft.rawBursts.size == 1) "" else "s"}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (isOrganizing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                    )
+                }
+            }
+
+            OutlinedTextField(
+                value = editedText,
+                onValueChange = { editedText = it },
+                enabled = canEditOrDiscard && !isOrganizing,
+                label = { Text("Prompt draft") },
+                minLines = 2,
+                maxLines = 6,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (hasUnsavedEdits) {
+                    FilledTonalButton(
+                        onClick = { onUpdateDraftText(editedText) },
+                        enabled = canEditOrDiscard && editedText.isNotBlank(),
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Text("Save Edit")
+                    }
+                }
+                Button(
+                    onClick = {
+                        if (hasUnsavedEdits && editedText.isNotBlank()) {
+                            onUpdateDraftText(editedText)
+                        }
+                        onCommitDraft()
+                    },
+                    enabled = canCommit && !isOrganizing && editedText.isNotBlank(),
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_check),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Send")
+                }
+                FilledTonalButton(
+                    onClick = {
+                        if (hasUnsavedEdits && editedText.isNotBlank()) {
+                            onUpdateDraftText(editedText)
+                        }
+                        onReorganizeDraft()
+                    },
+                    enabled = canEditOrDiscard && !isOrganizing && editedText.isNotBlank(),
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_refresh),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Re-organize")
+                }
+                if (!draft.previousOrganizedText.isNullOrBlank()) {
+                    OutlinedButton(
+                        onClick = onRevertDraft,
+                        enabled = canEditOrDiscard && !isOrganizing,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_undo),
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Undo Edit")
+                    }
+                }
+                OutlinedButton(
+                    onClick = onDiscardDraft,
+                    enabled = canEditOrDiscard && !isOrganizing,
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_close),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Discard")
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun PermissionWarningBanner(
     toolName: String,
@@ -513,14 +779,17 @@ internal fun PermissionWarningBanner(
                 text = "Approve or reject this tool in OpenChamber, then tap Re-Arm to resume voice mode.",
                 style = MaterialTheme.typography.bodySmall,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 Button(
                     onClick = onOpenOpenChamber,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.error,
                         contentColor = MaterialTheme.colorScheme.onError,
                     ),
-                    modifier = Modifier.weight(1f),
                 ) {
                     Icon(
                         painter = painterResource(R.drawable.ic_open_in_new),
@@ -545,6 +814,7 @@ internal fun PermissionWarningBanner(
 internal fun TurnTranscriptPanel(
     lastTranscript: String?,
     lastReply: String?,
+    lastSpokenSummary: String? = null,
     lastTtsInfo: String?,
     serviceError: String?,
     isSpeaking: Boolean = false,
@@ -602,6 +872,9 @@ internal fun TurnTranscriptPanel(
             }
 
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                val panelContext = LocalContext.current
+                @Suppress("DEPRECATION")
+                val clipboardManager = LocalClipboardManager.current
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -612,50 +885,152 @@ internal fun TurnTranscriptPanel(
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.tertiary,
                         fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
                     )
-                    if (!lastReply.isNullOrBlank() && onReadAloudClick != null) {
-                        FilledTonalButton(
-                            onClick = onReadAloudClick,
-                            enabled = canReadAloud,
-                            modifier = Modifier.heightIn(min = 40.dp),
+                    if (!lastReply.isNullOrBlank()) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
-                            Icon(
-                                painter = painterResource(
-                                    if (isSpeaking) R.drawable.ic_volume_off else R.drawable.ic_volume_up,
-                                ),
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (isSpeaking) "Stop" else "Read aloud",
-                                style = MaterialTheme.typography.labelMedium,
-                            )
+                            IconButton(
+                                onClick = {
+                                    clipboardManager.setText(AnnotatedString(lastReply))
+                                    Toast.makeText(panelContext, "Copied reply", Toast.LENGTH_SHORT).show()
+                                },
+                            ) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_content_copy),
+                                    contentDescription = "Copy reply",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                            if (onReadAloudClick != null) {
+                                FilledTonalButton(
+                                    onClick = onReadAloudClick,
+                                    enabled = canReadAloud,
+                                ) {
+                                    Icon(
+                                        painter = painterResource(
+                                            if (isSpeaking) R.drawable.ic_volume_off else R.drawable.ic_volume_up,
+                                        ),
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (isSpeaking) "Stop" else "Read aloud",
+                                        style = MaterialTheme.typography.labelMedium,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
 
-                Text(
-                    text = lastReply?.takeIf { it.isNotBlank() } ?: "No assistant message in this session yet.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (lastReply.isNullOrBlank()) {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    } else {
-                        MaterialTheme.colorScheme.onSurface
-                    },
-                )
+                val replyText = lastReply?.takeIf { it.isNotBlank() }
+                if (replyText != null) {
+                    MarkdownText(
+                        markdown = replyText,
+                        textColor = MaterialTheme.colorScheme.onSurface,
+                        baseStyle = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    Text(
+                        text = "No assistant message in this session yet.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                val spokenReadout = lastSpokenSummary?.takeIf { it.isNotBlank() }
+                if (replyText != null && spokenReadout != null) {
+                    var readoutExpanded by remember(replyText, spokenReadout) { mutableStateOf(false) }
+                    val isSummarized = spokenReadout.trim() != replyText.trim()
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .minimumInteractiveComponentSize()
+                                    .clickable { readoutExpanded = !readoutExpanded }
+                                    .semantics(mergeDescendants = true) {
+                                        role = Role.Button
+                                        stateDescription = if (readoutExpanded) "Expanded" else "Collapsed"
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_graphic_eq),
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Text(
+                                        text = if (isSummarized) {
+                                            "Spoken summary · ${spokenReadout.length} chars"
+                                        } else {
+                                            "Spoken readout · ${spokenReadout.length} chars"
+                                        },
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Icon(
+                                    painter = painterResource(
+                                        if (readoutExpanded) R.drawable.ic_arrow_up else R.drawable.ic_arrow_down,
+                                    ),
+                                    contentDescription = if (readoutExpanded) "Collapse spoken readout" else "Expand spoken readout",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                            AnimatedVisibility(visible = readoutExpanded) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+                                ) {
+                                    HorizontalDivider(
+                                        color = MaterialTheme.colorScheme.outlineVariant,
+                                        modifier = Modifier.padding(bottom = 8.dp),
+                                    )
+                                    Text(
+                                        text = spokenReadout,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if (!lastTtsInfo.isNullOrBlank() || onOpenInOpenChamber != null) {
-                    Row(
+                    Column(
                         modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         if (!lastTtsInfo.isNullOrBlank()) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Icon(
                                     painter = painterResource(R.drawable.ic_graphic_eq),
@@ -671,871 +1046,133 @@ internal fun TurnTranscriptPanel(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
-                        } else {
-                            Spacer(modifier = Modifier.weight(1f))
                         }
 
                         if (onOpenInOpenChamber != null) {
-                            TextButton(
-                                onClick = onOpenInOpenChamber,
-                                modifier = Modifier.heightIn(min = 48.dp),
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End,
                             ) {
-                                Text("Open in OpenChamber")
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_open_in_new),
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-internal fun SessionPickerSheet(
-    serverGroups: List<ServerSessionsResult>,
-    activeServerId: String?,
-    pinnedSession: PinnedSession?,
-    isLoading: Boolean,
-    error: String?,
-    onRefresh: () -> Unit,
-    onSelect: (ServerProfile, SessionSummary) -> Unit,
-    onSignInServer: ((ServerProfile) -> Unit)? = null,
-    onAddServer: (() -> Unit)? = null,
-    onDismiss: () -> Unit,
-) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var selectedServerFilterId by remember { mutableStateOf<String?>(null) }
-
-    val visibleGroups = remember(serverGroups, selectedServerFilterId) {
-        val filterId = selectedServerFilterId?.takeIf { id ->
-            serverGroups.any { it.server.id == id }
-        }
-        if (filterId == null) {
-            serverGroups
-        } else {
-            serverGroups.filter { it.server.id == filterId }
-        }
-    }
-    val hasAnySessions = visibleGroups.any { it.sessions.isNotEmpty() || it.error != null }
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp)
-                .padding(bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    text = "Select Session",
-                    style = MaterialTheme.typography.titleLarge,
-                    modifier = Modifier.weight(1f),
-                )
-                if (onAddServer != null) {
-                    TextButton(
-                        onClick = {
-                            onDismiss()
-                            onAddServer()
-                        },
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    ) {
-                        Text("+ Server")
-                    }
-                }
-                IconButton(onClick = onRefresh, enabled = !isLoading) {
-                    if (isLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            strokeWidth = 2.dp,
-                        )
-                    } else {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_refresh),
-                            contentDescription = "Refresh sessions",
-                        )
-                    }
-                }
-            }
-
-            if (serverGroups.size > 1) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    FilterChip(
-                        selected = selectedServerFilterId == null,
-                        onClick = { selectedServerFilterId = null },
-                        label = { Text("All (${serverGroups.sumOf { it.sessions.size }})") },
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    )
-                    serverGroups.forEach { group ->
-                        FilterChip(
-                            selected = selectedServerFilterId == group.server.id,
-                            onClick = {
-                                selectedServerFilterId = if (selectedServerFilterId == group.server.id) {
-                                    null
-                                } else {
-                                    group.server.id
-                                }
-                            },
-                            label = { Text(group.server.displayLabel) },
-                            modifier = Modifier.heightIn(min = 48.dp),
-                        )
-                    }
-                }
-            }
-
-            if (!error.isNullOrBlank()) {
-                Text(
-                    text = error,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-
-            if (!hasAnySessions && !isLoading) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 20.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = "No OpenCode sessions found",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    TextButton(onClick = onRefresh) {
-                        Text("Reload sessions")
-                    }
-                }
-            } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 380.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    visibleGroups.forEach { group ->
-                        val isGroupActiveServer = group.server.id == activeServerId
-                        if (serverGroups.size > 1 || group.error != null) {
-                            item(key = "hdr_${group.server.id}") {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(top = 6.dp, bottom = 2.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                TextButton(
+                                    onClick = onOpenInOpenChamber,
+                                    modifier = Modifier.heightIn(min = 48.dp),
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = group.server.displayLabel,
-                                            style = MaterialTheme.typography.labelLarge,
-                                            color = if (isGroupActiveServer) {
-                                                MaterialTheme.colorScheme.primary
-                                            } else {
-                                                MaterialTheme.colorScheme.onSurface
-                                            },
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                        Text(
-                                            text = group.server.serverUrl,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
-                                    if (isGroupActiveServer) {
-                                        Text(
-                                            text = "Active",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary,
-                                            fontWeight = FontWeight.SemiBold,
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        if (!group.error.isNullOrBlank()) {
-                            item(key = "err_${group.server.id}") {
-                                Surface(
-                                    color = MaterialTheme.colorScheme.surfaceContainerLow,
-                                    shape = RoundedCornerShape(12.dp),
-                                    modifier = Modifier.fillMaxWidth(),
-                                ) {
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                    ) {
-                                        Text(
-                                            text = group.error,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.error,
-                                            modifier = Modifier.weight(1f),
-                                        )
-                                        if (group.isUnauthorized && onSignInServer != null) {
-                                            TextButton(
-                                                onClick = {
-                                                    onDismiss()
-                                                    onSignInServer(group.server)
-                                                },
-                                                modifier = Modifier.heightIn(min = 48.dp),
-                                            ) {
-                                                Text("Sign in")
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else if (group.sessions.isEmpty() && !isLoading) {
-                            item(key = "empty_${group.server.id}") {
-                                Text(
-                                    text = "No sessions on this server",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(vertical = 4.dp),
-                                )
-                            }
-                        } else {
-                            items(
-                                items = group.sessions,
-                                key = { session -> "${group.server.id}:${session.id}" },
-                            ) { session ->
-                                val selected = isGroupActiveServer && pinnedSession?.sessionId == session.id
-                                Surface(
-                                    color = if (selected) {
-                                        MaterialTheme.colorScheme.primaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.surfaceContainerLow
-                                    },
-                                    shape = RoundedCornerShape(12.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .heightIn(min = 56.dp)
-                                        .clickable { onSelect(group.server, session) },
-                                ) {
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = session.title.ifBlank { "Untitled session" },
-                                                style = MaterialTheme.typography.bodyLarge,
-                                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                                                color = if (selected) {
-                                                    MaterialTheme.colorScheme.onPrimaryContainer
-                                                } else {
-                                                    MaterialTheme.colorScheme.onSurface
-                                                },
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                            )
-                                            Text(
-                                                text = session.directory.ifBlank { session.id },
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = if (selected) {
-                                                    MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
-                                                } else {
-                                                    MaterialTheme.colorScheme.onSurfaceVariant
-                                                },
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                            )
-                                        }
-                                        if (selected) {
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Icon(
-                                                painter = painterResource(R.drawable.ic_check),
-                                                contentDescription = "Selected",
-                                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-internal fun VoicePickerSheet(
-    ttsPipeline: List<TtsEngineOption>,
-    initialEngine: TtsEngine,
-    geminiVoices: List<TtsVoice>,
-    selectedGeminiVoiceId: String,
-    isLoadingGemini: Boolean,
-    geminiError: String?,
-    onRefreshGemini: () -> Unit,
-    onSelectGeminiVoice: (TtsVoice) -> Unit,
-    mlKitStatus: MlKitStatusReport?,
-    mlKitVoices: List<MlKitTtsVoiceSummary>,
-    selectedMlKitVoice: String?,
-    mlKitDownloadStatus: String?,
-    isDownloadingMlKit: Boolean,
-    onRefreshMlKit: () -> Unit,
-    onSelectMlKitVoice: (String) -> Unit,
-    onDownloadMlKitVoice: (String?) -> Unit,
-    selectedOpenAiVoice: String,
-    onSelectOpenAiVoice: (String) -> Unit,
-    systemVoices: List<SystemTtsVoiceSummary>,
-    selectedSystemVoice: String?,
-    isLoadingSystemVoices: Boolean,
-    onRefreshSystemVoices: () -> Unit,
-    onSelectSystemVoice: (String?) -> Unit,
-    onOpenSettings: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val context = LocalContext.current
-    @Suppress("DEPRECATION")
-    val clipboardManager = LocalClipboardManager.current
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-
-    var activeTab by remember(initialEngine) { mutableStateOf(initialEngine) }
-    var geminiQuery by remember { mutableStateOf("") }
-    var openAiQuery by remember { mutableStateOf("") }
-    var systemQuery by remember { mutableStateOf("") }
-
-    val primaryEngine = remember(ttsPipeline) {
-        VoicePipelineDefaults.primaryEnabledEngine(ttsPipeline)
-    }
-    val orderedEngines = remember(ttsPipeline) {
-        ttsPipeline.map { it.engine }
-    }
-    val activeOption = remember(ttsPipeline, activeTab) {
-        ttsPipeline.firstOrNull { it.engine == activeTab }
-    }
-
-    val filteredGemini = remember(geminiVoices, geminiQuery) {
-        val q = geminiQuery.trim().lowercase()
-        if (q.isEmpty()) {
-            geminiVoices
-        } else {
-            geminiVoices.filter { v ->
-                "${v.id} ${v.label} ${v.style} ${v.accent} ${v.gender} ${v.description}"
-                    .lowercase()
-                    .contains(q)
-            }
-        }
-    }
-
-    val filteredOpenAi = remember(openAiQuery) {
-        val q = openAiQuery.trim().lowercase()
-        if (q.isEmpty()) {
-            VoicePipelineDefaults.openAiVoices
-        } else {
-            VoicePipelineDefaults.openAiVoices.filter { p ->
-                "${p.id} ${p.label} ${p.description}".lowercase().contains(q)
-            }
-        }
-    }
-
-    val filteredSystem = remember(systemVoices, systemQuery) {
-        val q = systemQuery.trim().lowercase()
-        if (q.isEmpty()) {
-            systemVoices
-        } else {
-            systemVoices.filter { v ->
-                "${v.name} ${v.label} ${v.localeTag}".lowercase().contains(q)
-            }
-        }
-    }
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp)
-                .padding(bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Voices",
-                        style = MaterialTheme.typography.titleLarge,
-                    )
-                    Text(
-                        text = primaryEngine?.let { "Primary engine: ${it.title}" }
-                            ?: "All TTS engines are disabled",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-
-                when (activeTab) {
-                    TtsEngine.GEMINI_BRIDGE -> {
-                        IconButton(onClick = onRefreshGemini, enabled = !isLoadingGemini) {
-                            if (isLoadingGemini) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(20.dp),
-                                    strokeWidth = 2.dp,
-                                )
-                            } else {
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_refresh),
-                                    contentDescription = "Refresh Gemini voices",
-                                )
-                            }
-                        }
-                    }
-                    TtsEngine.MLKIT_GENAI -> {
-                        IconButton(onClick = onRefreshMlKit) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_refresh),
-                                contentDescription = "Refresh ML Kit voices",
-                            )
-                        }
-                    }
-                    TtsEngine.ANDROID_SYSTEM -> {
-                        IconButton(onClick = onRefreshSystemVoices, enabled = !isLoadingSystemVoices) {
-                            if (isLoadingSystemVoices) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(20.dp),
-                                    strokeWidth = 2.dp,
-                                )
-                            } else {
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_refresh),
-                                    contentDescription = "Refresh system voices",
-                                )
-                            }
-                        }
-                    }
-                    TtsEngine.OPENAI_CLOUD, TtsEngine.LOCAL_KOKORO -> Unit
-                }
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                orderedEngines.forEach { engine ->
-                    val enabled = ttsPipeline.firstOrNull { it.engine == engine }?.enabled == true
-                    val labelText = if (enabled) engine.shortTitle else "${engine.shortTitle} (off)"
-                    FilterChip(
-                        selected = activeTab == engine,
-                        onClick = { activeTab = engine },
-                        label = { Text(labelText) },
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    )
-                }
-            }
-
-            if (activeOption != null && !activeOption.enabled) {
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Text(
-                            text = "${activeTab.title} is currently disabled in Settings.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(
-                            onClick = {
-                                onDismiss()
-                                onOpenSettings()
-                            },
-                            modifier = Modifier.heightIn(min = 48.dp),
-                        ) {
-                            Text("Enable")
-                        }
-                    }
-                }
-            }
-
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 320.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                when (activeTab) {
-                TtsEngine.GEMINI_BRIDGE -> {
-                    OutlinedTextField(
-                        value = geminiQuery,
-                        onValueChange = { geminiQuery = it },
-                        label = { Text("Search Gemini voices") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-
-                    if (!geminiError.isNullOrBlank()) {
-                        Text(
-                            text = geminiError,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                    }
-
-                    if (filteredGemini.isEmpty() && !isLoadingGemini) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 20.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Text(
-                                text = if (geminiVoices.isEmpty()) "No Gemini voices loaded" else "No matching voices",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            if (geminiVoices.isEmpty()) {
-                                TextButton(onClick = onRefreshGemini) {
-                                    Text("Reload voices")
-                                }
-                            }
-                        }
-                    } else {
-                        LazyColumn(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 340.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            items(filteredGemini, key = { it.id }) { voice ->
-                                val selected = selectedGeminiVoiceId.equals(voice.id, ignoreCase = true)
-                                val meta = listOfNotNull(
-                                    voice.style.takeIf { it.isNotBlank() },
-                                    voice.gender.takeIf { it.isNotBlank() },
-                                    voice.accent.takeIf { it.isNotBlank() },
-                                ).joinToString(" · ")
-                                VoiceOptionRow(
-                                    title = voice.label,
-                                    subtitle = meta.ifBlank { null },
-                                    selected = selected,
-                                    onClick = { onSelectGeminiVoice(voice) },
-                                )
-                            }
-                        }
-                    }
-                }
-
-                TtsEngine.MLKIT_GENAI -> {
-                    if (mlKitVoices.isEmpty()) {
-                        Surface(
-                            color = MaterialTheme.colorScheme.surfaceContainerLow,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(14.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text(
-                                    text = if (mlKitStatus?.availability == MlKitAvailability.UNAVAILABLE) {
-                                        "ML Kit GenAI TTS unavailable on this device"
-                                    } else {
-                                        "Checking ML Kit GenAI voices…"
-                                    },
-                                    style = MaterialTheme.typography.titleSmall,
-                                )
-                                val statusDetail = mlKitStatus?.detail
-                                if (!statusDetail.isNullOrBlank()) {
-                                    Text(
-                                        text = statusDetail,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    Text("Open in OpenChamber")
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_open_in_new),
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
                                     )
                                 }
-                                if (mlKitStatus?.availability == MlKitAvailability.UNAVAILABLE) {
-                                    OutlinedButton(
-                                        onClick = {
-                                            val report = buildString {
-                                                appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} (API ${Build.VERSION.SDK_INT}, ${Build.TAGS})")
-                                                appendLine("Packages: ${MlKitSttClient.buildPackageDiagnostic(context)}")
-                                                append("TTS GenAI: ${mlKitStatus.availability} | ${mlKitStatus.detail ?: "ok"}")
-                                            }
-                                            clipboardManager.setText(AnnotatedString(report))
-                                            Toast.makeText(context, "Copied ML Kit diagnostics", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .heightIn(min = 48.dp),
-                                    ) {
-                                        Text("Copy diagnostics")
-                                    }
-                                }
                             }
-                        }
-                    } else {
-                        val activeChoice = mlKitVoices.firstOrNull {
-                            it.name.equals(selectedMlKitVoice, ignoreCase = true)
-                        } ?: mlKitVoices.firstOrNull()
-
-                        LazyColumn(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 280.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            items(mlKitVoices, key = { it.name }) { voice ->
-                                val selected = selectedMlKitVoice.equals(voice.name, ignoreCase = true)
-                                val stateLabel = when (voice.availability) {
-                                    MlKitAvailability.AVAILABLE -> "Ready"
-                                    MlKitAvailability.DOWNLOADABLE -> "Download needed"
-                                    MlKitAvailability.DOWNLOADING -> "Downloading"
-                                    MlKitAvailability.UNAVAILABLE -> "Unavailable"
-                                }
-                                val subtitle = listOfNotNull(
-                                    voice.description.takeIf { it.isNotBlank() },
-                                    stateLabel,
-                                ).joinToString(" · ")
-                                VoiceOptionRow(
-                                    title = voice.name,
-                                    subtitle = subtitle,
-                                    selected = selected,
-                                    onClick = { onSelectMlKitVoice(voice.name) },
-                                )
-                            }
-                        }
-
-                        if (activeChoice?.availability == MlKitAvailability.DOWNLOADABLE) {
-                            FilledTonalButton(
-                                onClick = { onDownloadMlKitVoice(activeChoice.name) },
-                                enabled = !isDownloadingMlKit,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(min = 48.dp),
-                            ) {
-                                Text(
-                                    if (isDownloadingMlKit) {
-                                        "Downloading ${activeChoice.name}…"
-                                    } else {
-                                        "Download ${activeChoice.name}"
-                                    },
-                                )
-                            }
-                        }
-
-                        if (!mlKitDownloadStatus.isNullOrBlank()) {
-                            Text(
-                                text = mlKitDownloadStatus,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
                         }
                     }
                 }
-
-                TtsEngine.OPENAI_CLOUD -> {
-                    OutlinedTextField(
-                        value = openAiQuery,
-                        onValueChange = { openAiQuery = it },
-                        label = { Text("Search OpenAI voices") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 320.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        items(filteredOpenAi, key = { it.id }) { preset ->
-                            val selected = selectedOpenAiVoice.equals(preset.id, ignoreCase = true)
-                            VoiceOptionRow(
-                                title = preset.label,
-                                subtitle = preset.description,
-                                selected = selected,
-                                onClick = { onSelectOpenAiVoice(preset.id) },
-                            )
-                        }
-                    }
-                }
-
-                TtsEngine.ANDROID_SYSTEM -> {
-                    OutlinedTextField(
-                        value = systemQuery,
-                        onValueChange = { systemQuery = it },
-                        label = { Text("Search system voices") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 280.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        item(key = "__system_default__") {
-                            VoiceOptionRow(
-                                title = "System default",
-                                subtitle = "Follow Android Text-to-Speech preferred voice",
-                                selected = selectedSystemVoice == null,
-                                onClick = { onSelectSystemVoice(null) },
-                            )
-                        }
-                        items(filteredSystem, key = { it.name }) { voice ->
-                            val selected = selectedSystemVoice == voice.name
-                            val modeTag = if (voice.isNetworkRequired) "Network" else "Offline"
-                            VoiceOptionRow(
-                                title = voice.label,
-                                subtitle = "${voice.name} · $modeTag",
-                                selected = selected,
-                                onClick = { onSelectSystemVoice(voice.name) },
-                            )
-                        }
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            runCatching {
-                                context.startActivity(
-                                    Intent("com.android.settings.TTS_SETTINGS").apply {
-                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    },
-                                )
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp),
-                    ) {
-                        Text("Open Android TTS settings")
-                    }
-                }
-
-                TtsEngine.LOCAL_KOKORO -> {
-                    Surface(
-                        color = MaterialTheme.colorScheme.surfaceContainerLow,
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Text(
-                                text = "Host-configured voice",
-                                style = MaterialTheme.typography.titleSmall,
-                            )
-                            Text(
-                                text = "Local Kokoro synthesizes on your OpenChamber host via /api/dictation/tts/speak using the server's default speaker.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
-            }
             }
         }
     }
 }
 
 @Composable
-private fun VoiceOptionRow(
-    title: String,
-    subtitle: String?,
-    selected: Boolean,
-    onClick: () -> Unit,
+internal fun SpokenDetailSlider(
+    detailLevel: SpokenDetailLevel,
+    onSelectLevel: (SpokenDetailLevel) -> Unit,
+    subtitle: String? = null,
+    containerColor: Color = MaterialTheme.colorScheme.surfaceContainerLow,
+    modifier: Modifier = Modifier,
 ) {
+    val entries = SpokenDetailLevel.entries
+    val selectedIndex = entries.indexOf(detailLevel).coerceIn(0, entries.lastIndex)
+
     Surface(
-        color = if (selected) {
-            MaterialTheme.colorScheme.primaryContainer
-        } else {
-            MaterialTheme.colorScheme.surfaceContainerLow
-        },
+        color = containerColor,
         shape = RoundedCornerShape(12.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(min = 56.dp)
-            .clickable(onClick = onClick),
+        modifier = modifier.fillMaxWidth(),
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
                 Text(
-                    text = title,
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                    color = if (selected) {
-                        MaterialTheme.colorScheme.onPrimaryContainer
-                    } else {
-                        MaterialTheme.colorScheme.onSurface
-                    },
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    text = "Spoken detail",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontWeight = FontWeight.SemiBold,
                 )
-                if (!subtitle.isNullOrBlank()) {
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (selected) {
-                            MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
+                Text(
+                    text = detailLevel.title,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+
+            Slider(
+                value = selectedIndex.toFloat(),
+                onValueChange = { raw ->
+                    val snapped = kotlin.math.round(raw).toInt().coerceIn(0, entries.lastIndex)
+                    onSelectLevel(entries[snapped])
+                },
+                valueRange = 0f..entries.lastIndex.toFloat(),
+                steps = (entries.size - 2).coerceAtLeast(0),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics {
+                        contentDescription = "Spoken detail level: ${detailLevel.title}"
+                    },
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .selectableGroup(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                entries.forEachIndexed { idx, level ->
+                    val isSelected = idx == selectedIndex
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .selectable(
+                                selected = isSelected,
+                                role = Role.RadioButton,
+                                onClick = { onSelectLevel(level) },
+                            ),
+                        contentAlignment = when (idx) {
+                            0 -> Alignment.CenterStart
+                            entries.lastIndex -> Alignment.CenterEnd
+                            else -> Alignment.Center
                         },
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    ) {
+                        Text(
+                            text = level.title,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (isSelected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
                 }
             }
-            if (selected) {
-                Spacer(modifier = Modifier.width(8.dp))
-                Icon(
-                    painter = painterResource(R.drawable.ic_check),
-                    contentDescription = "Selected",
-                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 2.dp),
                 )
             }
         }
