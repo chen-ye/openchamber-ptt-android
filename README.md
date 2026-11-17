@@ -44,7 +44,9 @@ APK output: `app/build/outputs/apk/debug/app-debug.apk`.
 ## CI and releases
 
 - **CI (`.github/workflows/ci.yml`)** runs `./gradlew testDebugUnitTest lintDebug assembleDebug` on every pull request and push to `main`, uploading `app-debug.apk` and test/lint reports as workflow artifacts.
-- **Release APK (`.github/workflows/release.yml`)** triggers on `v*` tag pushes (or `workflow_dispatch`), injects `versionName`/`versionCode` from the tag, builds a signed `app-release.apk`, verifies its signature with `apksigner`, and attaches `openchamber-ptt-<version>.apk` + `.sha256` to a GitHub Release.
+- **Release APK (`.github/workflows/release.yml`)** builds and signs `app-release.apk`, verifies its signature with `apksigner`, and publishes GitHub Releases:
+  - **Rolling prerelease (`push` to `main`, or default `workflow_dispatch`)**: updates the `prerelease` tag and GitHub Pre-release with `openchamber-ptt-prerelease.apk` + `.sha256` (`versionName` `<base>-dev.<commits>+<sha>` and monotonic `versionCode` so upgrades install cleanly across `v0.1.0` → `prerelease` → `v0.2.0`).
+  - **Tagged release (`v*` tag push, or `workflow_dispatch` with a `v*` tag)**: publishes `openchamber-ptt-<version>.apk` + `.sha256` to a matching GitHub Release.
 
 To enable signed releases in GitHub Actions, generate a signing keystore locally (if you don't already have one) and set four repository secrets (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`):
 
