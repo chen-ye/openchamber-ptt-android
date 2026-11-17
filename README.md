@@ -41,6 +41,21 @@ ANDROID_HOME=$HOME/Android/Sdk \
 
 APK output: `app/build/outputs/apk/debug/app-debug.apk`.
 
+## CI and releases
+
+- **CI (`.github/workflows/ci.yml`)** runs `./gradlew testDebugUnitTest lintDebug assembleDebug` on every pull request and push to `main`, uploading `app-debug.apk` and test/lint reports as workflow artifacts.
+- **Release APK (`.github/workflows/release.yml`)** triggers on `v*` tag pushes (or `workflow_dispatch`), injects `versionName`/`versionCode` from the tag, builds a signed `app-release.apk`, verifies its signature with `apksigner`, and attaches `openchamber-ptt-<version>.apk` + `.sha256` to a GitHub Release.
+
+To enable signed releases in GitHub Actions, generate a signing keystore locally (if you don't already have one) and set four repository secrets (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`):
+
+```bash
+keytool -genkeypair -v -keystore release.jks -alias openchamber-ptt \
+  -keyalg RSA -keysize 2048 -validity 10000
+base64 -w 0 release.jks   # paste into KEYSTORE_BASE64 secret
+```
+
+*(CI debug APKs use an ephemeral runner debug keystore, so installing a CI `app-debug.apk` over a locally built debug APK requires uninstalling first or using the consistently signed release APK.)*
+
 ## Install via ADB
 
 Connect over wireless ADB using the IP and pairing or debugging port shown in Android Developer Options, then install the APK:

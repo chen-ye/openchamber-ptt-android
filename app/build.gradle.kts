@@ -13,14 +13,61 @@ android {
         applicationId = "com.openchamber.ptt"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        val configuredVersionCode = providers.gradleProperty("versionCode")
+            .orElse(providers.environmentVariable("OPENCHAMBER_VERSION_CODE"))
+            .orNull
+            ?.trim()
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
+            ?: 1
+        val configuredVersionName = providers.gradleProperty("versionName")
+            .orElse(providers.environmentVariable("OPENCHAMBER_VERSION_NAME"))
+            .orNull
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: "0.1.0"
+        versionCode = configuredVersionCode
+        versionName = configuredVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    val releaseKeystorePath = providers.gradleProperty("keystorePath")
+        .orElse(providers.environmentVariable("OPENCHAMBER_KEYSTORE_PATH"))
+        .orNull
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+    val releaseKeystorePassword = providers.gradleProperty("keystorePassword")
+        .orElse(providers.environmentVariable("OPENCHAMBER_KEYSTORE_PASSWORD"))
+        .orNull
+    val releaseKeyAlias = providers.gradleProperty("keyAlias")
+        .orElse(providers.environmentVariable("OPENCHAMBER_KEY_ALIAS"))
+        .orNull
+    val releaseKeyPassword = providers.gradleProperty("keyPassword")
+        .orElse(providers.environmentVariable("OPENCHAMBER_KEY_PASSWORD"))
+        .orNull
+    val hasReleaseSigning = releaseKeystorePath != null &&
+        file(releaseKeystorePath).isFile &&
+        !releaseKeystorePassword.isNullOrEmpty() &&
+        !releaseKeyAlias.isNullOrEmpty() &&
+        !releaseKeyPassword.isNullOrEmpty()
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
