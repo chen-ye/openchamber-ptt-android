@@ -2,6 +2,10 @@
 
 An Android push-to-talk voice companion for [OpenChamber](https://github.com/openchamber/openchamber) and OpenCode. Talk to coding sessions from a Bluetooth headset, lock screen, or floating Android Bubble—without always-on hotword listening.
 
+<p align="center">
+  <img src="docs/screenshots/pixel-10-pro-cockpit.png" width="320" alt="OpenChamber PTT main cockpit at Pixel 10 Pro resolution (1280x2856)" />
+</p>
+
 ## Install
 
 ### Download a signed APK (recommended)
@@ -124,6 +128,12 @@ For offline Android emulator UI QA (hierarchical sessions, unread/failed indicat
 
 ```bash
 bun scripts/mock-openchamber-server.mjs --help
+```
+
+To regenerate the README screenshot on a temporary Pixel 10 Pro resolution emulator (`1280x2856 @ 480 dpi`):
+
+```bash
+bun scripts/capture-pixel10-pro-screenshot.mjs
 ```
 
 ### CI and releases

@@ -293,17 +293,20 @@ const servers = ports.map((port, idx) => {
       if (msgMatch && req.method === "GET") {
         const sid = decodeURIComponent(msgMatch[1]);
         const ses = sessionsById.get(sid);
+        const promptText = ses
+          ? `[voice] Summarize how ${ses.title} handles draft staging and send grace.`
+          : "[voice] Summarize the latest turn.";
+        const replyText = ses
+          ? `**${ses.title}** (\`${ses.location?.directory ?? ""}\`) keeps quick turns fast and drafts durable:\n\n- **Single-tap stop:** Enters a 2.5s undoable send grace window.\n- **Double-tap / Next:** Stages, smart-merges, and reads back your draft per session.`
+          : "Latest mock reply.";
         return Response.json([
           {
-            info: { id: `msg_${sid}`, role: "assistant" },
-            parts: [
-              {
-                type: "text",
-                text: ses
-                  ? `Latest mock reply for **${ses.title}** (\`${ses.location?.directory ?? ""}\`).`
-                  : "Latest mock reply.",
-              },
-            ],
+            info: { id: `msg_${sid}_assistant`, role: "assistant" },
+            parts: [{ type: "text", text: replyText }],
+          },
+          {
+            info: { id: `msg_${sid}_user`, role: "user" },
+            parts: [{ type: "text", text: promptText }],
           },
         ]);
       }
