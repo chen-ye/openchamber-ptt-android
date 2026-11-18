@@ -27,7 +27,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', inputs.tag || 'prerelease') || github.ref }}
+  group: ${{ github.workflow }}-${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && (inputs.tag == '' || inputs.tag == 'prerelease'))) && 'prerelease' || (github.event_name == 'workflow_dispatch' && format('dispatch-{0}', inputs.tag) || github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 jobs:
@@ -221,29 +221,29 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           if [ "$IS_ROLLING" = "true" ]; then
-            git tag -f "$TAG" "$TARGET_SHA"
-            git push --force origin "refs/tags/$TAG"
-
             notes_file="${{ runner.temp }}/release-notes.md"
             {
-              printf 'Rolling prerelease built from `main` (`%s`).\n\n' "$SHORT_SHA"
-              printf '- **versionName:** `%s`\n' "$VERSION_NAME"
-              printf '- **versionCode:** `%s`\n' "$VERSION_CODE"
-              printf '- **commit:** `%s`\n' "$TARGET_SHA"
+              printf -- 'Rolling prerelease built from `main` (`%s`).\n\n' "$SHORT_SHA"
+              printf -- '- **versionName:** `%s`\n' "$VERSION_NAME"
+              printf -- '- **versionCode:** `%s`\n' "$VERSION_CODE"
+              printf -- '- **commit:** `%s`\n' "$TARGET_SHA"
               if [ -n "$BASE_TAG" ]; then
-                printf '- **base tag:** `%s`\n' "$BASE_TAG"
+                printf -- '- **base tag:** `%s`\n' "$BASE_TAG"
                 changes="$(git log --no-merges --max-count=30 --pretty='- %h %s' "${BASE_TAG}..${TARGET_SHA}")"
                 if [ -n "$changes" ]; then
-                  printf '\n### Changes since `%s`\n%s\n' "$BASE_TAG" "$changes"
+                  printf -- '\n### Changes since `%s`\n%s\n' "$BASE_TAG" "$changes"
                 fi
-                printf '\n**Full Changelog:** https://github.com/%s/compare/%s...%s\n' "$REPO" "$BASE_TAG" "$TARGET_SHA"
+                printf -- '\n**Full Changelog:** https://github.com/%s/compare/%s...%s\n' "$REPO" "$BASE_TAG" "$TARGET_SHA"
               else
                 changes="$(git log --no-merges --max-count=20 --pretty='- %h %s' "$TARGET_SHA")"
                 if [ -n "$changes" ]; then
-                  printf '\n### Recent changes\n%s\n' "$changes"
+                  printf -- '\n### Recent changes\n%s\n' "$changes"
                 fi
               fi
             } > "$notes_file"
+
+            git tag -f "$TAG" "$TARGET_SHA"
+            git push --force origin "refs/tags/$TAG"
 
             title="Prerelease (${VERSION_NAME})"
             if gh release view "$TAG" >/dev/null 2>&1; then
@@ -252,12 +252,14 @@ jobs:
                 --draft=false \
                 --prerelease \
                 --latest=false \
+                --target "$TARGET_SHA" \
                 --title "$title" \
                 --notes-file "$notes_file"
             else
               gh release create "$TAG" dist/*.apk dist/*.sha256 \
                 --prerelease \
                 --latest=false \
+                --target "$TARGET_SHA" \
                 --title "$title" \
                 --notes-file "$notes_file"
             fi
@@ -265,13 +267,13 @@ jobs:
             if gh release view "$TAG" >/dev/null 2>&1; then
               gh release upload "$TAG" dist/*.apk dist/*.sha256 --clobber
             else
-              flags=""
+              flags=()
               if [ "$PRERELEASE" = "true" ]; then
-                flags="$flags --prerelease --latest=false"
+                flags+=(--prerelease --latest=false)
               fi
               if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-                flags="$flags --target $TARGET_SHA"
+                flags+=(--target "$TARGET_SHA")
               fi
-              gh release create "$TAG" dist/*.apk dist/*.sha256 --title "$TAG" --generate-notes $flags
+              gh release create "$TAG" dist/*.apk dist/*.sha256 --title "$TAG" --generate-notes "${flags[@]}"
             fi
           fi
