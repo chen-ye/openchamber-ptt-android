@@ -120,6 +120,12 @@ ANDROID_HOME=$HOME/Android/Sdk \
 
 Output APK: `app/build/outputs/apk/debug/app-debug.apk`.
 
+For offline Android emulator UI QA (hierarchical sessions, unread/failed indicators, search, and multi-server chips), run the local mock OpenChamber server and connect the emulator to `http://10.0.2.2:18401` (and `http://10.0.2.2:18402`) with any non-empty password:
+
+```bash
+bun scripts/mock-openchamber-server.mjs --help
+```
+
 ### CI and releases
 
 - [CI workflow](.github/workflows/ci.yml) runs unit tests, `lintDebug`, and `assembleDebug` on every pull request and push to `main`.

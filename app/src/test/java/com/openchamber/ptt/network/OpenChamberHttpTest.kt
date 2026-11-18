@@ -126,4 +126,25 @@ class OpenChamberHttpTest {
             serverB.shutdown()
         }
     }
+
+    @Test
+    fun `omitDirectoryHeaders prevents directoryForUrlProvider and directoryProvider injection`() {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("ok"))
+
+        val client = OpenChamberHttp.createClient(
+            tokenProvider = { "tok_global" },
+            directoryProvider = { "/repo/default" },
+            directoryForUrlProvider = { "/repo/scoped" },
+        )
+
+        val request = OpenChamberHttp.omitDirectoryHeaders(
+            Request.Builder().url(server.url("/api/session")).get(),
+        ).build()
+        client.newCall(request).execute().close()
+
+        val recorded = server.takeRequest()
+        assertEquals("Bearer tok_global", recorded.getHeader("Authorization"))
+        assertNull(recorded.getHeader("x-opencode-directory"))
+        assertNull(recorded.getHeader("x-opencode-directory-encoding"))
+    }
 }

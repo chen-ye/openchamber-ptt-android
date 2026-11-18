@@ -214,6 +214,48 @@ class TokenStoreTest {
         assertEquals(SpokenDetailLevel.ESSENTIALS, storeB.getEffectiveSpokenDetailLevel(srv.id))
     }
 
+    @Test
+    fun `migrateStagedDraft moves draft across keys and preserves newer destination draft`() {
+        val store = TokenStore(InMemorySharedPreferences())
+        val oldKey = TokenStore.sessionKeyFor("srv1", PinnedSession("child_1", "", "Child"))
+        val newKey = TokenStore.sessionKeyFor("srv1", PinnedSession("child_1", "/repo/main", "Child"))
+
+        store.saveStagedDraft(
+            StagedDraft(
+                sessionKey = oldKey,
+                rawBursts = listOf("first draft"),
+                organizedText = "First draft.",
+                updatedAtMs = 100L,
+            ),
+        )
+        assertTrue(store.migrateStagedDraft(oldKey, newKey))
+        assertNull(store.getStagedDraft(oldKey))
+        val moved = store.getStagedDraft(newKey)
+        assertEquals(newKey, moved?.sessionKey)
+        assertEquals("First draft.", moved?.organizedText)
+
+        // When destination already holds a newer draft, migration removes oldKey without clobbering newer draft
+        store.saveStagedDraft(
+            StagedDraft(
+                sessionKey = newKey,
+                rawBursts = listOf("newer"),
+                organizedText = "Newer destination.",
+                updatedAtMs = 300L,
+            ),
+        )
+        store.saveStagedDraft(
+            StagedDraft(
+                sessionKey = oldKey,
+                rawBursts = listOf("stale"),
+                organizedText = "Stale source.",
+                updatedAtMs = 200L,
+            ),
+        )
+        assertTrue(store.migrateStagedDraft(oldKey, newKey))
+        assertNull(store.getStagedDraft(oldKey))
+        assertEquals("Newer destination.", store.getStagedDraft(newKey)?.organizedText)
+    }
+
     private class InMemorySharedPreferences : SharedPreferences {
         private val map = LinkedHashMap<String, Any?>()
 

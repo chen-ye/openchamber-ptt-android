@@ -505,6 +505,35 @@ class TokenStore(
         }
     }
 
+    fun migrateStagedDraft(oldSessionKey: String, newSessionKey: String): Boolean {
+        val fromKey = oldSessionKey.trim()
+        val toKey = newSessionKey.trim()
+        if (fromKey.isEmpty() || toKey.isEmpty() || fromKey == toKey) return false
+        val map = getAllStagedDrafts().toMutableMap()
+        val existingOld = map.remove(fromKey) ?: return false
+        val validOld = existingOld.takeIf {
+            it.organizedText.isNotBlank() || it.rawBursts.any { b -> b.isNotBlank() }
+        }
+        if (validOld != null) {
+            val existingNew = map[toKey]?.takeIf {
+                it.organizedText.isNotBlank() || it.rawBursts.any { b -> b.isNotBlank() }
+            }
+            val winner = if (existingNew != null && existingNew.updatedAtMs >= validOld.updatedAtMs) {
+                existingNew
+            } else {
+                validOld.copy(sessionKey = toKey)
+            }
+            map[toKey] = winner
+        }
+        if (map.isEmpty()) {
+            prefs.edit().remove(KEY_STAGED_DRAFTS).apply()
+        } else {
+            prefs.edit().putString(KEY_STAGED_DRAFTS, json.encodeToString(map)).apply()
+        }
+        notifyChanged()
+        return true
+    }
+
     private fun writeServers(servers: List<ServerProfile>, activeId: String?) {
         val resolvedActiveId = activeId?.takeIf { id -> servers.any { it.id == id } }
             ?: servers.firstOrNull()?.id

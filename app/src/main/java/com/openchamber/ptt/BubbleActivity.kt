@@ -86,7 +86,6 @@ class BubbleActivity : ComponentActivity() {
         val tokenStore = TokenStore(appContext)
         val httpClient = OpenChamberHttp.createClient(
             tokenForUrlProvider = { url -> tokenStore.getTokenForUrl(url) },
-            directoryForUrlProvider = { url -> tokenStore.getDirectoryForUrl(url) },
         )
         val sessionRepository = SessionRepository(httpClient)
         val ttsClient = TtsClient(httpClient)

@@ -31,7 +31,7 @@ object BubbleHelper {
     const val BUBBLE_NOTIFICATION_ID = 1003
     private const val SHORTCUT_ID = "openchamber_ptt_voice_conversation"
     private const val SHORTCUT_CATEGORY = "com.openchamber.ptt.category.VOICE_CONVERSATION"
-    private const val DESIRED_HEIGHT_DP = 440
+    private const val DESIRED_HEIGHT_DP = 560
 
     @Volatile
     private var bubblePosted: Boolean = false

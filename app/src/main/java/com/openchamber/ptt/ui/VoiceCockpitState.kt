@@ -28,6 +28,9 @@ import com.openchamber.ptt.service.PttState
 import com.openchamber.ptt.session.ServerSessionsResult
 import com.openchamber.ptt.session.SessionRepository
 import com.openchamber.ptt.session.SessionSummary
+import com.openchamber.ptt.session.mergeRefreshedServerGroups
+import com.openchamber.ptt.session.resolveAutoPinCandidate
+import com.openchamber.ptt.session.resolvePinnedSession
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.ServerProfile
 import com.openchamber.ptt.storage.ServerVoiceOverride
@@ -51,7 +54,10 @@ import com.openchamber.ptt.voice.MlKitDownloadEvent
 import com.openchamber.ptt.voice.MlKitStatusReport
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlin.coroutines.coroutineContext
 
 @Stable
 internal class VoiceCockpitState(
@@ -96,6 +102,7 @@ internal class VoiceCockpitState(
         private set
     var sessionsError by mutableStateOf<String?>(null)
         private set
+    private var refreshSessionsJob: Job? = null
 
     var showSessionPicker by showSessionPickerState
     var showVoicePicker by showVoicePickerState
@@ -236,15 +243,23 @@ internal class VoiceCockpitState(
         syncEffectiveVoiceState(active?.id)
     }
 
+    private fun cancelSessionRefresh() {
+        refreshSessionsJob?.cancel()
+        refreshSessionsJob = null
+        isLoadingSessions = false
+    }
+
     fun refreshSessions() {
         val currentServers = tokenStore.getServers()
         if (currentServers.none { it.isSignedIn }) {
+            cancelSessionRefresh()
             syncServerStateFromStore()
             return
         }
-        scope.launch {
-            isLoadingSessions = true
-            sessionsError = null
+        refreshSessionsJob?.cancel()
+        isLoadingSessions = true
+        sessionsError = null
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val results = sessionRepository.listAllServerSessions(currentServers)
                 results.filter { it.isUnauthorized && it.server.isSignedIn }.forEach { failed ->
@@ -257,35 +272,43 @@ internal class VoiceCockpitState(
                 val updatedServers = servers
                 val curActive = activeServer
 
-                val refreshedResults = results.map { res ->
-                    val freshServer = updatedServers.firstOrNull { it.id == res.server.id } ?: res.server
-                    res.copy(server = freshServer)
-                }
+                val refreshedResults = mergeRefreshedServerGroups(
+                    previousGroups = serverGroups,
+                    freshResults = results,
+                    updatedServers = updatedServers,
+                )
                 serverGroups = refreshedResults
 
                 val activeResult = refreshedResults.firstOrNull { it.server.id == curActive?.id }
-                if (activeResult != null && activeResult.sessions.isNotEmpty()) {
+                if (activeResult != null && activeResult.roots.isNotEmpty()) {
                     val currentPinned = curActive?.lastPinnedSession
                     if (currentPinned != null) {
-                        val refreshed = activeResult.sessions.firstOrNull { it.id == currentPinned.sessionId }
-                        if (refreshed != null) {
-                            val updated = PinnedSession(
-                                sessionId = refreshed.id,
-                                directory = refreshed.directory,
-                                title = refreshed.title,
-                            )
+                        val updated = resolvePinnedSession(activeResult.roots, currentPinned)
+                        if (updated != null && updated != currentPinned) {
+                            val oldKey = TokenStore.sessionKeyFor(activeResult.server.id, currentPinned)
+                            val newKey = TokenStore.sessionKeyFor(activeResult.server.id, updated)
+                            val migratedDraft = if (oldKey != newKey) {
+                                tokenStore.migrateStagedDraft(oldKey, newKey)
+                            } else {
+                                false
+                            }
                             pinnedSession = updated
                             tokenStore.updatePinnedSession(activeResult.server.id, updated)
+                            if (migratedDraft || updated.directory != currentPinned.directory) {
+                                boundService?.refreshLatestTurn(forceClearOnSessionChange = false)
+                            }
                         }
-                    } else if (activeResult.sessions.size == 1) {
-                        val sole = activeResult.sessions.first()
-                        val autoPinned = PinnedSession(
-                            sessionId = sole.id,
-                            directory = sole.directory,
-                            title = sole.title,
-                        )
-                        pinnedSession = autoPinned
-                        tokenStore.updatePinnedSession(activeResult.server.id, autoPinned)
+                    } else {
+                        val autoCandidate = resolveAutoPinCandidate(activeResult.roots)
+                        if (autoCandidate != null) {
+                            val autoPinned = PinnedSession(
+                                sessionId = autoCandidate.id,
+                                directory = autoCandidate.directory,
+                                title = autoCandidate.title,
+                            )
+                            pinnedSession = autoPinned
+                            tokenStore.updatePinnedSession(activeResult.server.id, autoPinned)
+                        }
                     }
                 } else if (!isConnected) {
                     onSessionExpiredAuthErrorState.value("Session expired — please sign in again")
@@ -295,9 +318,13 @@ internal class VoiceCockpitState(
             } catch (t: Throwable) {
                 sessionsError = t.message ?: "Failed to load sessions"
             } finally {
-                isLoadingSessions = false
+                if (refreshSessionsJob === coroutineContext[Job]) {
+                    isLoadingSessions = false
+                }
             }
         }
+        refreshSessionsJob = job
+        job.start()
     }
 
     fun refreshVoices() {
@@ -390,7 +417,7 @@ internal class VoiceCockpitState(
     }
 
     fun openSessionPicker() {
-        if (serverGroups.isEmpty()) refreshSessions()
+        refreshSessions()
         showSessionPicker = true
     }
 
@@ -535,6 +562,7 @@ internal class VoiceCockpitState(
         if (isConnected) {
             refreshSessions()
         } else {
+            cancelSessionRefresh()
             serverGroups = emptyList()
         }
     }
@@ -544,6 +572,7 @@ internal class VoiceCockpitState(
     }
 
     fun clearServerGroups() {
+        cancelSessionRefresh()
         serverGroups = emptyList()
     }
 

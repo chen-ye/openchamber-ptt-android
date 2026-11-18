@@ -50,7 +50,7 @@ object OpenChamberHttp {
         tokenForUrlProvider: ((HttpUrl) -> String?)? = null,
         directoryForUrlProvider: ((HttpUrl) -> String?)? = null,
     ): OkHttpClient {
-        val builder = (baseClient ?: defaultBaseClient()).newBuilder()
+        val builder = (baseClient ?: sharedBaseClient).newBuilder()
 
         builder.addInterceptor(
             OpenChamberAuthAndDirectoryInterceptor(
@@ -74,6 +74,9 @@ object OpenChamberHttp {
             .header(HEADER_DIRECTORY, encodeUriComponent(cleaned))
             .header(HEADER_DIRECTORY_ENCODING, DIRECTORY_ENCODING_URI)
     }
+
+    internal fun omitDirectoryHeaders(builder: Request.Builder): Request.Builder =
+        builder.tag(OmitDirectoryHeadersTag::class.java, OmitDirectoryHeadersTag)
 
     fun buildWebSocketRequest(
         url: String,
@@ -130,14 +133,16 @@ object OpenChamberHttp {
             code == ')'.code
     }
 
-    private fun defaultBaseClient(): OkHttpClient {
-        return OkHttpClient.Builder()
+    private val sharedBaseClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
             .pingInterval(20, TimeUnit.SECONDS)
             .build()
     }
+
+    private object OmitDirectoryHeadersTag
 
     private class OpenChamberAuthAndDirectoryInterceptor(
         private val tokenProvider: () -> String?,
@@ -158,15 +163,17 @@ object OpenChamberHttp {
                 builder.header(HEADER_AUTHORIZATION, "Bearer $token")
             }
 
-            if (original.header(HEADER_DIRECTORY) == null) {
-                val directory = if (directoryForUrlProvider != null) {
-                    directoryForUrlProvider.invoke(original.url)
-                } else {
-                    directoryProvider?.invoke()
+            if (original.tag(OmitDirectoryHeadersTag::class.java) == null) {
+                if (original.header(HEADER_DIRECTORY) == null) {
+                    val directory = if (directoryForUrlProvider != null) {
+                        directoryForUrlProvider.invoke(original.url)
+                    } else {
+                        directoryProvider?.invoke()
+                    }
+                    applyDirectoryHeaders(builder, directory)
+                } else if (original.header(HEADER_DIRECTORY_ENCODING) == null) {
+                    builder.header(HEADER_DIRECTORY_ENCODING, DIRECTORY_ENCODING_URI)
                 }
-                applyDirectoryHeaders(builder, directory)
-            } else if (original.header(HEADER_DIRECTORY_ENCODING) == null) {
-                builder.header(HEADER_DIRECTORY_ENCODING, DIRECTORY_ENCODING_URI)
             }
 
             if (original.header("Upgrade").equals("websocket", ignoreCase = true)) {
