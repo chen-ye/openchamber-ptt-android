@@ -1,0 +1,357 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-18T09:31:21Z",
+  "title": "Design System: OpenChamber PTT",
+  "extensions": {
+    "colorMeta": {
+      "deep-pine-teal": {
+        "role": "primary",
+        "displayName": "Deep Pine Teal",
+        "canonical": "#0e6b5e",
+        "tonalRamp": ["#00201b", "#003730", "#005046", "#0e6b5e", "#2d8a7b", "#59b1a1", "#86d6c6", "#a2f2e2"]
+      },
+      "mint-container": {
+        "role": "primary",
+        "displayName": "Mint Container",
+        "canonical": "#a2f2e2",
+        "tonalRamp": ["#00201b", "#005046", "#0e6b5e", "#3c9a8b", "#6ec9b8", "#86d6c6", "#a2f2e2", "#d8fbf3"]
+      },
+      "deep-pine-ink": {
+        "role": "primary",
+        "displayName": "Deep Pine Ink",
+        "canonical": "#00201b",
+        "tonalRamp": ["#00201b", "#003730", "#064e44", "#0e6b5e", "#3b8477", "#6aa89d", "#a2f2e2", "#e3faf5"]
+      },
+      "muted-sage": {
+        "role": "secondary",
+        "displayName": "Muted Sage",
+        "canonical": "#4a635e",
+        "tonalRamp": ["#06201b", "#1c3530", "#334b46", "#4a635e", "#69827d", "#8ca6a0", "#b1ccc5", "#cce8e1"]
+      },
+      "sage-container": {
+        "role": "secondary",
+        "displayName": "Sage Container",
+        "canonical": "#cce8e1",
+        "tonalRamp": ["#06201b", "#1c3530", "#334b46", "#4a635e", "#76918b", "#9fbab3", "#cce8e1", "#e9f7f3"]
+      },
+      "sage-ink": {
+        "role": "secondary",
+        "displayName": "Sage Ink",
+        "canonical": "#06201b",
+        "tonalRamp": ["#06201b", "#1c3530", "#334b46", "#4a635e", "#78928d", "#a4beb8", "#cce8e1", "#edf7f4"]
+      },
+      "steel-slate": {
+        "role": "tertiary",
+        "displayName": "Steel Slate",
+        "canonical": "#436278",
+        "tonalRamp": ["#001e2e", "#123348", "#2b4a5f", "#436278", "#618198", "#84a4bc", "#abcbe3", "#c8e6ff"]
+      },
+      "steel-container": {
+        "role": "tertiary",
+        "displayName": "Steel Container",
+        "canonical": "#c8e6ff",
+        "tonalRamp": ["#001e2e", "#123348", "#2b4a5f", "#436278", "#6c8ea6", "#95b8d1", "#c8e6ff", "#e8f4ff"]
+      },
+      "steel-ink": {
+        "role": "tertiary",
+        "displayName": "Steel Ink",
+        "canonical": "#001e2e",
+        "tonalRamp": ["#001e2e", "#123348", "#2b4a5f", "#436278", "#6b8ca3", "#98b8cf", "#c8e6ff", "#ebf5ff"]
+      },
+      "recording-crimson": {
+        "role": "error",
+        "displayName": "Recording Crimson",
+        "canonical": "#ba1a1a",
+        "tonalRamp": ["#410002", "#690005", "#93000a", "#ba1a1a", "#de3730", "#ff695e", "#ffb4ab", "#ffdad6"]
+      },
+      "crimson-container": {
+        "role": "error",
+        "displayName": "Crimson Container",
+        "canonical": "#ffdad6",
+        "tonalRamp": ["#410002", "#690005", "#93000a", "#ba1a1a", "#e55449", "#ff897d", "#ffdad6", "#fff2f0"]
+      },
+      "crimson-ink": {
+        "role": "error",
+        "displayName": "Crimson Ink",
+        "canonical": "#410002",
+        "tonalRamp": ["#410002", "#690005", "#93000a", "#ba1a1a", "#dc4f46", "#ff8c82", "#ffdad6", "#fff4f2"]
+      },
+      "mineral-mist": {
+        "role": "neutral",
+        "displayName": "Mineral Mist",
+        "canonical": "#f5faf8",
+        "tonalRamp": ["#0e1513", "#171d1b", "#1b211f", "#252b29", "#d5dbd9", "#e9efed", "#f5faf8", "#ffffff"]
+      },
+      "surface-container-lowest": {
+        "role": "neutral",
+        "displayName": "Surface Container Lowest",
+        "canonical": "#ffffff",
+        "tonalRamp": ["#090f0e", "#171d1b", "#2f3634", "#d5dbd9", "#e3e9e7", "#eff5f2", "#f5faf8", "#ffffff"]
+      },
+      "surface-container-low": {
+        "role": "neutral",
+        "displayName": "Surface Container Low",
+        "canonical": "#eff5f2",
+        "tonalRamp": ["#0e1513", "#171d1b", "#1b211f", "#252b29", "#dae5e1", "#e9efed", "#eff5f2", "#ffffff"]
+      },
+      "surface-container": {
+        "role": "neutral",
+        "displayName": "Surface Container",
+        "canonical": "#e9efed",
+        "tonalRamp": ["#0e1513", "#1b211f", "#252b29", "#2f3634", "#dae5e1", "#e3e9e7", "#e9efed", "#f5faf8"]
+      },
+      "surface-container-high": {
+        "role": "neutral",
+        "displayName": "Surface Container High",
+        "canonical": "#e3e9e7",
+        "tonalRamp": ["#0e1513", "#1b211f", "#252b29", "#2f3634", "#d5dbd9", "#dae5e1", "#e3e9e7", "#eff5f2"]
+      },
+      "surface-container-highest": {
+        "role": "neutral",
+        "displayName": "Surface Container Highest",
+        "canonical": "#dae5e1",
+        "tonalRamp": ["#0e1513", "#1b211f", "#252b29", "#2f3634", "#bfc9c5", "#d5dbd9", "#dae5e1", "#eff5f2"]
+      },
+      "ink-charcoal": {
+        "role": "neutral",
+        "displayName": "Charcoal Ink",
+        "canonical": "#171d1b",
+        "tonalRamp": ["#090f0e", "#171d1b", "#2b322f", "#3f4946", "#6f7976", "#899390", "#bec9c5", "#dee4e1"]
+      },
+      "ink-muted": {
+        "role": "neutral",
+        "displayName": "Muted Slate Ink",
+        "canonical": "#3f4946",
+        "tonalRamp": ["#171d1b", "#2b322f", "#3f4946", "#57615e", "#6f7976", "#899390", "#bec9c5", "#dee4e1"]
+      },
+      "outline-hairline": {
+        "role": "neutral",
+        "displayName": "Hairline Mist",
+        "canonical": "#bfc9c5",
+        "tonalRamp": ["#252b29", "#3f4946", "#58625f", "#6f7976", "#899390", "#a6b0ac", "#bfc9c5", "#e9efed"]
+      },
+      "night-pine-bg": {
+        "role": "neutral",
+        "displayName": "Night Pine Background",
+        "canonical": "#0e1513",
+        "tonalRamp": ["#090f0e", "#0e1513", "#171d1b", "#1b211f", "#252b29", "#2f3634", "#899390", "#dee4e1"]
+      },
+      "night-surface-low": {
+        "role": "neutral",
+        "displayName": "Night Surface Low",
+        "canonical": "#171d1b",
+        "tonalRamp": ["#090f0e", "#0e1513", "#171d1b", "#1b211f", "#252b29", "#2f3634", "#bec9c5", "#dee4e1"]
+      },
+      "night-surface": {
+        "role": "neutral",
+        "displayName": "Night Surface",
+        "canonical": "#1b211f",
+        "tonalRamp": ["#090f0e", "#0e1513", "#171d1b", "#1b211f", "#252b29", "#2f3634", "#bec9c5", "#dee4e1"]
+      },
+      "night-teal": {
+        "role": "primary",
+        "displayName": "Night Pine Teal",
+        "canonical": "#86d6c6",
+        "tonalRamp": ["#00201b", "#003730", "#005046", "#0e6b5e", "#389687", "#60bca9", "#86d6c6", "#a2f2e2"]
+      },
+      "night-teal-container": {
+        "role": "primary",
+        "displayName": "Night Teal Container",
+        "canonical": "#005046",
+        "tonalRamp": ["#00201b", "#003730", "#005046", "#0e6b5e", "#328e7e", "#5ab8a6", "#86d6c6", "#a2f2e2"]
+      },
+      "night-coral": {
+        "role": "error",
+        "displayName": "Night Recording Coral",
+        "canonical": "#ffb4ab",
+        "tonalRamp": ["#410002", "#690005", "#93000a", "#ba1a1a", "#de3730", "#ff7569", "#ffb4ab", "#ffdad6"]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Setup screen title and primary onboarding headings."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Sheet headers, Hero PTT primary label, SessionPill title, and Markdown H1/H2."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "List item labels, transcript prompts, Markdown replies, and helper subtitles."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Status pills, action buttons, slider ticks, and compact metadata badges."
+      },
+      "mono": {
+        "displayName": "Monospace",
+        "purpose": "Markdown inline code, fenced code blocks, and JSONL telemetry log lines."
+      }
+    },
+    "shadows": [
+      {
+        "name": "card-tonal-flat",
+        "value": "none",
+        "purpose": "Default elevation across all cards, rows, and bottom sheets; depth comes strictly from surfaceContainer* steps."
+      },
+      {
+        "name": "hero-ptt-resting",
+        "value": "0 2px 4px rgba(0, 0, 0, 0.14)",
+        "purpose": "Subtle Material 3 surface depth beneath the resting circular Hero PTT control."
+      },
+      {
+        "name": "hero-ptt-recording",
+        "value": "0 6px 12px rgba(186, 26, 26, 0.28)",
+        "purpose": "Elevated state depth beneath the Hero PTT orb while actively capturing voice."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state-color-transition",
+        "value": "180ms linear-in-out",
+        "purpose": "Smooth container and icon color shift on HeroPttControl across PTT state transitions."
+      },
+      {
+        "name": "capture-pulse-halo",
+        "value": "750ms ease-in-out infinite reverse",
+        "purpose": "1.0x to 1.08x concentric outer ring pulse during recording, send grace, and TTS speech."
+      },
+      {
+        "name": "reduced-motion-guard",
+        "value": "ANIMATOR_DURATION_SCALE != 0",
+        "purpose": "Suppresses pulse loops and snaps color transitions to 0ms when system animations are disabled."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "compact-max-width",
+        "value": "560dp"
+      },
+      {
+        "name": "wide-landscape",
+        "value": "540dp"
+      },
+      {
+        "name": "expanded-two-pane",
+        "value": "600dp"
+      },
+      {
+        "name": "compact-height-sheet",
+        "value": "420dp"
+      },
+      {
+        "name": "bubble-desired-height",
+        "value": "560dp"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Hero PTT Orb (Ready)",
+      "kind": "button",
+      "refersTo": "hero-ptt-idle",
+      "description": "Pixel Recorder-inspired circular capture button in ready state.",
+      "html": "<button class=\"ds-hero-ptt\" aria-label=\"Arm PTT\"><svg viewBox=\"0 0 24 24\" width=\"36\" height=\"36\" fill=\"currentColor\"><path d=\"M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3zM17.3,11c0,3 -2.54,5.1 -5.3,5.1S6.7,14 6.7,11H5c0,3.41 2.72,6.23 6,6.72V21h2v-3.28c3.28,-0.49 6,-3.31 6,-6.72h-1.7z\"/></svg></button>",
+      "css": ".ds-hero-ptt { width: 104px; height: 104px; border-radius: 9999px; border: none; background: #0e6b5e; color: #ffffff; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.14); transition: background 180ms ease, transform 120ms ease; } .ds-hero-ptt:hover { background: #0b5a4f; } .ds-hero-ptt:focus-visible { outline: 3px solid #0e6b5e; outline-offset: 4px; } .ds-hero-ptt:active { transform: scale(0.96); }"
+    },
+    {
+      "name": "Hero PTT Orb (Recording)",
+      "kind": "button",
+      "refersTo": "hero-ptt-recording",
+      "description": "Active recording state with crimson fill and concentric pulse halo.",
+      "html": "<div class=\"ds-hero-wrap\"><button class=\"ds-hero-rec\" aria-label=\"Stop recording\"><svg viewBox=\"0 0 24 24\" width=\"36\" height=\"36\" fill=\"currentColor\"><path d=\"M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3zM17.3,11c0,3 -2.54,5.1 -5.3,5.1S6.7,14 6.7,11H5c0,3.41 2.72,6.23 6,6.72V21h2v-3.28c3.28,-0.49 6,-3.31 6,-6.72h-1.7z\"/></svg></button></div>",
+      "css": ".ds-hero-wrap { width: 118px; height: 118px; border-radius: 9999px; background: rgba(186, 26, 26, 0.20); display: inline-flex; align-items: center; justify-content: center; } .ds-hero-rec { width: 104px; height: 104px; border-radius: 9999px; border: none; background: #ba1a1a; color: #ffffff; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 6px 12px rgba(186,26,26,0.28); transition: transform 120ms ease; } .ds-hero-rec:focus-visible { outline: 3px solid #ba1a1a; outline-offset: 4px; } .ds-hero-rec:active { transform: scale(0.96); }"
+    },
+    {
+      "name": "Status Pill",
+      "kind": "chip",
+      "refersTo": "status-pill-armed",
+      "description": "Compact pill badge communicating live PTT state with an 8px indicator dot.",
+      "html": "<span class=\"ds-status-pill\"><span class=\"ds-status-dot\"></span>Armed — tap headset to talk</span>",
+      "css": ".ds-status-pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 9999px; background: #a2f2e2; color: #00201b; font: 600 12px/1.33 Roboto, system-ui, sans-serif; } .ds-status-dot { width: 8px; height: 8px; border-radius: 9999px; background: #0e6b5e; }"
+    },
+    {
+      "name": "Primary Filled Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Material 3 pill button with 48px minimum accessible height.",
+      "html": "<button class=\"ds-btn-primary\">Connect</button>",
+      "css": ".ds-btn-primary { min-height: 48px; padding: 12px 24px; border-radius: 9999px; border: none; background: #0e6b5e; color: #ffffff; font: 600 14px/1.43 Roboto, system-ui, sans-serif; cursor: pointer; transition: background 150ms ease; } .ds-btn-primary:hover { background: #0b5a4f; } .ds-btn-primary:focus-visible { outline: 2px solid #0e6b5e; outline-offset: 2px; } .ds-btn-primary:active { background: #084a41; }"
+    },
+    {
+      "name": "Session Switcher Pill",
+      "kind": "card",
+      "refersTo": "card-surface",
+      "description": "Tonal surface bar showing active session title, directory leaf, and swap affordance.",
+      "html": "<button class=\"ds-session-pill\"><span class=\"ds-session-copy\"><span class=\"ds-session-title\">Refactor Voice State</span><span class=\"ds-session-sub\">openchamber-ptt-android</span></span><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"currentColor\"><path d=\"M6.99,11L3,15l3.99,4v-3H14v-2H6.99v-3zM21,9l-3.99,-4v3H10v2h7.01v3L21,9z\"/></svg></button>",
+      "css": ".ds-session-pill { width: 100%; min-height: 52px; padding: 10px 14px; border-radius: 16px; border: none; background: #eff5f2; color: #171d1b; display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: left; cursor: pointer; transition: background 150ms ease; } .ds-session-pill:hover { background: #e3e9e7; } .ds-session-pill:focus-visible { outline: 2px solid #0e6b5e; outline-offset: 2px; } .ds-session-copy { display: flex; flex-direction: column; min-width: 0; } .ds-session-title { font: 600 14px/1.35 Roboto, system-ui, sans-serif; color: #171d1b; } .ds-session-sub { font: 400 12px/1.33 Roboto, system-ui, sans-serif; color: #3f4946; }"
+    },
+    {
+      "name": "Selected Sheet Row",
+      "kind": "card",
+      "refersTo": "list-row-selected",
+      "description": "Selected option row inside session and voice picker bottom sheets.",
+      "html": "<button class=\"ds-row-selected\"><span class=\"ds-row-copy\"><span class=\"ds-row-title\">Kore (Gemini Bridge)</span><span class=\"ds-row-sub\">Warm · Female · US</span></span><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"currentColor\"><path d=\"M9,16.17L4.83,12l-1.42,1.41L9,19 21,7l-1.41,-1.41z\"/></svg></button>",
+      "css": ".ds-row-selected { width: 100%; min-height: 56px; padding: 10px 14px; border-radius: 12px; border: none; background: #a2f2e2; color: #00201b; display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: left; cursor: pointer; } .ds-row-selected:focus-visible { outline: 2px solid #0e6b5e; outline-offset: 2px; } .ds-row-copy { display: flex; flex-direction: column; } .ds-row-title { font: 600 16px/1.4 Roboto, system-ui, sans-serif; } .ds-row-sub { font: 400 12px/1.33 Roboto, system-ui, sans-serif; opacity: 0.8; }"
+    },
+    {
+      "name": "Outlined Text Field",
+      "kind": "input",
+      "refersTo": "input-outlined",
+      "description": "Standard Material 3 outlined input used for server credentials, draft editing, and picker search.",
+      "html": "<label class=\"ds-field\"><span class=\"ds-field-label\">Search voices</span><input class=\"ds-input\" type=\"text\" value=\"Kore\" placeholder=\"Filter by name\" /></label>",
+      "css": ".ds-field { display: flex; flex-direction: column; gap: 4px; width: 100%; font: 400 12px/1.33 Roboto, system-ui, sans-serif; color: #3f4946; } .ds-input { width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 4px; border: 1px solid #6f7976; background: #f5faf8; color: #171d1b; font: 400 14px/1.43 Roboto, system-ui, sans-serif; } .ds-input:focus-visible { outline: none; border-color: #0e6b5e; box-shadow: 0 0 0 1px #0e6b5e; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Quiet Console",
+    "overview": "OpenChamber PTT treats voice-driven coding like Google Pixel Recorder treats audio capture: a calm, purely tonal Material Design 3 instrument panel where resting surfaces step back into soft mineral tones and saturated color speaks only when the microphone, grace timer, or voice playback is live. On Android 12 and newer, `OpenChamberPttTheme` adopts Material You dynamic wallpaper color (`dynamicLightColorScheme` / `dynamicDarkColorScheme`) while preserving exact semantic role separation; on older builds or fallback contexts, it settles into a cool pine-and-mineral palette in both light and dark themes.\n\nHierarchy relies on tonal contrast, generous `>=48dp` interactive targets, and progressive disclosure rather than drop shadows or heavy borders. The primary screen centers on four essentials—the active session pill, the circular Hero PTT orb, quick audio/voice toggles, and the latest turn transcript—while server connections, voice catalogs, session switching, and UX telemetry tuck cleanly into full-height `ModalBottomSheet` surfaces. Confirmed anti-references include decorative gradients, persistent card shadows, and non-native iOS chrome.",
+    "keyCharacteristics": [
+      "Purely tonal Material 3 surface hierarchy (`surfaceContainerLowest` through `surfaceContainerHighest`) with zero card drop shadows.",
+      "Pixel Recorder-inspired central circular capture orb (`HeroPttControl`) anchored above the fold with clear 12-state color transitions.",
+      "Semantic signal restraint: saturated primary, tertiary, and error tones appear only for live PTT state, active selection, and primary actions.",
+      "Native Android discipline: edge-to-edge system bar/IME insets, predictive back handling, `FlowRow` wrapping, and strict `>=48dp` touch targets."
+    ],
+    "rules": [
+      {
+        "name": "The Semantic Signal Rule",
+        "body": "Saturated `primary`, `tertiary`, and `error` containers belong strictly to live operational state, selected items, and primary CTAs—resting cards stay within neutral `surfaceContainer*` steps.",
+        "section": "colors"
+      },
+      {
+        "name": "The Dynamic-First Fallback Rule",
+        "body": "Components always consume `MaterialTheme.colorScheme` roles rather than raw hex constants so Material You wallpaper theming and dark mode resolve consistently across every screen and sheet.",
+        "section": "colors"
+      },
+      {
+        "name": "The Scale-Role Discipline Rule",
+        "body": "Map every string to a Material 3 `MaterialTheme.typography` role (`sp` scaled) and avoid fixed pixel text sizes or fixed-height wrappers that clip under `font_scale = 1.3`.",
+        "section": "typography"
+      },
+      {
+        "name": "The Above-the-Fold Instrument Rule",
+        "body": "Keep session switching, live PTT capture, and primary audio/voice toggles visible without scrolling in compact portrait and Bubble layouts; relegate deep settings, voice catalogs, and logs to sheets.",
+        "section": "layout"
+      },
+      {
+        "name": "The Tonal Step Over Shadow Rule",
+        "body": "Never stack drop shadows or thick borders on cards, sheets, or list rows; convey separation by stepping one `surfaceContainer*` level up or down.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep `>=48dp` minimum touch targets (`heightIn(min = 48.dp)` or `minimumInteractiveComponentSize()`) on every interactive button, chip, slider tick, and list row.",
+      "Do wrap multi-button toolbars in `FlowRow` so `font_scale = 1.3` wraps naturally without clipped labels.",
+      "Do step surfaces tonally (`surfaceContainerLow` → `surfaceContainer` → `surfaceContainerHigh`) and consume `MaterialTheme.colorScheme` roles so light, dark, and dynamic wallpaper schemes stay coherent.",
+      "Do use minimal local `24dp` vector drawables in `res/drawable/`, honor `Settings.Global.ANIMATOR_DURATION_SCALE` via `shouldAnimateMotion`, and open multi-section sheets with `skipPartiallyExpanded = true`.",
+      "Do verify every UI change on `openchamber_api35` in both light and dark themes (and check `font_scale = 1.3`)."
+    ],
+    "donts": [
+      "Don't add `material-icons-extended` or third-party icon font dependencies that bloat APK size.",
+      "Don't replace intrinsic line-height and padding with hardcoded fixed heights that truncate under large system font sizes.",
+      "Don't add persistent drop shadows to cards/sheets, decorative gradients, or non-Android iOS controls.",
+      "Don't block the main cockpit with full-screen modal interruptions when an inline banner or `ModalBottomSheet` belongs."
+    ]
+  }
+}
