@@ -183,4 +183,30 @@ class EventStreamClientTest {
         )
         assertEquals(TurnEvent.PermissionResolved, permReplied.turnEvent)
     }
+
+    @Test
+    fun `maps session synthetic frames for targetSessionId and ignores other sessions`() {
+        val streamClient = EventStreamClient(
+            httpClient = OpenChamberHttp.createClient(tokenProvider = { "oc_client_test" }),
+        )
+
+        val withMetadata = streamClient.parseFrame(
+            """{"type":"event","eventId":"evt-60","payload":{"id":"evt-60","type":"session.synthetic","data":{"sessionID":"ses_target","text":"Subagent finished","description":"wake","metadata":{"source":"openchamber-session"}}}}""",
+            targetSessionId = "ses_target",
+        )
+        assertEquals(TurnEvent.SyntheticArrived(source = "openchamber-session"), withMetadata.turnEvent)
+
+        val withoutMetadata = streamClient.parseFrame(
+            """{"type":"event","eventId":"evt-61","payload":{"id":"evt-61","type":"session.synthetic","data":{"sessionID":"ses_target","text":"Subagent finished"}}}""",
+            targetSessionId = "ses_target",
+        )
+        assertEquals(TurnEvent.SyntheticArrived(source = null), withoutMetadata.turnEvent)
+
+        val otherSession = streamClient.parseFrame(
+            """{"type":"event","eventId":"evt-62","payload":{"id":"evt-62","type":"session.synthetic","data":{"sessionID":"ses_other","text":"Subagent finished","metadata":{"source":"openchamber-session"}}}}""",
+            targetSessionId = "ses_target",
+        )
+        assertNull(otherSession.turnEvent)
+        assertEquals("evt-62", otherSession.eventId)
+    }
 }

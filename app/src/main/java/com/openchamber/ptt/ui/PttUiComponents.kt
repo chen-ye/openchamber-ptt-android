@@ -67,14 +67,19 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.openchamber.ptt.R
 import com.openchamber.ptt.service.PttState
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.StagedDraft
 import com.openchamber.ptt.tts.SpokenDetailLevel
+import com.openchamber.ptt.voice.ResponseFeedState
+import com.openchamber.ptt.voice.TurnTriggerKind
 import kotlinx.coroutines.delay
 import java.util.Locale
 
@@ -810,6 +815,7 @@ internal fun PermissionWarningBanner(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun TurnTranscriptPanel(
     lastTranscript: String?,
@@ -817,12 +823,34 @@ internal fun TurnTranscriptPanel(
     lastSpokenSummary: String? = null,
     lastTtsInfo: String?,
     serviceError: String?,
+    pttState: PttState = PttState.DISARMED,
+    responseFeed: ResponseFeedState = ResponseFeedState(),
+    showQueueStrip: Boolean = true,
     isSpeaking: Boolean = false,
     canReadAloud: Boolean = false,
     onReadAloudClick: (() -> Unit)? = null,
+    onStepResponse: ((Int) -> Unit)? = null,
+    onSelectResponse: ((String) -> Unit)? = null,
+    onMarkAllRead: (() -> Unit)? = null,
+    onDismissDirectAnswer: (() -> Unit)? = null,
     onOpenInOpenChamber: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
+    val inspectable = responseFeed.inspectableResponses
+    val unreadQueue = responseFeed.unreadQueue
+    val focused = responseFeed.focusedResponse
+    val focusedIdx = focused
+        ?.let { f -> inspectable.indexOfFirst { it.messageId == f.messageId } }
+        ?.takeIf { it >= 0 }
+        ?: 0
+    val isCapturingOrThinking = pttState == PttState.RECORDING ||
+        pttState.isTranscribing ||
+        pttState == PttState.SEND_GRACE ||
+        pttState == PttState.WAITING_AGENT
+    val replyText = focused?.assistantText?.takeIf { it.isNotBlank() }
+        ?: lastReply?.takeIf { it.isNotBlank() }
+    val activeTurnCount = responseFeed.activeTurn?.responses?.size ?: 0
+
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerLow,
         shape = RoundedCornerShape(16.dp),
@@ -852,7 +880,172 @@ internal fun TurnTranscriptPanel(
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             }
 
-            if (!lastTranscript.isNullOrBlank()) {
+            val rawDirectAnswer = responseFeed.directAnswer
+            val directAnswer = rawDirectAnswer?.takeIf { ans ->
+                ans.targetMessageId == null ||
+                    focused == null ||
+                    ans.targetMessageId == focused.messageId
+            }
+            if (directAnswer != null) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                start = 12.dp,
+                                top = if (onDismissDirectAnswer != null) 4.dp else 10.dp,
+                                end = if (onDismissDirectAnswer != null) 4.dp else 12.dp,
+                                bottom = 12.dp,
+                            ),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_graphic_eq),
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Text(
+                                    text = "Quick answer",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            if (onDismissDirectAnswer != null) {
+                                IconButton(onClick = onDismissDirectAnswer) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_close),
+                                        contentDescription = "Dismiss quick answer",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                            }
+                        }
+                        if (directAnswer.question.isNotBlank()) {
+                            Text(
+                                text = directAnswer.question,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(
+                                    end = if (onDismissDirectAnswer != null) 8.dp else 0.dp,
+                                ),
+                            )
+                        }
+                        Text(
+                            text = directAnswer.spokenAnswer,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(
+                                end = if (onDismissDirectAnswer != null) 8.dp else 0.dp,
+                            ),
+                        )
+                    }
+                }
+            }
+
+            if (isCapturingOrThinking && !lastTranscript.isNullOrBlank()) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "You",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = lastTranscript,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 4,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            } else if (focused != null) {
+                val triggerLabel = when (focused.triggerKind) {
+                    TurnTriggerKind.USER_PROMPT -> "You"
+                    TurnTriggerKind.ASYNC_SESSION_RESULT ->
+                        "Async result${focused.triggerLabel?.let { " · $it" }.orEmpty()}"
+                    TurnTriggerKind.SUBAGENT_REPORT ->
+                        "Subagent${focused.triggerLabel?.let { " · $it" }.orEmpty()}"
+                }
+                val triggerColor = when (focused.triggerKind) {
+                    TurnTriggerKind.USER_PROMPT -> MaterialTheme.colorScheme.primary
+                    TurnTriggerKind.ASYNC_SESSION_RESULT,
+                    TurnTriggerKind.SUBAGENT_REPORT,
+                    -> MaterialTheme.colorScheme.tertiary
+                }
+                val isFocusedUnread = unreadQueue.any { it.messageId == focused.messageId }
+                val triggerBody = focused.triggerText?.takeIf { it.isNotBlank() }
+
+                if (triggerBody != null || isFocusedUnread || focused.triggerKind != TurnTriggerKind.USER_PROMPT) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = triggerLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = triggerColor,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (isFocusedUnread) {
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .background(MaterialTheme.colorScheme.primary, CircleShape),
+                                    )
+                                    Text(
+                                        text = "Unread",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                }
+                            }
+                        }
+                        if (triggerBody != null) {
+                            Text(
+                                text = triggerBody,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 4,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                }
+            } else if (!lastTranscript.isNullOrBlank()) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
                         text = "You",
@@ -875,40 +1068,158 @@ internal fun TurnTranscriptPanel(
                 val panelContext = LocalContext.current
                 @Suppress("DEPRECATION")
                 val clipboardManager = LocalClipboardManager.current
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Text(
-                        text = "Latest reply",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.tertiary,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                    )
-                    if (!lastReply.isNullOrBlank()) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        ) {
-                            IconButton(
-                                onClick = {
-                                    clipboardManager.setText(AnnotatedString(lastReply))
-                                    Toast.makeText(panelContext, "Copied reply", Toast.LENGTH_SHORT).show()
-                                },
+
+                if (inspectable.size <= 1 && unreadQueue.isEmpty()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = "Latest reply",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.tertiary,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (replyText != null) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
                             ) {
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_content_copy),
-                                    contentDescription = "Copy reply",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(18.dp),
-                                )
+                                IconButton(
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(replyText))
+                                        Toast.makeText(panelContext, "Copied reply", Toast.LENGTH_SHORT).show()
+                                    },
+                                ) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_content_copy),
+                                        contentDescription = "Copy reply",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                                if (onReadAloudClick != null) {
+                                    FilledTonalButton(
+                                        onClick = onReadAloudClick,
+                                        enabled = canReadAloud,
+                                        modifier = Modifier.heightIn(min = 48.dp),
+                                    ) {
+                                        Icon(
+                                            painter = painterResource(
+                                                if (isSpeaking) R.drawable.ic_volume_off else R.drawable.ic_volume_up,
+                                            ),
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = if (isSpeaking) "Stop" else "Read aloud",
+                                            style = MaterialTheme.typography.labelMedium,
+                                        )
+                                    }
+                                }
                             }
-                            if (onReadAloudClick != null) {
+                        }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        val headerBase = if (inspectable.size > 1) {
+                            "Response ${focusedIdx + 1} of ${inspectable.size}"
+                        } else {
+                            "Latest reply"
+                        }
+                        Text(
+                            text = buildAnnotatedString {
+                                withStyle(SpanStyle(color = MaterialTheme.colorScheme.tertiary)) {
+                                    append(headerBase)
+                                }
+                                if (unreadQueue.isNotEmpty()) {
+                                    withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary)) {
+                                        append(" · ${unreadQueue.size} unread")
+                                    }
+                                }
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (inspectable.size > 1) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    onClick = { onStepResponse?.invoke(-1) },
+                                    enabled = onStepResponse != null && focusedIdx > 0,
+                                ) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_chevron_left),
+                                        contentDescription = "Previous response",
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { onStepResponse?.invoke(1) },
+                                    enabled = onStepResponse != null && focusedIdx < inspectable.lastIndex,
+                                ) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_chevron_right),
+                                        contentDescription = "Next response",
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    if (replyText != null || unreadQueue.isNotEmpty()) {
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            if (unreadQueue.isNotEmpty() && onMarkAllRead != null) {
+                                TextButton(
+                                    onClick = onMarkAllRead,
+                                    modifier = Modifier
+                                        .align(Alignment.CenterVertically)
+                                        .heightIn(min = 48.dp),
+                                ) {
+                                    Text("Mark read")
+                                }
+                            }
+                            if (replyText != null) {
+                                IconButton(
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(replyText))
+                                        Toast.makeText(panelContext, "Copied reply", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier.align(Alignment.CenterVertically),
+                                ) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_content_copy),
+                                        contentDescription = "Copy reply",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                            }
+                            if (onReadAloudClick != null && (replyText != null || unreadQueue.isNotEmpty())) {
+                                val readLabel = when {
+                                    isSpeaking -> "Stop"
+                                    unreadQueue.isNotEmpty() -> "Read all (${unreadQueue.size})"
+                                    activeTurnCount > 1 -> "Read turn ($activeTurnCount)"
+                                    else -> "Read aloud"
+                                }
                                 FilledTonalButton(
                                     onClick = onReadAloudClick,
                                     enabled = canReadAloud,
+                                    modifier = Modifier
+                                        .align(Alignment.CenterVertically)
+                                        .heightIn(min = 48.dp),
                                 ) {
                                     Icon(
                                         painter = painterResource(
@@ -919,7 +1230,7 @@ internal fun TurnTranscriptPanel(
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = if (isSpeaking) "Stop" else "Read aloud",
+                                        text = readLabel,
                                         style = MaterialTheme.typography.labelMedium,
                                     )
                                 }
@@ -928,7 +1239,6 @@ internal fun TurnTranscriptPanel(
                     }
                 }
 
-                val replyText = lastReply?.takeIf { it.isNotBlank() }
                 if (replyText != null) {
                     MarkdownText(
                         markdown = replyText,
@@ -944,7 +1254,12 @@ internal fun TurnTranscriptPanel(
                     )
                 }
 
-                val spokenReadout = lastSpokenSummary?.takeIf { it.isNotBlank() }
+                val scopedSpokenSummary = if (focused != null) {
+                    responseFeed.focusedSpokenSummary
+                } else {
+                    lastSpokenSummary
+                }
+                val spokenReadout = scopedSpokenSummary?.takeIf { it.isNotBlank() }
                 if (replyText != null && spokenReadout != null) {
                     var readoutExpanded by remember(replyText, spokenReadout) { mutableStateOf(false) }
                     val isSummarized = spokenReadout.trim() != replyText.trim()
@@ -995,7 +1310,7 @@ internal fun TurnTranscriptPanel(
                                     painter = painterResource(
                                         if (readoutExpanded) R.drawable.ic_arrow_up else R.drawable.ic_arrow_down,
                                     ),
-                                    contentDescription = if (readoutExpanded) "Collapse spoken readout" else "Expand spoken readout",
+                                    contentDescription = null,
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(18.dp),
                                 )
@@ -1015,6 +1330,162 @@ internal fun TurnTranscriptPanel(
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (showQueueStrip && unreadQueue.isNotEmpty()) {
+                    var queueExpanded by remember(unreadQueue.isEmpty()) { mutableStateOf(false) }
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .minimumInteractiveComponentSize()
+                                    .clickable { queueExpanded = !queueExpanded }
+                                    .semantics(mergeDescendants = true) {
+                                        role = Role.Button
+                                        stateDescription = if (queueExpanded) "Expanded" else "Collapsed"
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .background(MaterialTheme.colorScheme.primary, CircleShape),
+                                    )
+                                    Text(
+                                        text = "Up next · ${unreadQueue.size} unread",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Icon(
+                                    painter = painterResource(
+                                        if (queueExpanded) R.drawable.ic_arrow_up else R.drawable.ic_arrow_down,
+                                    ),
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                            AnimatedVisibility(visible = queueExpanded) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(bottom = 4.dp),
+                                ) {
+                                    HorizontalDivider(
+                                        color = MaterialTheme.colorScheme.outlineVariant,
+                                        modifier = Modifier.padding(horizontal = 12.dp),
+                                    )
+                                    unreadQueue.forEach { item ->
+                                        val isItemSpeaking = responseFeed.speakingMessageId == item.messageId
+                                        val isItemFocused = focused?.messageId == item.messageId
+                                        val sourceLabel = when (item.triggerKind) {
+                                            TurnTriggerKind.USER_PROMPT -> "You"
+                                            TurnTriggerKind.ASYNC_SESSION_RESULT ->
+                                                "Async result${item.triggerLabel?.let { " · $it" }.orEmpty()}"
+                                            TurnTriggerKind.SUBAGENT_REPORT ->
+                                                "Subagent${item.triggerLabel?.let { " · $it" }.orEmpty()}"
+                                        }
+                                        val statusTag = when {
+                                            isItemSpeaking -> " · Speaking"
+                                            isItemFocused -> " · Viewing"
+                                            else -> ""
+                                        }
+                                        val itemLabelColor = when {
+                                            isItemSpeaking -> MaterialTheme.colorScheme.tertiary
+                                            isItemFocused -> MaterialTheme.colorScheme.primary
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                        val preview = item.assistantText
+                                            .replace('\n', ' ')
+                                            .replace(COLLAPSE_WHITESPACE_REGEX, " ")
+                                            .trim()
+
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(min = 48.dp)
+                                                .clickable(
+                                                    enabled = onSelectResponse != null,
+                                                    role = Role.Button,
+                                                ) {
+                                                    onSelectResponse?.invoke(item.messageId)
+                                                }
+                                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                        ) {
+                                            Box(
+                                                modifier = Modifier.size(16.dp),
+                                                contentAlignment = Alignment.Center,
+                                            ) {
+                                                if (isItemSpeaking) {
+                                                    Icon(
+                                                        painter = painterResource(R.drawable.ic_graphic_eq),
+                                                        contentDescription = "Speaking",
+                                                        tint = MaterialTheme.colorScheme.tertiary,
+                                                        modifier = Modifier.size(16.dp),
+                                                    )
+                                                } else {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(8.dp)
+                                                            .background(
+                                                                color = if (isItemFocused) {
+                                                                    MaterialTheme.colorScheme.primary
+                                                                } else {
+                                                                    MaterialTheme.colorScheme.outline
+                                                                },
+                                                                shape = CircleShape,
+                                                            ),
+                                                    )
+                                                }
+                                            }
+                                            Column(
+                                                modifier = Modifier.weight(1f),
+                                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                                            ) {
+                                                Text(
+                                                    text = "$sourceLabel$statusTag",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = itemLabelColor,
+                                                    fontWeight = if (isItemSpeaking || isItemFocused) {
+                                                        FontWeight.SemiBold
+                                                    } else {
+                                                        FontWeight.Medium
+                                                    },
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                                Text(
+                                                    text = preview,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurface,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1178,3 +1649,5 @@ internal fun SpokenDetailSlider(
         }
     }
 }
+
+private val COLLAPSE_WHITESPACE_REGEX = Regex("\\s+")

@@ -27,6 +27,7 @@ sealed interface TurnEvent {
     data class Interrupted(val reason: String = "user") : TurnEvent
     data class PermissionAsked(val tool: String) : TurnEvent
     data object PermissionResolved : TurnEvent
+    data class SyntheticArrived(val source: String? = null) : TurnEvent
 }
 
 class EventStreamClient(
@@ -196,6 +197,13 @@ class EventStreamClient(
             }
 
             "permission.replied", "permission.resolved" -> TurnEvent.PermissionResolved
+
+            "session.synthetic" -> {
+                val source = (data?.get("metadata") as? JsonObject)
+                    ?.str("source")
+                    ?.takeIf { it.isNotBlank() }
+                TurnEvent.SyntheticArrived(source)
+            }
 
             "openchamber:session-status" -> {
                 val status = data?.str("status")

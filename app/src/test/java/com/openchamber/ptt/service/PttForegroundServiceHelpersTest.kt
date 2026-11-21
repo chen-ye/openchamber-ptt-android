@@ -112,4 +112,51 @@ class PttForegroundServiceHelpersTest {
         assertTrue(PttForegroundService.shouldCancelTurnOnIdleReturn(armToIdle))
         assertFalse(PttForegroundService.shouldCancelTurnOnIdleReturn(normalPullBack))
     }
+
+    @Test
+    fun `shouldCheckAutoSpeakAfterIdleReturn suppresses DISARMED Arm and SingleTap barge-in but allows other idle returns`() {
+        val armFromDisarmed = PttTransition(
+            previous = PttState.DISARMED,
+            current = PttState.ARMED_IDLE,
+            event = PttEvent.Arm(hasPersistedDraft = false),
+            effects = emptyList(),
+        )
+        val bargeInToIdle = PttTransition(
+            previous = PttState.SPEAKING_TTS,
+            current = PttState.ARMED_IDLE,
+            event = PttEvent.SingleTap,
+            effects = emptyList(),
+        )
+        val bargeInToDraft = PttTransition(
+            previous = PttState.SPEAKING_TTS,
+            current = PttState.STAGED_DRAFT,
+            event = PttEvent.SingleTap,
+            effects = emptyList(),
+        )
+        val ttsDoneToIdle = PttTransition(
+            previous = PttState.SPEAKING_TTS,
+            current = PttState.ARMED_IDLE,
+            event = PttEvent.TtsFinished,
+            effects = emptyList(),
+        )
+        val discardToDraft = PttTransition(
+            previous = PttState.RECORDING,
+            current = PttState.STAGED_DRAFT,
+            event = PttEvent.DiscardCapture,
+            effects = emptyList(),
+        )
+        val whileRecording = PttTransition(
+            previous = PttState.ARMED_IDLE,
+            current = PttState.RECORDING,
+            event = PttEvent.SingleTap,
+            effects = emptyList(),
+        )
+
+        assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(armFromDisarmed))
+        assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(bargeInToIdle))
+        assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(bargeInToDraft))
+        assertTrue(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(ttsDoneToIdle))
+        assertTrue(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(discardToDraft))
+        assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(whileRecording))
+    }
 }

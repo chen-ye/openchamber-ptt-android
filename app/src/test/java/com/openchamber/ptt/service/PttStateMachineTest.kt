@@ -473,4 +473,82 @@ class PttStateMachineTest {
         sm.dispatch(PttEvent.SyncDraftPresence(hasPersistedDraft = true))
         assertEquals(PttState.STAGED_DRAFT, sm.dispatch(PttEvent.AgentInterrupted).current)
     }
+
+    @Test
+    fun `PlayQueuedReply speaks only from ARMED_IDLE or STAGED_DRAFT and is ignored in all other states`() {
+        val expectedEffects = listOf(
+            PttEffect.PinBluetoothAudio,
+            PttEffect.AcquireWakeAndWifiLocks,
+            PttEffect.PlayEarcon(Earcon.TURN_COMPLETE),
+            PttEffect.SpeakPendingReplies,
+        )
+
+        // From ARMED_IDLE -> SPEAKING_TTS, returns to ARMED_IDLE on TtsFinished
+        val armedSm = PttStateMachine()
+        armedSm.dispatch(PttEvent.Arm())
+        val fromArmed = armedSm.dispatch(PttEvent.PlayQueuedReply)
+        assertTrue(fromArmed.changed)
+        assertEquals(PttState.SPEAKING_TTS, fromArmed.current)
+        assertEquals(expectedEffects, fromArmed.effects)
+        assertEquals(PttState.ARMED_IDLE, armedSm.dispatch(PttEvent.TtsFinished).current)
+
+        // From STAGED_DRAFT -> SPEAKING_TTS, returns to STAGED_DRAFT on TtsFinished
+        val draftSm = PttStateMachine()
+        draftSm.dispatch(PttEvent.Arm(hasPersistedDraft = true))
+        assertEquals(PttState.STAGED_DRAFT, draftSm.currentState)
+        val fromDraft = draftSm.dispatch(PttEvent.PlayQueuedReply)
+        assertTrue(fromDraft.changed)
+        assertEquals(PttState.SPEAKING_TTS, fromDraft.current)
+        assertEquals(expectedEffects, fromDraft.effects)
+        assertEquals(PttState.STAGED_DRAFT, draftSm.dispatch(PttEvent.TtsFinished).current)
+
+        // Strictly ignored (no transition, empty effects) in every other state
+        val ignoredStates = listOf(
+            PttState.DISARMED,
+            PttState.RECORDING,
+            PttState.TRANSCRIBING_SEND,
+            PttState.TRANSCRIBING_STAGE,
+            PttState.SEND_GRACE,
+            PttState.STAGED_DRAFT_SPEAKING,
+            PttState.WAITING_AGENT,
+            PttState.SPEAKING_TTS,
+            PttState.PERMISSION_BLOCKED,
+            PttState.ERROR,
+        )
+        assertEquals(PttState.entries.size - 2, ignoredStates.size)
+        for (state in ignoredStates) {
+            val sm = PttStateMachine(initialState = state)
+            val result = sm.dispatch(PttEvent.PlayQueuedReply)
+            assertFalse("Expected no state change in $state", result.changed)
+            assertEquals(state, result.current)
+            assertTrue("Expected empty effects in $state", result.effects.isEmpty())
+        }
+    }
+
+    @Test
+    fun `standalone PlayLastReply error returns to DISARMED instead of stranding in ERROR`() {
+        val sm = PttStateMachine()
+        assertEquals(PttState.SPEAKING_TTS, sm.dispatch(PttEvent.PlayLastReply).current)
+
+        val err = sm.dispatch(PttEvent.Error("TTS failed"))
+        assertTrue(err.changed)
+        assertEquals(PttState.DISARMED, err.current)
+        assertEquals("TTS failed", sm.lastError.value)
+        assertEquals(
+            listOf(
+                PttEffect.StopTts,
+                PttEffect.ReleaseWakeAndWifiLocks,
+                PttEffect.ReleaseBluetoothAudio,
+                PttEffect.PlayEarcon(Earcon.ERROR),
+            ),
+            err.effects,
+        )
+
+        // Armed SPEAKING_TTS error still transitions to ERROR for recovery
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.PlayLastReply)
+        val armedErr = sm.dispatch(PttEvent.Error("Unauthorized", isAuthExpired = true))
+        assertEquals(PttState.ERROR, armedErr.current)
+        assertTrue(armedErr.effects.contains(PttEffect.PlayEarcon(Earcon.AUTH_EXPIRED)))
+    }
 }

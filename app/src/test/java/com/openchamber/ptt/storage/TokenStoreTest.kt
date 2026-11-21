@@ -256,6 +256,160 @@ class TokenStoreTest {
         assertEquals("Newer destination.", store.getStagedDraft(newKey)?.organizedText)
     }
 
+    @Test
+    fun `reply cursors normalize keys and IDs, persist across TokenStore instances, and clear independently`() {
+        val sharedPrefs = InMemorySharedPreferences()
+        val storeA = TokenStore(sharedPrefs)
+        val storeB = TokenStore(sharedPrefs)
+        val keyA = TokenStore.sessionKeyFor("srv1", PinnedSession("ses1", "/repo/a", "Repo A"))
+        val keyB = TokenStore.sessionKeyFor("srv1", PinnedSession("ses2", "/repo/b", "Repo B"))
+
+        val beforeChange = storeB.changes.value
+        storeA.saveReplyCursor("   ", SessionReplyCursor(lastHeardMessageId = "msg_ignored", updatedAtMs = 10L))
+        assertEquals(beforeChange, storeB.changes.value)
+        assertNull(storeB.getReplyCursor("   "))
+
+        storeA.saveReplyCursor(
+            "  $keyA  ",
+            SessionReplyCursor(
+                lastHeardMessageId = "  msg_1  ",
+                lastHeardCreatedAtMs = 1000L,
+                armedBaselineMessageId = "   ",
+                armedBaselineCreatedAtMs = 900L,
+                updatedAtMs = 1500L,
+            ),
+        )
+        assertTrue(storeB.changes.value > beforeChange)
+
+        val restoredA = storeB.getReplyCursor(" $keyA ")
+        assertNotNull(restoredA)
+        assertEquals("msg_1", restoredA?.lastHeardMessageId)
+        assertEquals(1000L, restoredA?.lastHeardCreatedAtMs)
+        assertNull(restoredA?.armedBaselineMessageId)
+        assertEquals(900L, restoredA?.armedBaselineCreatedAtMs)
+        assertEquals(1500L, restoredA?.updatedAtMs)
+
+        storeA.saveReplyCursor(
+            keyB,
+            SessionReplyCursor(
+                lastHeardMessageId = "msg_2",
+                lastHeardCreatedAtMs = 2000L,
+                armedBaselineMessageId = "base_2",
+                armedBaselineCreatedAtMs = 1800L,
+                updatedAtMs = 2500L,
+            ),
+        )
+
+        val afterSaveB = storeB.changes.value
+        storeA.clearReplyCursor(keyA)
+        assertTrue(storeB.changes.value > afterSaveB)
+        assertNull(storeB.getReplyCursor(keyA))
+        assertEquals("msg_2", storeB.getReplyCursor(keyB)?.lastHeardMessageId)
+
+        // Clearing an absent key does not emit change
+        val afterClearA = storeB.changes.value
+        storeA.clearReplyCursor(keyA)
+        assertEquals(afterClearA, storeB.changes.value)
+    }
+
+    @Test
+    fun `migrateReplyCursor moves cursor across keys and preserves newer destination cursor`() {
+        val sharedPrefs = InMemorySharedPreferences()
+        val storeA = TokenStore(sharedPrefs)
+        val storeB = TokenStore(sharedPrefs)
+        val oldKey = TokenStore.sessionKeyFor("srv1", PinnedSession("child_1", "", "Child"))
+        val newKey = TokenStore.sessionKeyFor("srv1", PinnedSession("child_1", "/repo/main", "Child"))
+
+        assertFalse(storeA.migrateReplyCursor(oldKey, newKey))
+        assertFalse(storeA.migrateReplyCursor(oldKey, oldKey))
+        assertFalse(storeA.migrateReplyCursor("  ", newKey))
+
+        storeA.saveReplyCursor(
+            oldKey,
+            SessionReplyCursor(
+                lastHeardMessageId = "msg_old",
+                lastHeardCreatedAtMs = 100L,
+                armedBaselineMessageId = "base_old",
+                armedBaselineCreatedAtMs = 50L,
+                updatedAtMs = 150L,
+            ),
+        )
+        assertTrue(storeA.migrateReplyCursor(" $oldKey ", " $newKey "))
+        assertNull(storeB.getReplyCursor(oldKey))
+        assertEquals("msg_old", storeB.getReplyCursor(newKey)?.lastHeardMessageId)
+
+        // Older source replaces nothing when destination cursor is newer
+        storeA.saveReplyCursor(
+            newKey,
+            SessionReplyCursor(
+                lastHeardMessageId = "msg_newer",
+                lastHeardCreatedAtMs = 300L,
+                updatedAtMs = 350L,
+            ),
+        )
+        storeA.saveReplyCursor(
+            oldKey,
+            SessionReplyCursor(
+                lastHeardMessageId = "msg_stale",
+                lastHeardCreatedAtMs = 200L,
+                updatedAtMs = 250L,
+            ),
+        )
+        assertTrue(storeA.migrateReplyCursor(oldKey, newKey))
+        assertNull(storeB.getReplyCursor(oldKey))
+        assertEquals("msg_newer", storeB.getReplyCursor(newKey)?.lastHeardMessageId)
+
+        // Newer source overwrites older destination cursor
+        storeA.saveReplyCursor(
+            oldKey,
+            SessionReplyCursor(
+                lastHeardMessageId = "msg_newest",
+                lastHeardCreatedAtMs = 400L,
+                updatedAtMs = 450L,
+            ),
+        )
+        assertTrue(storeA.migrateReplyCursor(oldKey, newKey))
+        assertNull(storeB.getReplyCursor(oldKey))
+        assertEquals("msg_newest", storeB.getReplyCursor(newKey)?.lastHeardMessageId)
+    }
+
+    @Test
+    fun `saveReplyCursor caps stored cursors at 200 by evicting oldest updatedAtMs entries`() {
+        val sharedPrefs = InMemorySharedPreferences()
+        val storeA = TokenStore(sharedPrefs)
+        val storeB = TokenStore(sharedPrefs)
+
+        for (i in 1..205) {
+            storeA.saveReplyCursor(
+                "srv1|ses_$i|/repo",
+                SessionReplyCursor(
+                    lastHeardMessageId = "msg_$i",
+                    lastHeardCreatedAtMs = i.toLong() * 10L,
+                    updatedAtMs = i.toLong() * 100L,
+                ),
+            )
+        }
+
+        for (i in 1..5) {
+            assertNull("Expected oldest entry $i to be evicted", storeB.getReplyCursor("srv1|ses_$i|/repo"))
+        }
+        for (i in 6..205) {
+            assertEquals("msg_$i", storeB.getReplyCursor("srv1|ses_$i|/repo")?.lastHeardMessageId)
+        }
+
+        // Updating an existing entry at capacity keeps all 200 entries
+        storeA.saveReplyCursor(
+            "srv1|ses_6|/repo",
+            SessionReplyCursor(
+                lastHeardMessageId = "msg_6_updated",
+                lastHeardCreatedAtMs = 60L,
+                updatedAtMs = 99999L,
+            ),
+        )
+        assertEquals("msg_6_updated", storeB.getReplyCursor("srv1|ses_6|/repo")?.lastHeardMessageId)
+        assertEquals("msg_7", storeB.getReplyCursor("srv1|ses_7|/repo")?.lastHeardMessageId)
+    }
+
     private class InMemorySharedPreferences : SharedPreferences {
         private val map = LinkedHashMap<String, Any?>()
 

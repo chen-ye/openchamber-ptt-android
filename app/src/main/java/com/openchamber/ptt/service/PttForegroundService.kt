@@ -44,7 +44,9 @@ import com.openchamber.ptt.voice.EventStreamClient
 import com.openchamber.ptt.voice.MlKitSttClient
 import com.openchamber.ptt.voice.PromptOrganizer
 import com.openchamber.ptt.voice.PromptOrganizerException
+import com.openchamber.ptt.voice.ResponseFeedState
 import com.openchamber.ptt.voice.SessionClient
+import com.openchamber.ptt.voice.TurnTriggerKind
 import com.openchamber.ptt.voice.VoiceControlPlane
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -99,6 +101,8 @@ class PttForegroundService : Service() {
     val sendGraceRemainingMs: StateFlow<Long?> = _sendGraceRemainingMs.asStateFlow()
     val isOrganizingDraft: StateFlow<Boolean> = _isOrganizingDraft.asStateFlow()
     val transitions: SharedFlow<PttTransition> = _transitions.asSharedFlow()
+    val responseFeed: StateFlow<ResponseFeedState>
+        get() = sessionResponseController.feedState
 
     var pinBluetoothSco: Boolean
         get() = _pinBluetoothSco.value
@@ -120,10 +124,10 @@ class PttForegroundService : Service() {
     private lateinit var voiceUxLogger: VoiceUxLogger
     private lateinit var serviceScope: CoroutineScope
     private lateinit var audioBurstRecorder: AudioBurstRecorder
+    private lateinit var sessionResponseController: SessionResponseController
     private lateinit var agentTurnRunner: AgentTurnRunner
 
     private var sendGraceJob: Job? = null
-    private var preloadJob: Job? = null
     private var loadedSessionKey: String? = null
 
     @Volatile
@@ -134,6 +138,9 @@ class PttForegroundService : Service() {
 
     @Volatile
     private var lastTtsStopElapsedMs: Long = 0L
+
+    @Volatile
+    private var activeSpokenMessageId: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -168,7 +175,17 @@ class PttForegroundService : Service() {
             inputModeProvider = { tokenStore.getEffectiveTtsInputMode() },
             detailLevelProvider = { tokenStore.getEffectiveSpokenDetailLevel() },
             onStatusEvent = { info -> _lastTtsInfo.value = info },
-            onSpokenTextSynthesized = { spoken -> _lastSpokenSummary.value = spoken },
+            onSpokenTextSynthesized = { spoken ->
+                val msgId = activeSpokenMessageId ?: sessionResponseController.feedState.value.speakingMessageId
+                if (msgId != null) {
+                    sessionResponseController.recordSpokenSummary(msgId, spoken)
+                    if (sessionResponseController.feedState.value.focusedResponse?.messageId == msgId) {
+                        _lastSpokenSummary.value = spoken
+                    }
+                } else {
+                    _lastSpokenSummary.value = spoken
+                }
+            },
             onSpeakStats = { stats ->
                 voiceUxLogger.log(
                     category = VoiceUxLogger.CAT_TTS,
@@ -202,6 +219,22 @@ class PttForegroundService : Service() {
             onMaxCapAutoStage = { stageOnMaxCap() },
             onPartialTranscript = { partial -> _lastTranscript.value = partial },
             onStatusUpdate = { msg -> _statusText.value = msg },
+        )
+
+        sessionResponseController = SessionResponseController(
+            scope = serviceScope,
+            tokenStore = tokenStore,
+            sessionClient = sessionClient,
+            eventStreamClient = eventStreamClient,
+            currentState = { stateMachine.currentState },
+            isPlaybackActive = {
+                (::agentTurnRunner.isInitialized && agentTurnRunner.isPlaybackActive) ||
+                    ttsPlayer.isSpeaking ||
+                    stateMachine.currentState == PttState.SPEAKING_TTS ||
+                    stateMachine.currentState == PttState.STAGED_DRAFT_SPEAKING
+            },
+            onTriggerAutoSpeak = { dispatch(PttEvent.PlayQueuedReply) },
+            onFeedUpdated = { feed -> syncFromResponseFeed(feed) },
         )
 
         agentTurnRunner = AgentTurnRunner(
@@ -247,6 +280,36 @@ class PttForegroundService : Service() {
             onError = { message, isAuthExpired -> onError(message, isAuthExpired) },
             onPostPermissionAlertNotification = { tool -> notificationBuilder.postPermissionAlertNotification(tool) },
             onCancelPermissionAlertNotification = { notificationBuilder.cancelPermissionAlertNotification() },
+            observeTurnEvents = sessionResponseController::observeEventsForActiveTurn,
+            buildVoiceReplyContext = sessionResponseController::buildVoiceReplyContext,
+            currentReplyContextTargetMessageId = sessionResponseController::currentReplyContextTargetMessageId,
+            onDirectAnswer = sessionResponseController::setDirectAnswer,
+            setActivePromptTurn = sessionResponseController::setActivePromptTurn,
+            ensureAutoSpeakAnchorBeforeTurn = sessionResponseController::ensureAutoSpeakAnchorBeforeTurn,
+            ensureCursorSeededBeforeTurn = sessionResponseController::ensureCursorSeededBeforeTurn,
+            onSyncTurnCompleted = {
+                sessionResponseController.syncSessionTurns(
+                    reason = "turn_completed",
+                    triggerAutoSpeak = false,
+                    throwOnError = true,
+                )
+            },
+            onSyncForManualReadAloud = {
+                sessionResponseController.syncSessionTurns(
+                    reason = "manual_read_aloud",
+                    triggerAutoSpeak = false,
+                    throwOnError = true,
+                )
+            },
+            hasCachedResponses = sessionResponseController::hasCachedResponses,
+            nextAutoSpeakItem = sessionResponseController::nextItemToAutoSpeak,
+            nextUnreadItem = sessionResponseController::nextUnreadItem,
+            itemsForManualReadAloud = sessionResponseController::itemsForManualReadAloud,
+            markItemHeard = sessionResponseController::markItemHeard,
+            setSpeakingMessage = { msgId ->
+                activeSpokenMessageId = msgId
+                sessionResponseController.setSpeakingMessage(msgId)
+            },
         )
 
         val mainHandler = Handler(Looper.getMainLooper())
@@ -361,7 +424,9 @@ class PttForegroundService : Service() {
         if (::gestureDetector.isInitialized) {
             gestureDetector.cancelPending()
         }
-        preloadJob?.cancel()
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.setArmed(false)
+        }
         cancelAllTurnJobs(stopTts = true)
         if (::notificationBuilder.isInitialized) {
             notificationBuilder.cancelPermissionAlertNotification()
@@ -409,20 +474,60 @@ class PttForegroundService : Service() {
                 metrics = mapOf("bursts" to restored.rawBursts.size, "chars" to restored.organizedText.length),
             )
         }
-        val transition = dispatch(PttEvent.Arm(hasPersistedDraft = restored != null))
-        if ((transition.current == PttState.ARMED_IDLE || transition.current == PttState.STAGED_DRAFT) &&
-            hasRecordAudioPermission()
-        ) {
-            runCatching { startForegroundWithState(transition.current) }
+        resolveBoundSession()?.let { bound ->
+            loadedSessionKey = bound.sessionKey
+            sessionResponseController.bindSession(bound, forceClear = false)
         }
-        return transition.current == PttState.ARMED_IDLE || transition.current == PttState.STAGED_DRAFT
+        val transition = dispatch(PttEvent.Arm(hasPersistedDraft = restored != null))
+        val isArmedNow = transition.current == PttState.ARMED_IDLE || transition.current == PttState.STAGED_DRAFT
+        if (isArmedNow) {
+            if (hasRecordAudioPermission()) {
+                runCatching { startForegroundWithState(transition.current) }
+            }
+            sessionResponseController.setArmed(true)
+            if (transition.changed) {
+                sessionResponseController.requestBackgroundSync(
+                    reason = "arm",
+                    triggerAutoSpeak = false,
+                    captureAutoSpeakAnchor = true,
+                )
+            }
+        }
+        return isArmedNow
     }
 
     fun disarm() {
         gestureDetector.cancelPending()
         promotedForStandaloneTts = false
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.setArmed(false)
+        }
         dispatch(PttEvent.Disarm)
         stopForegroundAndSelf()
+    }
+
+    fun selectResponse(messageId: String) {
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.selectResponse(messageId)
+        }
+    }
+
+    fun stepResponse(delta: Int) {
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.stepResponse(delta)
+        }
+    }
+
+    fun markAllResponsesRead() {
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.markAllResponsesRead()
+        }
+    }
+
+    fun dismissDirectAnswer() {
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.dismissDirectAnswer()
+        }
     }
 
     fun onSingleTap() {
@@ -573,20 +678,42 @@ class PttForegroundService : Service() {
         if (currentState.isBusyWithTurn) {
             disarm()
         }
+        val bound = resolveBoundSession()
+        val nextKey = bound?.sessionKey
+        val sessionChanged = loadedSessionKey != nextKey
+        loadedSessionKey = nextKey
+        if (sessionChanged) {
+            _lastTranscript.value = null
+            _lastReply.value = null
+            _lastSpokenSummary.value = null
+            _lastTtsInfo.value = null
+        }
         val restored = restoreDraftForActiveSession()
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.bindSession(bound, forceClear = true)
+        }
         if (stateMachine.currentState == PttState.ARMED_IDLE || stateMachine.currentState == PttState.STAGED_DRAFT) {
             dispatch(PttEvent.SyncDraftPresence(hasPersistedDraft = restored != null))
             updateForegroundNotification(stateMachine.currentState)
+            if (bound != null && ::sessionResponseController.isInitialized) {
+                sessionResponseController.setArmed(true)
+                sessionResponseController.requestBackgroundSync(
+                    reason = "session_switch_armed",
+                    triggerAutoSpeak = false,
+                    captureAutoSpeakAnchor = true,
+                    forceFocusLatest = true,
+                )
+            } else {
+                disarm()
+            }
+            return
         }
         refreshLatestTurn(forceClearOnSessionChange = true)
     }
 
     fun refreshLatestTurn(forceClearOnSessionChange: Boolean = true) {
-        val activeServer = tokenStore.getActiveServer()
-        val serverUrl = activeServer?.serverUrl
-        val token = activeServer?.token
-        val pinnedSession = activeServer?.lastPinnedSession
-        if (activeServer == null || serverUrl.isNullOrBlank() || token.isNullOrBlank() || pinnedSession == null) {
+        val bound = resolveBoundSession()
+        if (bound == null) {
             if (forceClearOnSessionChange) {
                 loadedSessionKey = null
                 _lastTranscript.value = null
@@ -594,6 +721,9 @@ class PttForegroundService : Service() {
                 _lastSpokenSummary.value = null
                 _lastTtsInfo.value = null
                 _stagedDraft.value = null
+                if (::sessionResponseController.isInitialized) {
+                    sessionResponseController.bindSession(null, forceClear = true)
+                }
             }
             return
         }
@@ -603,7 +733,7 @@ class PttForegroundService : Service() {
             return
         }
 
-        val nextKey = TokenStore.sessionKeyFor(activeServer.id, pinnedSession)
+        val nextKey = bound.sessionKey
         if (forceClearOnSessionChange && loadedSessionKey != null && loadedSessionKey != nextKey) {
             _lastTranscript.value = null
             _lastReply.value = null
@@ -617,30 +747,14 @@ class PttForegroundService : Service() {
             _lastTranscript.value = restoredDraft.organizedText
         }
 
-        preloadJob?.cancel()
-        preloadJob = serviceScope.launch(Dispatchers.IO) {
-            runCatching {
-                val latest = sessionClient.fetchLatestTurn(
-                    serverUrl = serverUrl,
-                    sessionId = pinnedSession.sessionId,
-                    directory = pinnedSession.directory,
-                )
-                if (loadedSessionKey == nextKey) {
-                    if (restoredDraft == null && !latest.userText.isNullOrBlank()) {
-                        _lastTranscript.value = latest.userText
-                    }
-                    if (!latest.assistantText.isNullOrBlank()) {
-                        if (_lastReply.value != latest.assistantText) {
-                            _lastSpokenSummary.value = null
-                        }
-                        _lastReply.value = latest.assistantText
-                    }
-                    syncActiveBubble()
-                }
-            }.onFailure { err ->
-                if (err is CancellationException) throw err
-                handleUnauthorizedIfNeeded(activeServer.id, err)
-            }
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.bindSession(bound, forceClear = forceClearOnSessionChange)
+            sessionResponseController.requestBackgroundSync(
+                reason = "refresh",
+                triggerAutoSpeak = false,
+                captureAutoSpeakAnchor = false,
+                forceFocusLatest = false,
+            )
         }
     }
 
@@ -650,16 +764,15 @@ class PttForegroundService : Service() {
             onSingleTap()
             return
         }
-        val activeServer = tokenStore.getActiveServer()
-        val serverId = activeServer?.id
-        val serverUrl = activeServer?.serverUrl
-        val token = activeServer?.token
-        val pinnedSession = activeServer?.lastPinnedSession
-        if (serverId == null || serverUrl.isNullOrBlank() || token.isNullOrBlank() || pinnedSession == null) {
+        val bound = resolveBoundSession()
+        if (bound == null) {
             _lastError.value = "Connect to OpenChamber and select a session first"
             _statusText.value = _lastError.value.orEmpty()
             earconPlayer.play(Earcon.ERROR)
             return
+        }
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.bindSession(bound, forceClear = false)
         }
         val wasDisarmed = current == PttState.DISARMED
         if (wasDisarmed) {
@@ -710,16 +823,53 @@ class PttForegroundService : Service() {
         dispatch(PttEvent.Error(message, isAuthExpired = isAuthExpired))
     }
 
-    fun dispatch(event: PttEvent): PttTransition = synchronized(dispatchLock) {
-        val transition = stateMachine.dispatch(event)
-        syncStateAndStatus(transition)
-        applyEffects(transition)
-        updateMediaSessionPlaybackState(transition.current)
-        if (transition.changed) {
-            updateForegroundNotification(transition.current)
+    fun dispatch(event: PttEvent): PttTransition {
+        val transition = synchronized(dispatchLock) {
+            val tr = stateMachine.dispatch(event)
+            syncStateAndStatus(tr)
+            applyEffects(tr)
+            updateMediaSessionPlaybackState(tr.current)
+            if (tr.changed) {
+                updateForegroundNotification(tr.current)
+            }
+            _transitions.tryEmit(tr)
+            tr
         }
-        _transitions.tryEmit(transition)
-        transition
+        if (shouldCheckAutoSpeakAfterIdleReturn(transition) && ::sessionResponseController.isInitialized) {
+            sessionResponseController.maybeTriggerAutoSpeakIfIdle()
+        }
+        return transition
+    }
+
+    private fun resolveBoundSession(): BoundServerSession? {
+        val activeServer = tokenStore.getActiveServer() ?: return null
+        val serverUrl = activeServer.serverUrl
+        val token = activeServer.token
+        val pinnedSession = activeServer.lastPinnedSession
+        if (serverUrl.isNullOrBlank() || token.isNullOrBlank() || pinnedSession == null) {
+            return null
+        }
+        return BoundServerSession(
+            serverId = activeServer.id,
+            serverUrl = serverUrl,
+            pinnedSession = pinnedSession,
+            sessionKey = TokenStore.sessionKeyFor(activeServer.id, pinnedSession),
+        )
+    }
+
+    private fun syncFromResponseFeed(feed: ResponseFeedState) {
+        val focused = feed.focusedResponse
+        _lastReply.value = focused?.assistantText
+        _lastSpokenSummary.value = feed.focusedSpokenSummary
+        if (_lastTranscript.value.isNullOrBlank() &&
+            _stagedDraft.value == null &&
+            !stateMachine.currentState.isBusyWithTurn &&
+            focused?.triggerKind == TurnTriggerKind.USER_PROMPT &&
+            !focused.triggerText.isNullOrBlank()
+        ) {
+            _lastTranscript.value = focused.triggerText
+        }
+        syncActiveBubble()
     }
 
     private fun activeSessionKey(): String? {
@@ -772,12 +922,37 @@ class PttForegroundService : Service() {
 
     private fun syncActiveBubble(statusSummary: String = _statusText.value) {
         val title = tokenStore.getPinnedSession()?.title ?: "OpenChamber Voice"
+        val feed = if (::sessionResponseController.isInitialized) {
+            sessionResponseController.feedState.value
+        } else {
+            null
+        }
+        val focused = feed?.focusedResponse
+        val triggerPrompt = focused?.let { item ->
+            val label = item.triggerLabel?.trim()?.takeIf { it.isNotEmpty() }
+            val text = item.triggerText?.trim()?.takeIf { it.isNotEmpty() }
+            when {
+                label != null && text != null -> "$label: $text"
+                text != null -> text
+                label != null -> label
+                else -> null
+            }
+        }
+        val userPrompt = _lastTranscript.value?.takeIf { it.isNotBlank() } ?: triggerPrompt
+        val rawReply = _lastReply.value?.takeIf { it.isNotBlank() }
+            ?: focused?.assistantText?.takeIf { it.isNotBlank() }
+        val unreadCount = feed?.unreadQueue?.size ?: 0
+        val agentReply = when {
+            unreadCount > 0 && rawReply != null -> "$unreadCount unread · $rawReply"
+            unreadCount > 0 -> "$unreadCount unread"
+            else -> rawReply
+        }
         BubbleHelper.updateIfPosted(
             context = this,
             sessionTitle = title,
             statusSummary = statusSummary,
-            userPrompt = _lastTranscript.value,
-            agentReply = _lastReply.value,
+            userPrompt = userPrompt,
+            agentReply = agentReply,
         )
     }
 
@@ -793,6 +968,12 @@ class PttForegroundService : Service() {
                 PttEffect.StopRecording -> audioBurstRecorder.requestStop()
                 PttEffect.DiscardRecording -> cancelBurstRecording()
                 PttEffect.StopTts -> {
+                    if (transition.previous == PttState.SPEAKING_TTS &&
+                        transition.event is PttEvent.SingleTap &&
+                        ::sessionResponseController.isInitialized
+                    ) {
+                        sessionResponseController.onUserBargeIn()
+                    }
                     if (transition.previous == PttState.STAGED_DRAFT_SPEAKING) {
                         val evtName = if (transition.event is PttEvent.DoubleTap || transition.event is PttEvent.CommitDraft) {
                             "committed_during_preview"
@@ -821,6 +1002,7 @@ class PttForegroundService : Service() {
                 is PttEffect.OrganizeAndSpeakDraft -> agentTurnRunner.organizeAndSpeakDraft(effect.burst)
                 is PttEffect.DispatchPrompt -> agentTurnRunner.dispatchPrompt(fromStagedDraft = effect.fromStagedDraft)
                 PttEffect.ReadLastReply -> agentTurnRunner.readLastReply()
+                PttEffect.SpeakPendingReplies -> agentTurnRunner.speakPendingReplies()
                 PttEffect.ClearDraft -> {
                     val key = activeSessionKey()
                     if (key != null) {
@@ -837,6 +1019,9 @@ class PttForegroundService : Service() {
             PttState.DISARMED,
             PttState.ERROR,
             -> {
+                if (::sessionResponseController.isInitialized) {
+                    sessionResponseController.setArmed(false)
+                }
                 cancelAllTurnJobs(stopTts = transition.effects.none { it is PttEffect.StopTts })
                 notificationBuilder.cancelPermissionAlertNotification()
                 releaseWakeAndWifiLocks()
@@ -881,7 +1066,11 @@ class PttForegroundService : Service() {
 
     private fun stopTtsWithBargeInCooldown() {
         lastTtsStopElapsedMs = SystemClock.elapsedRealtime()
+        activeSpokenMessageId = null
         agentTurnRunner.cancelSpeechJobs()
+        if (::sessionResponseController.isInitialized) {
+            sessionResponseController.setSpeakingMessage(null)
+        }
         if (::ttsPlayer.isInitialized) {
             ttsPlayer.stop()
         }
@@ -1269,6 +1458,19 @@ class PttForegroundService : Service() {
             }
             return (transition.previous == PttState.PERMISSION_BLOCKED && transition.event is PttEvent.Arm) ||
                 (transition.previous == PttState.SPEAKING_TTS && transition.event is PttEvent.SingleTap)
+        }
+
+        internal fun shouldCheckAutoSpeakAfterIdleReturn(transition: PttTransition): Boolean {
+            if (transition.current != PttState.ARMED_IDLE && transition.current != PttState.STAGED_DRAFT) {
+                return false
+            }
+            if (transition.previous == PttState.SPEAKING_TTS && transition.event is PttEvent.SingleTap) {
+                return false
+            }
+            if (transition.previous == PttState.DISARMED && transition.event is PttEvent.Arm) {
+                return false
+            }
+            return true
         }
 
         internal fun isUnauthorizedError(t: Throwable): Boolean {

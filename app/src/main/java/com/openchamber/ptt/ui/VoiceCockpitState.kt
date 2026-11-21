@@ -49,9 +49,11 @@ import com.openchamber.ptt.tts.TtsInputMode
 import com.openchamber.ptt.tts.TtsPlayer
 import com.openchamber.ptt.tts.TtsVoice
 import com.openchamber.ptt.tts.VoicePipelineDefaults
+import com.openchamber.ptt.voice.AssistantResponseItem
 import com.openchamber.ptt.voice.MlKitAvailability
 import com.openchamber.ptt.voice.MlKitDownloadEvent
 import com.openchamber.ptt.voice.MlKitStatusReport
+import com.openchamber.ptt.voice.ResponseFeedState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -80,6 +82,7 @@ internal class VoiceCockpitState(
     private val pendingQuickTranscriptState: State<String?>,
     private val sendGraceRemainingMsState: State<Long?>,
     private val isOrganizingDraftState: State<Boolean>,
+    private val responseFeedState: State<ResponseFeedState>,
     showSessionPickerState: MutableState<Boolean>,
     showVoicePickerState: MutableState<Boolean>,
     voicePickerInitialEngineState: MutableState<TtsEngine>,
@@ -181,6 +184,14 @@ internal class VoiceCockpitState(
         get() = sendGraceRemainingMsState.value
     val isOrganizingDraft: Boolean
         get() = isOrganizingDraftState.value
+    val responseFeed: ResponseFeedState
+        get() = responseFeedState.value
+    val unreadCount: Int
+        get() = responseFeed.unreadQueue.size
+    val inspectableResponses: List<AssistantResponseItem>
+        get() = responseFeed.inspectableResponses
+    val focusedResponse: AssistantResponseItem?
+        get() = responseFeed.focusedResponse
 
     val isConnected: Boolean
         get() = servers.any { it.isSignedIn }
@@ -287,14 +298,15 @@ internal class VoiceCockpitState(
                         if (updated != null && updated != currentPinned) {
                             val oldKey = TokenStore.sessionKeyFor(activeResult.server.id, currentPinned)
                             val newKey = TokenStore.sessionKeyFor(activeResult.server.id, updated)
-                            val migratedDraft = if (oldKey != newKey) {
-                                tokenStore.migrateStagedDraft(oldKey, newKey)
+                            val (migratedDraft, migratedCursor) = if (oldKey != newKey) {
+                                tokenStore.migrateStagedDraft(oldKey, newKey) to
+                                    tokenStore.migrateReplyCursor(oldKey, newKey)
                             } else {
-                                false
+                                false to false
                             }
                             pinnedSession = updated
                             tokenStore.updatePinnedSession(activeResult.server.id, updated)
-                            if (migratedDraft || updated.directory != currentPinned.directory) {
+                            if (migratedDraft || migratedCursor || updated.directory != currentPinned.directory) {
                                 boundService?.refreshLatestTurn(forceClearOnSessionChange = false)
                             }
                         }
@@ -663,6 +675,22 @@ internal class VoiceCockpitState(
         boundService?.readPreviousMessage()
     }
 
+    fun selectResponse(messageId: String) {
+        boundService?.selectResponse(messageId)
+    }
+
+    fun stepResponse(delta: Int) {
+        boundService?.stepResponse(delta)
+    }
+
+    fun markAllResponsesRead() {
+        boundService?.markAllResponsesRead()
+    }
+
+    fun dismissDirectAnswer() {
+        boundService?.dismissDirectAnswer()
+    }
+
     fun openInOfficialApp(fallbackServerUrl: String = activeServerUrl) {
         OpenChamberLauncher.openInOfficialApp(
             context = context,
@@ -717,6 +745,9 @@ internal fun rememberVoiceCockpitState(
     val pendingQuickTranscriptState = rememberUpdatedState(boundService?.pendingQuickTranscript?.collectAsState()?.value)
     val sendGraceRemainingMsState = rememberUpdatedState(boundService?.sendGraceRemainingMs?.collectAsState()?.value)
     val isOrganizingDraftState = rememberUpdatedState(boundService?.isOrganizingDraft?.collectAsState()?.value ?: false)
+    val responseFeedState = rememberUpdatedState(
+        boundService?.responseFeed?.collectAsState()?.value ?: ResponseFeedState(),
+    )
     val onSessionExpiredAuthErrorState = rememberUpdatedState(onSessionExpiredAuthError)
 
     val activeDraftHolder = remember { mutableStateOf<StagedDraft?>(null) }
@@ -742,6 +773,7 @@ internal fun rememberVoiceCockpitState(
             pendingQuickTranscriptState = pendingQuickTranscriptState,
             sendGraceRemainingMsState = sendGraceRemainingMsState,
             isOrganizingDraftState = isOrganizingDraftState,
+            responseFeedState = responseFeedState,
             showSessionPickerState = showSessionPickerState,
             showVoicePickerState = showVoicePickerState,
             voicePickerInitialEngineState = voicePickerInitialEngineState,

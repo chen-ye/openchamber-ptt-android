@@ -320,12 +320,32 @@ private fun OpenChamberPttScreen(
         val snapshot = cockpit.permissionSnapshot
         when (snapshot.bubbleAvailability) {
             BubbleAvailability.AVAILABLE -> {
+                val focused = cockpit.focusedResponse
+                val triggerPrompt = focused?.let { item ->
+                    val label = item.triggerLabel?.trim()?.takeIf { it.isNotEmpty() }
+                    val text = item.triggerText?.trim()?.takeIf { it.isNotEmpty() }
+                    when {
+                        label != null && text != null -> "$label: $text"
+                        text != null -> text
+                        label != null -> label
+                        else -> null
+                    }
+                }
+                val bubblePrompt = cockpit.lastTranscript?.takeIf { it.isNotBlank() } ?: triggerPrompt
+                val rawReply = cockpit.lastReply?.takeIf { it.isNotBlank() }
+                    ?: focused?.assistantText?.takeIf { it.isNotBlank() }
+                val unreadCount = cockpit.unreadCount
+                val bubbleReply = when {
+                    unreadCount > 0 && rawReply != null -> "$unreadCount unread · $rawReply"
+                    unreadCount > 0 -> "$unreadCount unread"
+                    else -> rawReply
+                }
                 val ok = BubbleHelper.showOrUpdateBubble(
                     context = context,
                     sessionTitle = cockpit.pinnedSession?.title ?: "OpenChamber Voice",
                     statusSummary = cockpit.statusText,
-                    userPrompt = cockpit.lastTranscript,
-                    agentReply = cockpit.lastReply,
+                    userPrompt = bubblePrompt,
+                    agentReply = bubbleReply,
                     autoExpand = true,
                 )
                 if (!ok) {
@@ -557,9 +577,16 @@ private fun OpenChamberPttScreen(
                     lastSpokenSummary = cockpit.lastSpokenSummary,
                     lastTtsInfo = cockpit.lastTtsInfo,
                     serviceError = cockpit.serviceError,
+                    pttState = cockpit.pttState,
+                    responseFeed = cockpit.responseFeed,
+                    showQueueStrip = true,
                     isSpeaking = cockpit.pttState == PttState.SPEAKING_TTS,
                     canReadAloud = cockpit.canReadAloud,
                     onReadAloudClick = { cockpit.readPreviousMessage() },
+                    onStepResponse = { delta -> cockpit.stepResponse(delta) },
+                    onSelectResponse = { messageId -> cockpit.selectResponse(messageId) },
+                    onMarkAllRead = { cockpit.markAllResponsesRead() },
+                    onDismissDirectAnswer = { cockpit.dismissDirectAnswer() },
                     onOpenInOpenChamber = if (cockpit.pinnedSession != null || serverUrl.isNotBlank()) {
                         { cockpit.openInOfficialApp(fallbackServerUrl = serverUrl) }
                     } else {

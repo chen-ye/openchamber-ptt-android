@@ -320,9 +320,16 @@ private fun BubbleCockpitScreen(
                 lastSpokenSummary = cockpit.lastSpokenSummary,
                 lastTtsInfo = cockpit.lastTtsInfo,
                 serviceError = cockpit.serviceError,
+                pttState = cockpit.pttState,
+                responseFeed = cockpit.responseFeed,
+                showQueueStrip = false,
                 isSpeaking = cockpit.pttState == PttState.SPEAKING_TTS,
                 canReadAloud = cockpit.canReadAloud,
                 onReadAloudClick = { cockpit.readPreviousMessage() },
+                onStepResponse = { delta -> cockpit.stepResponse(delta) },
+                onSelectResponse = { messageId -> cockpit.selectResponse(messageId) },
+                onMarkAllRead = { cockpit.markAllResponsesRead() },
+                onDismissDirectAnswer = { cockpit.dismissDirectAnswer() },
                 onOpenInOpenChamber = if (cockpit.pinnedSession != null || cockpit.activeServerUrl.isNotBlank()) {
                     { cockpit.openInOfficialApp() }
                 } else {

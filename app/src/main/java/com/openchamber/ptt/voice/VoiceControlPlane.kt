@@ -21,6 +21,19 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 
+data class UnreadReplyPreview(
+    val messageId: String,
+    val sourceLabel: String,
+    val previewText: String,
+)
+
+data class VoiceReplyContext(
+    val focusedReply: String? = null,
+    val focusedTriggerLabel: String? = null,
+    val sameTurnSiblings: List<String> = emptyList(),
+    val pendingUnreadPreviews: List<UnreadReplyPreview> = emptyList(),
+)
+
 enum class VoiceRoute {
     PASS_THROUGH,
     ANSWER_DIRECTLY,
@@ -41,7 +54,7 @@ sealed interface VoiceControlDecision {
  * Lightweight turn-based Voice Control Plane backed by `gemini-decision-1`
  * (via OpenChamber's `gemini-decisions-bridge` guest proxy) and `/api/small-model/generate`.
  *
- * Evaluates `{ utterance, lastReply, currentSettings }` and fails open to [VoiceRoute.PASS_THROUGH]
+ * Evaluates `{ utterance, replyContext, currentSettings }` and fails open to [VoiceRoute.PASS_THROUGH]
  * on any timeout or unavailability so coding prompts are never dropped.
  */
 class VoiceControlPlane(
@@ -63,17 +76,18 @@ class VoiceControlPlane(
     suspend fun evaluateTurn(
         serverUrl: String,
         utterance: String,
-        lastReply: String?,
+        replyContext: VoiceReplyContext,
         currentDetailLevel: SpokenDetailLevel,
         currentInputMode: TtsInputMode,
     ): VoiceControlDecision {
         val cleanUtterance = utterance.trim()
         if (cleanUtterance.isEmpty()) return VoiceControlDecision.PassThrough
 
+        val formattedContext = formatReplyContext(replyContext)
         val routeChoice = classifyRoute(
             serverUrl = serverUrl,
             utterance = cleanUtterance,
-            lastReply = lastReply,
+            formattedContext = formattedContext,
             currentDetailLevel = currentDetailLevel,
             currentInputMode = currentInputMode,
         )
@@ -100,12 +114,13 @@ class VoiceControlPlane(
             }
 
             VoiceRoute.ANSWER_DIRECTLY -> {
-                val reply = lastReply?.trim()?.takeIf { it.isNotEmpty() }
-                    ?: return VoiceControlDecision.PassThrough
+                if (!formattedContext.hasAnyContext) {
+                    return VoiceControlDecision.PassThrough
+                }
                 val answer = generateDirectAnswer(
                     serverUrl = serverUrl,
                     utterance = cleanUtterance,
-                    lastReply = reply,
+                    formattedContext = formattedContext,
                 ) ?: return VoiceControlDecision.PassThrough
                 VoiceControlDecision.AnswerDirectly(spokenAnswer = answer)
             }
@@ -118,22 +133,137 @@ class VoiceControlPlane(
         val inputMode: TtsInputMode? = null,
     )
 
+    internal data class FormattedReplyContext(
+        val focusedReply: String?,
+        val focusedTriggerLabel: String?,
+        val sameTurnSiblings: String?,
+        val pendingUnreadReplies: String?,
+        val lastAssistantReply: String?,
+    ) {
+        val hasLastReply: Boolean get() = lastAssistantReply != null
+        val hasPendingUnread: Boolean get() = pendingUnreadReplies != null
+        val hasAnyContext: Boolean get() = hasLastReply || hasPendingUnread
+    }
+
+    internal fun formatReplyContext(replyContext: VoiceReplyContext): FormattedReplyContext {
+        val rawFocused = replyContext.focusedReply?.trim()?.takeIf { it.isNotEmpty() }
+        val triggerLabel = replyContext.focusedTriggerLabel?.trim()?.takeIf { it.isNotEmpty() }
+        val siblings = replyContext.sameTurnSiblings.mapNotNull { it.trim().takeIf { s -> s.isNotEmpty() } }
+        val unread = replyContext.pendingUnreadPreviews.mapNotNull { preview ->
+            val cleanedText = preview.previewText
+                .trim()
+                .replace(WHITESPACE_REGEX, " ")
+                .takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val label = preview.sourceLabel.trim().ifEmpty { "background" }
+            label to cleanedText
+        }
+
+        val hasExtras = siblings.isNotEmpty() || unread.isNotEmpty()
+        val focusedBudget = if (hasExtras) FOCUSED_BUDGET_WITH_EXTRAS else MAX_REPLY_CONTEXT_CHARS
+        val focusedForPrompt = rawFocused?.take(focusedBudget)
+        val focusedForState = rawFocused?.let { reply ->
+            if (triggerLabel != null) {
+                "[Trigger: $triggerLabel]\n$reply".take(focusedBudget)
+            } else {
+                reply.take(focusedBudget)
+            }
+        }
+
+        val siblingsSeparator = if (focusedForState != null) "\n\n" else ""
+        val siblingsHeader = "Other steps in same turn:\n"
+        val siblingsContentBudget = (SIBLINGS_BUDGET - siblingsSeparator.length - siblingsHeader.length)
+            .coerceAtLeast(0)
+        val formattedSiblings = formatSiblings(siblings, siblingsContentBudget)
+
+        val formattedUnread = formatUnreadPreviews(unread, UNREAD_BUDGET)
+
+        val lastAssistantReply = buildString {
+            if (focusedForState != null) {
+                append(focusedForState)
+            }
+            if (formattedSiblings != null) {
+                append(siblingsSeparator)
+                append(siblingsHeader)
+                append(formattedSiblings)
+            }
+        }.takeIf { it.isNotEmpty() }
+
+        return FormattedReplyContext(
+            focusedReply = focusedForPrompt,
+            focusedTriggerLabel = triggerLabel,
+            sameTurnSiblings = formattedSiblings,
+            pendingUnreadReplies = formattedUnread,
+            lastAssistantReply = lastAssistantReply,
+        )
+    }
+
+    private fun formatSiblings(
+        siblings: List<String>,
+        budget: Int,
+    ): String? {
+        if (siblings.isEmpty() || budget <= 0) return null
+        val sb = StringBuilder()
+        for (sibling in siblings) {
+            val line = "- $sibling"
+            val sep = if (sb.isEmpty()) "" else "\n"
+            val remaining = budget - sb.length - sep.length
+            if (remaining <= 0) break
+            if (line.length <= remaining) {
+                sb.append(sep).append(line)
+            } else if (sb.isEmpty() || remaining >= MIN_TRUNCATED_SIBLING_CHARS) {
+                val truncated = if (remaining > 1) line.take(remaining - 1) + "…" else line.take(remaining)
+                sb.append(sep).append(truncated)
+                break
+            } else {
+                break
+            }
+        }
+        return sb.toString().takeIf { it.isNotEmpty() }
+    }
+
+    private fun formatUnreadPreviews(
+        previews: List<Pair<String, String>>,
+        budget: Int,
+    ): String? {
+        if (previews.isEmpty() || budget <= 0) return null
+        val sb = StringBuilder()
+        for ((label, text) in previews) {
+            val snippet = if (text.length > UNREAD_PREVIEW_MAX_CHARS) {
+                text.take(UNREAD_PREVIEW_MAX_CHARS - 1) + "…"
+            } else {
+                text
+            }
+            val line = "[UNREAD · $label]: $snippet"
+            val sep = if (sb.isEmpty()) "" else "\n"
+            if (sb.length + sep.length + line.length <= budget) {
+                sb.append(sep).append(line)
+            } else if (sb.isEmpty()) {
+                sb.append(line.take(budget))
+                break
+            } else {
+                break
+            }
+        }
+        return sb.toString().takeIf { it.isNotEmpty() }
+    }
+
     internal suspend fun classifyRoute(
         serverUrl: String,
         utterance: String,
-        lastReply: String?,
+        formattedContext: FormattedReplyContext,
         currentDetailLevel: SpokenDetailLevel,
         currentInputMode: TtsInputMode,
     ): RouteClassification {
         val baseUrl = OpenChamberHttp.normalizeBaseUrl(serverUrl)
-        val hasLastReply = !lastReply.isNullOrBlank()
+        val hasLastReply = formattedContext.hasLastReply
+        val hasPendingUnread = formattedContext.hasPendingUnread
         val stateJson = buildMap<String, JsonElement> {
             put("user_utterance", JsonPrimitive(utterance))
             put("current_detail_level", JsonPrimitive(currentDetailLevel.name))
             put("current_input_mode", JsonPrimitive(currentInputMode.name))
-            if (hasLastReply) {
-                put("last_assistant_reply", JsonPrimitive(lastReply.orEmpty().take(MAX_REPLY_CONTEXT_CHARS)))
-            }
+            put("has_pending_unread", JsonPrimitive(hasPendingUnread))
+            formattedContext.lastAssistantReply?.let { put("last_assistant_reply", JsonPrimitive(it)) }
+            formattedContext.pendingUnreadReplies?.let { put("pending_unread_replies", JsonPrimitive(it)) }
         }
 
         val questionsMap = buildMap<String, SystemOneQuestion> {
@@ -141,10 +271,14 @@ class VoiceControlPlane(
                 "route",
                 SystemOneQuestion(
                     type = "choice",
-                    instructions = "Route the user's spoken utterance. Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed) or speech input mode (spoken/sanitized/raw). Choose 'answer_directly' ONLY if last_assistant_reply is present and completely answers the user's follow-up question (e.g. asking to clarify or expand on an option/detail from that last reply) without needing new code edits, file reads, or tool execution. Otherwise choose 'pass_through'.",
+                    instructions = "Route the user's spoken utterance. " +
+                        "Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed) or speech input mode (spoken/sanitized/raw). " +
+                        "Choose 'answer_directly' ONLY if (a) last_assistant_reply is present and completely answers a clarifying or follow-up question about the focused reply without needing new code edits, file reads, or tool execution, OR " +
+                        "(b) pending_unread_replies is present and the user is explicitly asking about the unread queue or what else finished in the background, and pending_unread_replies answers it. " +
+                        "Choose 'pass_through' for ambiguous status queries when has_pending_unread is true, or whenever codebase/tool access or action is needed.",
                     criteria = mapOf(
-                        "pass_through" to "A coding task, command, question requiring codebase/tool access, or anything not fully answered by last_assistant_reply.",
-                        "answer_directly" to "A clarifying or follow-up question that can be answered completely from last_assistant_reply alone.",
+                        "pass_through" to "A coding task, command, question requiring codebase/tool access, an ambiguous status query when has_pending_unread is true, or anything not fully answered by the provided reply context.",
+                        "answer_directly" to "A clarifying/follow-up question answered completely by last_assistant_reply, or an explicit queue/background-status question answered completely by pending_unread_replies.",
                         "live_tuning" to "An explicit request to change spoken detail level (essentials, balanced, detailed) or speech input mode (spoken, sanitized, raw).",
                     ),
                 ),
@@ -214,7 +348,7 @@ class VoiceControlPlane(
             val modeChoice = answers["tuning_mode"]?.jsonObject?.get("choice")?.jsonPrimitive?.contentOrNull
 
             when (routeChoice) {
-                "answer_directly" -> if (hasLastReply) {
+                "answer_directly" -> if (hasLastReply || hasPendingUnread) {
                     RouteClassification(VoiceRoute.ANSWER_DIRECTLY)
                 } else {
                     RouteClassification(VoiceRoute.PASS_THROUGH)
@@ -250,12 +384,31 @@ class VoiceControlPlane(
     private suspend fun generateDirectAnswer(
         serverUrl: String,
         utterance: String,
-        lastReply: String,
+        formattedContext: FormattedReplyContext,
     ): String? {
         val baseUrl = OpenChamberHttp.normalizeBaseUrl(serverUrl)
+        val prompt = buildString {
+            formattedContext.focusedReply?.let { focused ->
+                val labelSuffix = formattedContext.focusedTriggerLabel?.let { " ($it)" }.orEmpty()
+                append("Focused assistant reply$labelSuffix:\n")
+                append(focused)
+            }
+            formattedContext.sameTurnSiblings?.let { siblings ->
+                if (isNotEmpty()) append("\n\n")
+                append("Other steps in same turn:\n")
+                append(siblings)
+            }
+            formattedContext.pendingUnreadReplies?.let { unread ->
+                if (isNotEmpty()) append("\n\n")
+                append("Queued unread replies (only if user asks what else finished):\n")
+                append(unread)
+            }
+            append("\n\nUser follow-up question:\n")
+            append(utterance)
+        }
         val payload = json.encodeToString(
             SmallModelRequest(
-                prompt = "Previous assistant reply:\n$lastReply\n\nUser follow-up question:\n$utterance",
+                prompt = prompt,
                 system = ANSWER_DIRECTLY_SYSTEM_PROMPT,
             ),
         )
@@ -311,13 +464,21 @@ class VoiceControlPlane(
         const val DECISION_MODEL = "gemini-decision-1"
         const val DEFAULT_DECISION_TIMEOUT_MS = 1_800L
         const val DEFAULT_ANSWER_TIMEOUT_MS = 5_000L
-        private const val MAX_REPLY_CONTEXT_CHARS = 8_000
+        internal const val MAX_REPLY_CONTEXT_CHARS = 8_000
+        internal const val FOCUSED_BUDGET_WITH_EXTRAS = 4_800
+        internal const val SIBLINGS_BUDGET = 2_000
+        internal const val UNREAD_BUDGET = 1_200
+        internal const val UNREAD_PREVIEW_MAX_CHARS = 350
+        private const val MIN_TRUNCATED_SIBLING_CHARS = 60
+        private val WHITESPACE_REGEX = Regex("\\s+")
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         const val ANSWER_DIRECTLY_SYSTEM_PROMPT =
-            "Answer the user's follow-up question directly using ONLY the provided previous assistant reply. " +
+            "Answer the user's follow-up question directly using ONLY the provided reply context. " +
+                "Prefer the focused assistant reply (and other steps in the same turn if relevant) for follow-up questions; " +
+                "use queued unread replies ONLY if the user explicitly asks what else finished or about queued/background messages. " +
                 "Speak in clear, natural plain prose for text-to-speech listening (no markdown, no backticks, no raw URLs, no audio tags). " +
-                "If the previous reply does not actually contain the answer, say so briefly."
+                "If the provided context does not actually contain the answer, say so briefly."
 
         private val DefaultJson = Json {
             ignoreUnknownKeys = true

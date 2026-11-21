@@ -53,6 +53,7 @@ sealed interface PttEvent {
     data class PermissionAsked(val reason: String? = null) : PttEvent
     data object PermissionResolved : PttEvent
     data object PlayLastReply : PttEvent
+    data object PlayQueuedReply : PttEvent
     data object TtsFinished : PttEvent
     data class Error(val message: String? = null, val isAuthExpired: Boolean = false) : PttEvent
 }
@@ -72,6 +73,7 @@ sealed interface PttEffect {
     data class OrganizeAndSpeakDraft(val burst: String) : PttEffect
     data class DispatchPrompt(val fromStagedDraft: Boolean) : PttEffect
     data object ReadLastReply : PttEffect
+    data object SpeakPendingReplies : PttEffect
     data object ClearDraft : PttEffect
 }
 
@@ -114,7 +116,7 @@ class PttStateMachine(
 
             when (event) {
                 is PttEvent.Error -> {
-                    if (next == PttState.ERROR) {
+                    if (next == PttState.ERROR || (previous == PttState.SPEAKING_TTS && speechReturnToDisarmed)) {
                         _lastError.value = event.message
                     }
                     hasDraft = false
@@ -198,6 +200,11 @@ class PttStateMachine(
                 PttEvent.PlayLastReply -> {
                     if (next == PttState.SPEAKING_TTS) {
                         speechReturnToDisarmed = previous == PttState.DISARMED
+                    }
+                }
+                PttEvent.PlayQueuedReply -> {
+                    if (next == PttState.SPEAKING_TTS) {
+                        speechReturnToDisarmed = false
                     }
                 }
                 PttEvent.TtsFinished -> {
@@ -562,6 +569,18 @@ class PttStateMachine(
             else -> current to emptyList()
         }
 
+        PttEvent.PlayQueuedReply -> when (current) {
+            PttState.ARMED_IDLE,
+            PttState.STAGED_DRAFT,
+            -> PttState.SPEAKING_TTS to listOf(
+                PttEffect.PinBluetoothAudio,
+                PttEffect.AcquireWakeAndWifiLocks,
+                PttEffect.PlayEarcon(Earcon.TURN_COMPLETE),
+                PttEffect.SpeakPendingReplies,
+            )
+            else -> current to emptyList()
+        }
+
         PttEvent.TtsFinished -> when (current) {
             PttState.SPEAKING_TTS -> postTtsState() to listOf(
                 PttEffect.ReleaseWakeAndWifiLocks,
@@ -576,10 +595,19 @@ class PttStateMachine(
 
         is PttEvent.Error -> when (current) {
             PttState.DISARMED -> PttState.DISARMED to emptyList()
+            PttState.SPEAKING_TTS -> {
+                val targetState = if (speechReturnToDisarmed) PttState.DISARMED else PttState.ERROR
+                targetState to listOf(
+                    PttEffect.StopTts,
+                    PttEffect.ReleaseWakeAndWifiLocks,
+                    PttEffect.ReleaseBluetoothAudio,
+                    PttEffect.PlayEarcon(if (event.isAuthExpired) Earcon.AUTH_EXPIRED else Earcon.ERROR),
+                )
+            }
             else -> PttState.ERROR to buildList {
                 if (current == PttState.RECORDING) add(PttEffect.StopRecording)
                 if (current == PttState.SEND_GRACE) add(PttEffect.CancelSendGraceTimer)
-                if (current == PttState.SPEAKING_TTS || current == PttState.STAGED_DRAFT_SPEAKING) {
+                if (current == PttState.STAGED_DRAFT_SPEAKING) {
                     add(PttEffect.StopTts)
                 }
                 add(PttEffect.ReleaseWakeAndWifiLocks)

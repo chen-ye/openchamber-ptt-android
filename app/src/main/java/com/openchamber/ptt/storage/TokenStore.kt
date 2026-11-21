@@ -38,6 +38,15 @@ data class StagedDraft(
 )
 
 @Serializable
+data class SessionReplyCursor(
+    val lastHeardMessageId: String? = null,
+    val lastHeardCreatedAtMs: Long = 0L,
+    val armedBaselineMessageId: String? = null,
+    val armedBaselineCreatedAtMs: Long = 0L,
+    val updatedAtMs: Long = 0L,
+)
+
+@Serializable
 data class ServerVoiceOverride(
     val ttsPipeline: List<TtsEngineOption>? = null,
     val ttsInputMode: TtsInputMode? = null,
@@ -534,6 +543,77 @@ class TokenStore(
         return true
     }
 
+    private fun getAllReplyCursors(): Map<String, SessionReplyCursor> {
+        val raw = prefs.getString(KEY_REPLY_CURSORS, null)?.takeIf { it.isNotBlank() } ?: return emptyMap()
+        return runCatching { json.decodeFromString<Map<String, SessionReplyCursor>>(raw) }.getOrDefault(emptyMap())
+    }
+
+    private fun writeReplyCursors(map: Map<String, SessionReplyCursor>) {
+        if (map.isEmpty()) {
+            prefs.edit().remove(KEY_REPLY_CURSORS).apply()
+        } else {
+            prefs.edit().putString(KEY_REPLY_CURSORS, json.encodeToString(map)).apply()
+        }
+    }
+
+    fun getReplyCursor(sessionKey: String): SessionReplyCursor? {
+        val key = sessionKey.trim()
+        if (key.isEmpty()) return null
+        return getAllReplyCursors()[key]
+    }
+
+    fun saveReplyCursor(sessionKey: String, cursor: SessionReplyCursor) {
+        val key = sessionKey.trim()
+        if (key.isEmpty()) return
+        val normalized = cursor.copy(
+            lastHeardMessageId = cursor.lastHeardMessageId?.trim()?.takeIf { it.isNotEmpty() },
+            armedBaselineMessageId = cursor.armedBaselineMessageId?.trim()?.takeIf { it.isNotEmpty() },
+        )
+        val map = getAllReplyCursors().toMutableMap()
+        map.remove(key)
+        map[key] = normalized
+        if (map.size > MAX_REPLY_CURSORS) {
+            val keysToEvict = map.entries
+                .sortedBy { it.value.updatedAtMs }
+                .take(map.size - MAX_REPLY_CURSORS)
+                .map { it.key }
+            for (evictKey in keysToEvict) {
+                map.remove(evictKey)
+            }
+        }
+        writeReplyCursors(map)
+        notifyChanged()
+    }
+
+    fun clearReplyCursor(sessionKey: String) {
+        val key = sessionKey.trim()
+        if (key.isEmpty()) return
+        val map = getAllReplyCursors().toMutableMap()
+        if (map.remove(key) != null) {
+            writeReplyCursors(map)
+            notifyChanged()
+        }
+    }
+
+    fun migrateReplyCursor(oldSessionKey: String, newSessionKey: String): Boolean {
+        val fromKey = oldSessionKey.trim()
+        val toKey = newSessionKey.trim()
+        if (fromKey.isEmpty() || toKey.isEmpty() || fromKey == toKey) return false
+        val map = getAllReplyCursors().toMutableMap()
+        val existingOld = map.remove(fromKey) ?: return false
+        val existingNew = map[toKey]
+        val winner = if (existingNew != null && existingNew.updatedAtMs >= existingOld.updatedAtMs) {
+            existingNew
+        } else {
+            existingOld
+        }
+        map.remove(toKey)
+        map[toKey] = winner
+        writeReplyCursors(map)
+        notifyChanged()
+        return true
+    }
+
     private fun writeServers(servers: List<ServerProfile>, activeId: String?) {
         val resolvedActiveId = activeId?.takeIf { id -> servers.any { it.id == id } }
             ?: servers.firstOrNull()?.id
@@ -577,6 +657,8 @@ class TokenStore(
         const val DEFAULT_TTS_VOICE = "Kore"
         private const val KEY_INSTALL_ID = "install_id"
         private const val KEY_STAGED_DRAFTS = "staged_drafts_v1"
+        private const val KEY_REPLY_CURSORS = "reply_cursors_v1"
+        private const val MAX_REPLY_CURSORS = 200
 
         fun sessionKeyFor(serverId: String, session: PinnedSession): String =
             "$serverId|${session.sessionId}|${session.directory}"
