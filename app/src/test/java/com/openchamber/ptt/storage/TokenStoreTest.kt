@@ -133,6 +133,18 @@ class TokenStoreTest {
         assertEquals(SpokenDetailLevel.BALANCED, store.getEffectiveSpokenDetailLevel(srvA.id))
         assertEquals(SpokenDetailLevel.DETAILED, store.getEffectiveSpokenDetailLevel(srvB.id))
 
+        assertFalse(store.getQuickTurnDirectAnswer())
+        assertFalse(store.getEffectiveQuickTurnDirectAnswer(srvA.id))
+        assertFalse(store.getEffectiveQuickTurnDirectAnswer(srvB.id))
+        store.saveQuickTurnDirectAnswer(true, customServerId = srvB.id)
+        assertFalse(store.getEffectiveQuickTurnDirectAnswer(srvA.id))
+        assertTrue(store.getEffectiveQuickTurnDirectAnswer(srvB.id))
+        store.saveQuickTurnDirectAnswer(true, customServerId = null)
+        assertTrue(store.getEffectiveQuickTurnDirectAnswer(srvA.id))
+        store.saveQuickTurnDirectAnswer(false, customServerId = srvB.id)
+        assertFalse(store.getEffectiveQuickTurnDirectAnswer(srvB.id))
+        assertTrue(store.getEffectiveQuickTurnDirectAnswer(srvA.id))
+
         // Resetting Server B restores global defaults
         store.setServerVoiceOverride(srvB.id, null)
         assertNotNull(store.getServer(srvB.id))
@@ -140,6 +152,7 @@ class TokenStoreTest {
         assertEquals(SttEngine.OPENCHAMBER_PARAKEET, store.getEffectiveSttEngine(srvB.id))
         assertEquals(TtsInputMode.SUMMARIZED, store.getEffectiveTtsInputMode(srvB.id))
         assertEquals(SpokenDetailLevel.BALANCED, store.getEffectiveSpokenDetailLevel(srvB.id))
+        assertTrue(store.getEffectiveQuickTurnDirectAnswer(srvB.id))
     }
 
     @Test

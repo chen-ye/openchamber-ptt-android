@@ -79,17 +79,19 @@ class VoiceControlPlane(
         replyContext: VoiceReplyContext,
         currentDetailLevel: SpokenDetailLevel,
         currentInputMode: TtsInputMode,
+        allowDirectAnswer: Boolean = true,
     ): VoiceControlDecision {
         val cleanUtterance = utterance.trim()
         if (cleanUtterance.isEmpty()) return VoiceControlDecision.PassThrough
 
-        val formattedContext = formatReplyContext(replyContext)
+        val formattedContext = if (allowDirectAnswer) formatReplyContext(replyContext) else null
         val routeChoice = classifyRoute(
             serverUrl = serverUrl,
             utterance = cleanUtterance,
             formattedContext = formattedContext,
             currentDetailLevel = currentDetailLevel,
             currentInputMode = currentInputMode,
+            allowDirectAnswer = allowDirectAnswer,
         )
 
         return when (routeChoice.route) {
@@ -114,7 +116,7 @@ class VoiceControlPlane(
             }
 
             VoiceRoute.ANSWER_DIRECTLY -> {
-                if (!formattedContext.hasAnyContext) {
+                if (!allowDirectAnswer || formattedContext == null || !formattedContext.hasAnyContext) {
                     return VoiceControlDecision.PassThrough
                 }
                 val answer = generateDirectAnswer(
@@ -250,37 +252,63 @@ class VoiceControlPlane(
     internal suspend fun classifyRoute(
         serverUrl: String,
         utterance: String,
-        formattedContext: FormattedReplyContext,
+        formattedContext: FormattedReplyContext?,
         currentDetailLevel: SpokenDetailLevel,
         currentInputMode: TtsInputMode,
+        allowDirectAnswer: Boolean = true,
     ): RouteClassification {
         val baseUrl = OpenChamberHttp.normalizeBaseUrl(serverUrl)
-        val hasLastReply = formattedContext.hasLastReply
-        val hasPendingUnread = formattedContext.hasPendingUnread
+        val hasLastReply = allowDirectAnswer && formattedContext?.hasLastReply == true
+        val hasPendingUnread = allowDirectAnswer && formattedContext?.hasPendingUnread == true
         val stateJson = buildMap<String, JsonElement> {
             put("user_utterance", JsonPrimitive(utterance))
             put("current_detail_level", JsonPrimitive(currentDetailLevel.name))
             put("current_input_mode", JsonPrimitive(currentInputMode.name))
-            put("has_pending_unread", JsonPrimitive(hasPendingUnread))
-            formattedContext.lastAssistantReply?.let { put("last_assistant_reply", JsonPrimitive(it)) }
-            formattedContext.pendingUnreadReplies?.let { put("pending_unread_replies", JsonPrimitive(it)) }
+            if (allowDirectAnswer && formattedContext != null) {
+                put("has_pending_unread", JsonPrimitive(hasPendingUnread))
+                formattedContext.lastAssistantReply?.let { put("last_assistant_reply", JsonPrimitive(it)) }
+                formattedContext.pendingUnreadReplies?.let { put("pending_unread_replies", JsonPrimitive(it)) }
+            }
         }
 
         val questionsMap = buildMap<String, SystemOneQuestion> {
+            val routeInstructions = if (allowDirectAnswer) {
+                "Route the user's spoken utterance. " +
+                    "Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed) or speech input mode (spoken/sanitized/raw). " +
+                    "Choose 'answer_directly' ONLY if (a) last_assistant_reply is present and completely answers a clarifying or follow-up question about the focused reply without needing new code edits, file reads, or tool execution, OR " +
+                    "(b) pending_unread_replies is present and the user is explicitly asking about the unread queue or what else finished in the background, and pending_unread_replies answers it. " +
+                    "Choose 'pass_through' for ambiguous status queries when has_pending_unread is true, or whenever codebase/tool access or action is needed."
+            } else {
+                "Route the user's spoken utterance. " +
+                    "Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed) or speech input mode (spoken/sanitized/raw). " +
+                    "For everything else, choose 'pass_through'."
+            }
+            val routeCriteria = buildMap {
+                put(
+                    "pass_through",
+                    if (allowDirectAnswer) {
+                        "A coding task, command, question requiring codebase/tool access, an ambiguous status query when has_pending_unread is true, or anything not fully answered by the provided reply context."
+                    } else {
+                        "Any prompt, question, follow-up, command, or task to send straight to the session."
+                    },
+                )
+                if (allowDirectAnswer) {
+                    put(
+                        "answer_directly",
+                        "A clarifying/follow-up question answered completely by last_assistant_reply, or an explicit queue/background-status question answered completely by pending_unread_replies.",
+                    )
+                }
+                put(
+                    "live_tuning",
+                    "An explicit request to change spoken detail level (essentials, balanced, detailed) or speech input mode (spoken, sanitized, raw).",
+                )
+            }
             put(
                 "route",
                 SystemOneQuestion(
                     type = "choice",
-                    instructions = "Route the user's spoken utterance. " +
-                        "Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed) or speech input mode (spoken/sanitized/raw). " +
-                        "Choose 'answer_directly' ONLY if (a) last_assistant_reply is present and completely answers a clarifying or follow-up question about the focused reply without needing new code edits, file reads, or tool execution, OR " +
-                        "(b) pending_unread_replies is present and the user is explicitly asking about the unread queue or what else finished in the background, and pending_unread_replies answers it. " +
-                        "Choose 'pass_through' for ambiguous status queries when has_pending_unread is true, or whenever codebase/tool access or action is needed.",
-                    criteria = mapOf(
-                        "pass_through" to "A coding task, command, question requiring codebase/tool access, an ambiguous status query when has_pending_unread is true, or anything not fully answered by the provided reply context.",
-                        "answer_directly" to "A clarifying/follow-up question answered completely by last_assistant_reply, or an explicit queue/background-status question answered completely by pending_unread_replies.",
-                        "live_tuning" to "An explicit request to change spoken detail level (essentials, balanced, detailed) or speech input mode (spoken, sanitized, raw).",
-                    ),
+                    instructions = routeInstructions,
+                    criteria = routeCriteria,
                 ),
             )
             put(
@@ -348,7 +376,7 @@ class VoiceControlPlane(
             val modeChoice = answers["tuning_mode"]?.jsonObject?.get("choice")?.jsonPrimitive?.contentOrNull
 
             when (routeChoice) {
-                "answer_directly" -> if (hasLastReply || hasPendingUnread) {
+                "answer_directly" -> if (allowDirectAnswer && (hasLastReply || hasPendingUnread)) {
                     RouteClassification(VoiceRoute.ANSWER_DIRECTLY)
                 } else {
                     RouteClassification(VoiceRoute.PASS_THROUGH)

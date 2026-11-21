@@ -334,6 +334,8 @@ internal fun SettingsBottomSheet(
     onSelectSttEngine: (SttEngine) -> Unit,
     sttFallbackToParakeet: Boolean,
     onToggleSttFallback: (Boolean) -> Unit,
+    quickTurnDirectAnswer: Boolean,
+    onToggleQuickTurnDirectAnswer: (Boolean) -> Unit,
     mlKitAdvancedStatus: MlKitStatusReport?,
     mlKitBasicStatus: MlKitStatusReport?,
     mlKitDownloadStatus: String?,
@@ -661,6 +663,44 @@ internal fun SettingsBottomSheet(
                         subtitle = spokenDetailLevel.subtitle,
                         containerColor = MaterialTheme.colorScheme.surfaceContainer,
                     )
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .toggleable(
+                            value = quickTurnDirectAnswer,
+                            role = Role.Switch,
+                            onValueChange = onToggleQuickTurnDirectAnswer,
+                        ),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Local quick-turn answers",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                text = "Answer quick follow-ups about the latest reply locally without prompting the session (live tuning commands stay active)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = quickTurnDirectAnswer,
+                            onCheckedChange = null,
+                        )
+                    }
                 }
             }
 

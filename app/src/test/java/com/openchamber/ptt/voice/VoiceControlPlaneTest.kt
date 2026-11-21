@@ -333,4 +333,62 @@ class VoiceControlPlaneTest {
         assertEquals(VoiceControlDecision.PassThrough, decision)
         assertEquals(1, server.requestCount)
     }
+
+    @Test
+    fun `evaluateTurn with allowDirectAnswer false omits reply context and answer_directly option while keeping live_tuning active`() = runTest {
+        val answerInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"answer_directly"},"tuning_detail":{"choice":"none"}}}"""
+        val liveInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"live_tuning"},"tuning_detail":{"choice":"essentials"},"tuning_mode":{"choice":"none"}}}"""
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"status":200,"body":"${answerInner.replace("\"", "\\\"")}"}"""),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"status":200,"body":"${liveInner.replace("\"", "\\\"")}"}"""),
+        )
+
+        val vcp = VoiceControlPlane(OpenChamberHttp.createClient())
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        val suppressed = vcp.evaluateTurn(
+            serverUrl = baseUrl,
+            utterance = "What did step 2 say?",
+            replyContext = VoiceReplyContext(
+                focusedReply = "Step 2 fixed the bug.",
+                pendingUnreadPreviews = listOf(
+                    UnreadReplyPreview("m2", "Worker", "Build passed."),
+                ),
+            ),
+            currentDetailLevel = SpokenDetailLevel.BALANCED,
+            currentInputMode = TtsInputMode.SUMMARIZED,
+            allowDirectAnswer = false,
+        )
+        assertEquals(VoiceControlDecision.PassThrough, suppressed)
+
+        val tuning = vcp.evaluateTurn(
+            serverUrl = baseUrl,
+            utterance = "Switch to essentials detail",
+            replyContext = VoiceReplyContext(focusedReply = "Step 2 fixed the bug."),
+            currentDetailLevel = SpokenDetailLevel.BALANCED,
+            currentInputMode = TtsInputMode.SUMMARIZED,
+            allowDirectAnswer = false,
+        )
+        assertTrue(tuning is VoiceControlDecision.LiveTuning)
+        assertEquals(SpokenDetailLevel.ESSENTIALS, (tuning as VoiceControlDecision.LiveTuning).detailLevel)
+
+        // Ensure neither call triggered /api/small-model/generate and reply context / answer_directly criteria were omitted
+        assertEquals(2, server.requestCount)
+        val firstBody = Json.parseToJsonElement(server.takeRequest().body.readUtf8())
+            .jsonObject["body"]!!.jsonObject
+        val firstState = firstBody["state"]!!.jsonObject
+        assertFalse(firstState.containsKey("last_assistant_reply"))
+        assertFalse(firstState.containsKey("pending_unread_replies"))
+        assertFalse(firstState.containsKey("has_pending_unread"))
+        val routeCriteria = firstBody["questions"]!!.jsonObject["route"]!!.jsonObject["criteria"]!!.jsonObject
+        assertFalse(routeCriteria.containsKey("answer_directly"))
+        assertTrue(routeCriteria.containsKey("live_tuning"))
+        assertTrue(routeCriteria.containsKey("pass_through"))
+    }
 }

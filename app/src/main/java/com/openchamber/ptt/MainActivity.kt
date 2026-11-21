@@ -758,6 +758,10 @@ private fun OpenChamberPttScreen(
             onToggleSttFallback = { enabled ->
                 cockpit.toggleSttFallback(enabled)
             },
+            quickTurnDirectAnswer = cockpit.quickTurnDirectAnswer,
+            onToggleQuickTurnDirectAnswer = { enabled ->
+                cockpit.toggleQuickTurnDirectAnswer(enabled)
+            },
             mlKitAdvancedStatus = mlKitAdvancedStatus,
             mlKitBasicStatus = mlKitBasicStatus,
             mlKitDownloadStatus = mlKitDownloadStatus,

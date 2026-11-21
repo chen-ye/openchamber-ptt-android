@@ -360,9 +360,10 @@ class AgentTurnRunnerTest {
                 assertEquals(AgentTurnRunner.TTS_KIND_CONTROL, h1.speakRequests[0].kind)
                 assertFalse(h1.speakRequests[0].notifySpokenSummary)
 
-                // Second call: AnswerDirectly populates DirectVoiceAnswer and preserves BOTH lastReply & lastSpokenSummary
+                // Second call: AnswerDirectly populates DirectVoiceAnswer and preserves BOTH lastReply & lastSpokenSummary when enabled
                 val done2 = CountDownLatch(1)
                 val h2 = createHarness(scope, baseUrl, initialState = PttState.WAITING_AGENT, onFinishedLatch = done2)
+                h2.store.saveQuickTurnDirectAnswer(true, customServerId = null)
                 h2.lastReply = "Option 1: Gemini. Option 2: Local Kokoro."
                 h2.lastSpokenSummary = "Summary: Gemini or Kokoro."
                 h2.targetMessageIdOverride = "msg_focus_2"
@@ -809,6 +810,101 @@ class AgentTurnRunnerTest {
                 h2.runner.readLastReply()
                 assertTrue(done2.await(3, TimeUnit.SECONDS))
                 assertEquals(PttState.ERROR, h2.stateMachine.currentState)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `when quickTurnDirectAnswer is disabled by default even answer_directly passes prompt straight through while LiveTuning stays active`() =
+        runBlocking {
+            val answerInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"answer_directly"},"tuning_detail":{"choice":"none"},"tuning_mode":{"choice":"none"}}}"""
+            val promptSentLatch = CountDownLatch(1)
+            val replyReadCount = AtomicInteger(0)
+            var sentPromptBody = ""
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    "/api/guests/gemini-decisions-bridge/service/request" ->
+                        MockResponse().setResponseCode(200)
+                            .setBody("""{"status":200,"body":"${answerInner.replace("\"", "\\\"")}"}""")
+                    "/api/small-model/generate" ->
+                        MockResponse().setResponseCode(500).setBody("Must not be called when direct answers disabled")
+                    messagesPath -> {
+                        if (replyReadCount.getAndIncrement() == 0) {
+                            MockResponse().setResponseCode(200)
+                                .setBody("""{"data":[{"id":"msg_old","type":"assistant","content":[{"type":"text","text":"Previous reply"}]}]}""")
+                        } else {
+                            MockResponse().setResponseCode(200)
+                                .setBody("""{"data":[{"id":"idle_2","type":"idle","outcome":"succeeded","time":{"created":300}},{"id":"msg_new","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Session answered directly."}]},{"id":"msg_old","type":"assistant","content":[{"type":"text","text":"Previous reply"}]}]}""")
+                        }
+                    }
+                    "/api/session/ses_1/prompt" -> {
+                        sentPromptBody = request.body.readUtf8()
+                        promptSentLatch.countDown()
+                        MockResponse().setResponseCode(200).setBody("""{"id":"msg_u2"}""")
+                    }
+                    "/api/global/event/ws" -> MockResponse().withWebSocketUpgrade(
+                        object : WebSocketListener() {
+                            override fun onOpen(webSocket: WebSocket, response: Response) {
+                                webSocket.send("""{"type":"ready","scope":"global"}""")
+                                Thread {
+                                    promptSentLatch.await(2, TimeUnit.SECONDS)
+                                    webSocket.send("""{"type":"event","eventId":"e1","payload":{"type":"session.execution.succeeded","data":{"sessionID":"ses_1"}}}""")
+                                }.start()
+                            }
+                        },
+                    )
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val doneLatch = CountDownLatch(1)
+                val harness = createHarness(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    initialState = PttState.WAITING_AGENT,
+                    onFinishedLatch = doneLatch,
+                )
+                assertFalse(harness.store.getEffectiveQuickTurnDirectAnswer(harness.serverId))
+                harness.lastReply = "Previous reply"
+                harness.pendingQuickTranscript = "What was option 2?"
+
+                harness.runner.dispatchPrompt(fromStagedDraft = false)
+                assertTrue(doneLatch.await(5, TimeUnit.SECONDS))
+
+                assertTrue(sentPromptBody.contains("[voice]\\nWhat was option 2?"))
+                assertTrue(harness.directAnswers.filterNotNull().isEmpty())
+                assertEquals(listOf("Session answered directly."), harness.speakRequests.map { it.text })
+                assertEquals(AgentTurnRunner.TTS_KIND_REPLY, harness.speakRequests[0].kind)
+
+                // And LiveTuning still works even when quickTurnDirectAnswer is disabled
+                val liveInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"live_tuning"},"tuning_detail":{"choice":"detailed"},"tuning_mode":{"choice":"none"}}}"""
+                server.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                        "/api/guests/gemini-decisions-bridge/service/request" ->
+                            MockResponse().setResponseCode(200)
+                                .setBody("""{"status":200,"body":"${liveInner.replace("\"", "\\\"")}"}""")
+                        else -> MockResponse().setResponseCode(404)
+                    }
+                }
+                val liveDone = CountDownLatch(1)
+                val hLive = createHarness(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    initialState = PttState.WAITING_AGENT,
+                    onFinishedLatch = liveDone,
+                )
+                assertFalse(hLive.store.getEffectiveQuickTurnDirectAnswer(hLive.serverId))
+                hLive.pendingQuickTranscript = "Switch to detailed"
+                hLive.runner.dispatchPrompt(fromStagedDraft = false)
+                assertTrue(liveDone.await(3, TimeUnit.SECONDS))
+                assertEquals(SpokenDetailLevel.DETAILED, hLive.store.getEffectiveSpokenDetailLevel(hLive.serverId))
+                assertEquals(AgentTurnRunner.TTS_KIND_CONTROL, hLive.speakRequests.single().kind)
             } finally {
                 scope.cancel()
             }

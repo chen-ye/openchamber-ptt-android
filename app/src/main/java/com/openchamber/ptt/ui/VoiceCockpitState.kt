@@ -139,6 +139,8 @@ internal class VoiceCockpitState(
         private set
     var sttFallbackToParakeet by mutableStateOf(tokenStore.getEffectiveSttFallbackToParakeet())
         private set
+    var quickTurnDirectAnswer by mutableStateOf(tokenStore.getEffectiveQuickTurnDirectAnswer())
+        private set
 
     var mlKitTtsStatus by mutableStateOf<MlKitStatusReport?>(null)
         private set
@@ -242,6 +244,7 @@ internal class VoiceCockpitState(
         spokenDetailLevel = tokenStore.getEffectiveSpokenDetailLevel(serverId)
         sttEngine = tokenStore.getEffectiveSttEngine(serverId)
         sttFallbackToParakeet = tokenStore.getEffectiveSttFallbackToParakeet(serverId)
+        quickTurnDirectAnswer = tokenStore.getEffectiveQuickTurnDirectAnswer(serverId)
     }
 
     fun syncServerStateFromStore() {
@@ -516,6 +519,7 @@ internal class VoiceCockpitState(
                     openAiVoice = selectedOpenAiVoice,
                     sttEngine = sttEngine,
                     sttFallbackToParakeet = sttFallbackToParakeet,
+                    quickTurnDirectAnswer = quickTurnDirectAnswer,
                 ),
             )
         } else {
@@ -545,6 +549,12 @@ internal class VoiceCockpitState(
     fun toggleSttFallback(enabled: Boolean) {
         sttFallbackToParakeet = enabled
         tokenStore.saveSttFallbackToParakeet(enabled, customServerId)
+        syncServerStateFromStore()
+    }
+
+    fun toggleQuickTurnDirectAnswer(enabled: Boolean) {
+        quickTurnDirectAnswer = enabled
+        tokenStore.saveQuickTurnDirectAnswer(enabled, customServerId)
         syncServerStateFromStore()
     }
 

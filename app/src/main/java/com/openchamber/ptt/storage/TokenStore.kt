@@ -55,6 +55,7 @@ data class ServerVoiceOverride(
     val openAiVoice: String? = null,
     val sttEngine: SttEngine? = null,
     val sttFallbackToParakeet: Boolean? = null,
+    val quickTurnDirectAnswer: Boolean? = null,
 )
 
 @Serializable
@@ -460,6 +461,27 @@ class TokenStore(
             overrideUpdate = { it.copy(sttFallbackToParakeet = enabled) },
         )
 
+    fun getQuickTurnDirectAnswer(): Boolean = prefs.getBoolean(KEY_QUICK_TURN_DIRECT_ANSWER, false)
+
+    fun setQuickTurnDirectAnswer(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_QUICK_TURN_DIRECT_ANSWER, enabled).apply()
+        notifyChanged()
+    }
+
+    fun getEffectiveQuickTurnDirectAnswer(serverId: String? = getActiveServer()?.id): Boolean =
+        effectiveSetting(
+            serverId = serverId,
+            overridePick = { it.quickTurnDirectAnswer },
+            globalPick = ::getQuickTurnDirectAnswer,
+        )
+
+    fun saveQuickTurnDirectAnswer(enabled: Boolean, customServerId: String? = null) =
+        updateSetting(
+            customServerId = customServerId,
+            globalSave = { setQuickTurnDirectAnswer(enabled) },
+            overrideUpdate = { it.copy(quickTurnDirectAnswer = enabled) },
+        )
+
     fun getOrCreateInstallId(): String {
         val existing = prefs.getString(KEY_INSTALL_ID, null)?.takeIf { it.isNotBlank() }
         if (existing != null) return existing
@@ -654,6 +676,7 @@ class TokenStore(
         private const val KEY_SPOKEN_DETAIL_LEVEL = "spoken_detail_level"
         private const val KEY_STT_ENGINE = "stt_engine"
         private const val KEY_STT_FALLBACK_PARAKEET = "stt_fallback_parakeet"
+        private const val KEY_QUICK_TURN_DIRECT_ANSWER = "quick_turn_direct_answer"
         const val DEFAULT_TTS_VOICE = "Kore"
         private const val KEY_INSTALL_ID = "install_id"
         private const val KEY_STAGED_DRAFTS = "staged_drafts_v1"

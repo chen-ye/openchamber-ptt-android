@@ -180,14 +180,16 @@ internal class AgentTurnRunner(
             try {
                 if (!fromStagedDraft) {
                     val customServerId = activeServer.takeIf { it.voiceOverride != null }?.id
-                    val replyContext = buildVoiceReplyContext()
-                    val targetMessageId = currentReplyContextTargetMessageId()
+                    val allowDirectAnswer = tokenStore.getEffectiveQuickTurnDirectAnswer(serverId)
+                    val replyContext = if (allowDirectAnswer) buildVoiceReplyContext() else VoiceReplyContext()
+                    val targetMessageId = if (allowDirectAnswer) currentReplyContextTargetMessageId() else null
                     val decision = voiceControlPlane.evaluateTurn(
                         serverUrl = serverUrl,
                         utterance = promptText,
                         replyContext = replyContext,
                         currentDetailLevel = tokenStore.getEffectiveSpokenDetailLevel(serverId),
                         currentInputMode = tokenStore.getEffectiveTtsInputMode(serverId),
+                        allowDirectAnswer = allowDirectAnswer,
                     )
                     when (decision) {
                         is VoiceControlDecision.LiveTuning -> {
