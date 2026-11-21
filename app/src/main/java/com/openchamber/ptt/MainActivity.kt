@@ -394,7 +394,7 @@ private fun OpenChamberPttScreen(
             TopAppBar(
                 title = {
                     Text(
-                        text = "OpenChamber",
+                        text = "OpenChamber PTT",
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
