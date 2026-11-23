@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import androidx.annotation.DrawableRes
 import androidx.annotation.StringRes
 import androidx.core.app.NotificationCompat
 import com.openchamber.ptt.MainActivity
@@ -16,6 +17,24 @@ internal data class PttNotificationActionSpec(
     val labelText: String?,
     val action: String,
     val requestCode: Int,
+)
+
+internal data class RecordingMirrorNotificationSpec(
+    val channelId: String = PttNotificationBuilder.RECORDING_MIRROR_CHANNEL_ID,
+    val notificationId: Int = PttNotificationBuilder.RECORDING_MIRROR_NOTIFICATION_ID,
+    val channelImportance: Int = NotificationManager.IMPORTANCE_DEFAULT,
+    val ongoing: Boolean = false,
+    val localOnly: Boolean = false,
+    val visibility: Int = NotificationCompat.VISIBILITY_PUBLIC,
+    val groupKey: String = PttNotificationBuilder.RECORDING_MIRROR_GROUP,
+    val category: String? = null,
+    val silentFlag: Boolean = false,
+    val soundNull: Boolean = true,
+    val vibrationEnabled: Boolean = false,
+    @DrawableRes val actionIconRes: Int = R.drawable.ic_stop,
+    @StringRes val actionTitleRes: Int = R.string.ptt_action_stop_recording,
+    val actionIntentAction: String = RecordingNotificationActionReceiver.ACTION_STOP_RECORDING_MIRROR,
+    val requestCode: Int = PttNotificationBuilder.REQUEST_CODE_STOP_RECORDING_MIRROR,
 )
 
 internal class PttNotificationBuilder(
@@ -42,6 +61,23 @@ internal class PttNotificationBuilder(
             setShowBadge(true)
         }
         notificationManager.createNotificationChannel(alertChannel)
+
+        val mirrorSpec = recordingMirrorSpec()
+        val recordingMirrorChannel = NotificationChannel(
+            mirrorSpec.channelId,
+            context.getString(R.string.ptt_recording_mirror_channel_name),
+            mirrorSpec.channelImportance,
+        ).apply {
+            description = context.getString(R.string.ptt_recording_mirror_channel_desc)
+            if (mirrorSpec.soundNull) {
+                setSound(null, null)
+            }
+            enableVibration(mirrorSpec.vibrationEnabled)
+            enableLights(false)
+            setShowBadge(false)
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        }
+        notificationManager.createNotificationChannel(recordingMirrorChannel)
     }
 
     fun statusTextForState(pttState: PttState): String =
@@ -106,6 +142,49 @@ internal class PttNotificationBuilder(
         runCatching { notificationManager.cancel(ALERT_NOTIFICATION_ID) }
     }
 
+    fun buildRecordingMirrorNotification(sessionTitle: String?): Notification {
+        val spec = recordingMirrorSpec()
+        val body = sessionTitle?.trim()?.takeIf { it.isNotEmpty() }
+            ?: context.getString(R.string.ptt_recording_mirror_body_fallback)
+        val stopIntent = Intent(context, RecordingNotificationActionReceiver::class.java)
+            .setAction(spec.actionIntentAction)
+        val stopPendingIntent = PendingIntent.getBroadcast(
+            context,
+            spec.requestCode,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        return NotificationCompat.Builder(context, spec.channelId)
+            .setSmallIcon(R.drawable.ic_ptt_mic)
+            .setContentTitle(context.getString(R.string.ptt_recording_mirror_title))
+            .setContentText(body)
+            .setContentIntent(mainActivityPendingIntent())
+            .setOngoing(spec.ongoing)
+            .setLocalOnly(spec.localOnly)
+            .setVisibility(spec.visibility)
+            .setGroup(spec.groupKey)
+            .setAutoCancel(false)
+            .addAction(
+                spec.actionIconRes,
+                context.getString(spec.actionTitleRes),
+                stopPendingIntent,
+            )
+            .build()
+    }
+
+    fun postRecordingMirrorNotification(sessionTitle: String?) {
+        runCatching {
+            notificationManager.notify(
+                RECORDING_MIRROR_NOTIFICATION_ID,
+                buildRecordingMirrorNotification(sessionTitle),
+            )
+        }
+    }
+
+    fun cancelRecordingMirrorNotification() {
+        runCatching { notificationManager.cancel(RECORDING_MIRROR_NOTIFICATION_ID) }
+    }
+
     private fun mainActivityPendingIntent(): PendingIntent =
         PendingIntent.getActivity(
             context,
@@ -131,8 +210,11 @@ internal class PttNotificationBuilder(
     companion object {
         const val NOTIFICATION_CHANNEL_ID = "openchamber_ptt_channel"
         const val ALERT_NOTIFICATION_CHANNEL_ID = "openchamber_ptt_alerts_channel"
+        const val RECORDING_MIRROR_CHANNEL_ID = "openchamber_ptt_recording_mirror_v1"
         const val NOTIFICATION_ID = 1001
         const val ALERT_NOTIFICATION_ID = 1002
+        const val RECORDING_MIRROR_NOTIFICATION_ID = 1004
+        const val RECORDING_MIRROR_GROUP = "openchamber_ptt_recording_mirror"
 
         const val REQUEST_CODE_ARM = 2001
         const val REQUEST_CODE_DISARM = 2002
@@ -141,6 +223,10 @@ internal class PttNotificationBuilder(
         const val REQUEST_CODE_DISCARD = 2005
         const val REQUEST_CODE_COMMIT_DRAFT = 2006
         const val REQUEST_CODE_PULL_BACK = 2007
+        const val REQUEST_CODE_STOP_RECORDING_MIRROR = 2008
+
+        internal fun recordingMirrorSpec(): RecordingMirrorNotificationSpec =
+            RecordingMirrorNotificationSpec()
 
         @StringRes
         internal fun statusTextResForState(pttState: PttState): Int = when (pttState) {

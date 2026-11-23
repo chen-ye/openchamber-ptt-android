@@ -150,4 +150,61 @@ class AudioOutputCoordinatorTest {
         assertEquals(0L, testScheduler.currentTime)
         assertEquals(0, preroll)
     }
+
+    @Test
+    fun `invalidateSinkWarmth clears A2DP warmth and preserves 160ms preroll on subsequent media playback`() = runTest {
+        var nowMs = 1_000L
+        val coordinator = AudioOutputCoordinator(clockElapsedMs = { nowMs })
+
+        // Warm sink via speech playback
+        coordinator.onSpeechPlaybackStarted()
+        nowMs += 100L
+        coordinator.onSpeechPlaybackFinished()
+        assertEquals(0, coordinator.awaitCueDrainAndResolvePrerollMs(useCommunicationUsage = false))
+
+        // Transitioning through SCO/Telecom invalidates sink warmth -> next media playback gets 160ms preroll
+        coordinator.invalidateSinkWarmth()
+        assertEquals(160, coordinator.awaitCueDrainAndResolvePrerollMs(useCommunicationUsage = false))
+
+        // Warm via media cue, then invalidate again -> 160ms preroll returns
+        coordinator.onCueStarted(durationMs = 150, useCommunicationUsage = false)
+        nowMs += 200L
+        coordinator.onCueStopped(useCommunicationUsage = false)
+        assertEquals(0, coordinator.awaitCueDrainAndResolvePrerollMs(useCommunicationUsage = false))
+
+        coordinator.invalidateSinkWarmth()
+        assertEquals(160, coordinator.awaitCueDrainAndResolvePrerollMs(useCommunicationUsage = false))
+    }
+
+    @Test
+    fun `SCO cues with useCommunicationUsage true drain properly without warming A2DP media sink`() = runTest {
+        val coordinator = AudioOutputCoordinator(clockElapsedMs = { testScheduler.currentTime })
+
+        // Start a 200ms SCO cue while A2DP sink is cold
+        coordinator.onCueStarted(durationMs = 200L, useCommunicationUsage = true)
+        advanceTimeBy(50L)
+        runCurrent()
+
+        // Subsequent media playback still waits for cue drain + 70ms gap, and STILL gets 160ms A2DP preroll
+        val deferred = async {
+            coordinator.awaitCueDrainAndResolvePrerollMs(useCommunicationUsage = false)
+        }
+        runCurrent()
+        assertTrue(!deferred.isCompleted)
+
+        advanceTimeBy(220L)
+        runCurrent()
+        assertTrue(deferred.isCompleted)
+        assertEquals(160, deferred.await())
+
+        // Explicit onCueStopped(useCommunicationUsage = true) and stopAll() after SCO cue also keep media sink cold
+        coordinator.onCueStarted(durationMs = 300L, useCommunicationUsage = true)
+        advanceTimeBy(100L)
+        coordinator.onCueStopped(useCommunicationUsage = true)
+        assertEquals(160, coordinator.awaitCueDrainAndResolvePrerollMs(useCommunicationUsage = false))
+
+        coordinator.onCueStarted(durationMs = 300L, useCommunicationUsage = true)
+        coordinator.stopAll()
+        assertEquals(160, coordinator.awaitCueDrainAndResolvePrerollMs(useCommunicationUsage = false))
+    }
 }

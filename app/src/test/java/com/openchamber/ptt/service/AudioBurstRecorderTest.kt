@@ -7,10 +7,12 @@ import com.openchamber.ptt.tts.SttEngine
 import com.openchamber.ptt.voice.DictationClient
 import com.openchamber.ptt.voice.DictationException
 import com.openchamber.ptt.voice.MlKitSttClient
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.int
@@ -28,15 +30,20 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.Timeout
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class AudioBurstRecorderTest {
+    @get:Rule
+    val globalTimeout: Timeout = Timeout.seconds(20)
     private lateinit var server: MockWebServer
     private lateinit var tempDir: File
     private val json = Json { ignoreUnknownKeys = true }
@@ -416,6 +423,154 @@ class AudioBurstRecorderTest {
                 assertTrue(outcome?.hitMaxCap ?: false)
                 assertEquals(1, warningCueCount)
                 assertEquals(1, autoStageCount)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `prepareCaptureTransport defers REC_START and AudioRecord creation and aborts cleanly on quick cancel`() =
+        runBlocking {
+            val logger = VoiceUxLogger(logFile = null)
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val http = OpenChamberHttp.createClient()
+
+            try {
+                // 1) Deferred REC_START plays strictly AFTER prepareCaptureTransport returns Ready and BEFORE AudioRecord opens
+                val events = CopyOnWriteArrayList<String>()
+                val prepStarted = CompletableDeferred<Unit>()
+                val allowPrepComplete = CompletableDeferred<Unit>()
+                val captureDone = CountDownLatch(1)
+                var outcomeTranscript: String? = null
+                val readyState = PttState.RECORDING
+                val source = FakePcmCaptureSource(
+                    chunks = listOf(byteArrayOf(1, 2, 3, 4)),
+                    blockUntilStoppedAfterChunks = true,
+                )
+
+                lateinit var deferredRecorder: AudioBurstRecorder
+                deferredRecorder = AudioBurstRecorder(
+                    scope = scope,
+                    dictationClient = DictationClient(http),
+                    mlKitSttClient = MlKitSttClient(),
+                    voiceUxLogger = logger,
+                    currentState = { readyState },
+                    sessionKeyProvider = { "srv|ses_1|/dir" },
+                    lastTtsStopElapsedMsProvider = { 0L },
+                    hasRecordAudioPermission = { true },
+                    pinBluetoothScoProvider = { true },
+                    sttEngineProvider = { SttEngine.MLKIT_GENAI_ADVANCED },
+                    sttFallbackToParakeetProvider = { false },
+                    onPlayWarningCue = {},
+                    onMaxCapAutoStage = {},
+                    onPartialTranscript = {},
+                    onStatusUpdate = {},
+                    prepareCaptureTransport = { gen ->
+                        events += "prep_start:$gen"
+                        prepStarted.complete(Unit)
+                        allowPrepComplete.await()
+                        events += "prep_ready:$gen"
+                        CaptureTransportPrepResult.Ready(playStartCueAfterPrep = true)
+                    },
+                    onPlayDeferredStartCue = {
+                        events += "rec_start_cue"
+                    },
+                    captureSourceFactory = { useComm ->
+                        assertTrue(useComm)
+                        events += "open_audio_record"
+                        source
+                    },
+                    mlKitTranscribe = { _, audioChunks, _ ->
+                        audioChunks.collect {
+                            deferredRecorder.requestStop()
+                        }
+                        "telecom ready"
+                    },
+                )
+
+                deferredRecorder.startBurst(
+                    serverId = "srv",
+                    serverUrl = "http://127.0.0.1:4096",
+                    pinnedSession = PinnedSession("ses_1", "/dir", "Demo"),
+                    onStoppedEarly = {},
+                    onOutcome = { _, _, _, outcome ->
+                        outcomeTranscript = outcome?.transcript
+                        captureDone.countDown()
+                    },
+                    onFailure = { _, err -> throw err },
+                )
+
+                prepStarted.await()
+                assertEquals(listOf("prep_start:1"), events.toList())
+                allowPrepComplete.complete(Unit)
+
+                assertTrue(captureDone.await(3, TimeUnit.SECONDS))
+                assertEquals("telecom ready", outcomeTranscript)
+                assertEquals(
+                    listOf("prep_start:1", "prep_ready:1", "rec_start_cue", "open_audio_record"),
+                    events.toList(),
+                )
+
+                // 2) Cancel (<200ms) while prepareCaptureTransport is still suspending skips REC_START and AudioRecord
+                val abortEvents = CopyOnWriteArrayList<String>()
+                val abortPrepStarted = CompletableDeferred<Unit>()
+                val allowAbortPrepFinish = CompletableDeferred<Unit>()
+                var abortStoppedEarly = false
+                var abortOutcomeCalled = false
+                var cancelState = PttState.RECORDING
+                val abortController = CaptureController()
+
+                val abortRecorder = AudioBurstRecorder(
+                    scope = scope,
+                    dictationClient = DictationClient(http),
+                    mlKitSttClient = MlKitSttClient(),
+                    voiceUxLogger = logger,
+                    currentState = { cancelState },
+                    sessionKeyProvider = { "srv|ses_1|/dir" },
+                    lastTtsStopElapsedMsProvider = { 0L },
+                    hasRecordAudioPermission = { true },
+                    pinBluetoothScoProvider = { true },
+                    sttEngineProvider = { SttEngine.OPENCHAMBER_PARAKEET },
+                    sttFallbackToParakeetProvider = { false },
+                    onPlayWarningCue = {},
+                    onMaxCapAutoStage = {},
+                    onPartialTranscript = {},
+                    onStatusUpdate = {},
+                    prepareCaptureTransport = { _ ->
+                        abortPrepStarted.complete(Unit)
+                        allowAbortPrepFinish.await()
+                        CaptureTransportPrepResult.Aborted
+                    },
+                    onPlayDeferredStartCue = {
+                        abortEvents += "rec_start_cue"
+                    },
+                    captureSourceFactory = {
+                        abortEvents += "open_audio_record"
+                        FakePcmCaptureSource(emptyList())
+                    },
+                )
+
+                val burstJob = scope.launch {
+                    abortRecorder.executeBurst(
+                        serverId = "srv",
+                        serverUrl = "http://127.0.0.1:4096",
+                        pinnedSession = PinnedSession("ses_1", "/dir", "Demo"),
+                        captureController = abortController,
+                        onStoppedEarly = { abortStoppedEarly = true },
+                        onOutcome = { _, _, _, _ -> abortOutcomeCalled = true },
+                        onFailure = { _, err -> throw err },
+                    )
+                }
+
+                abortPrepStarted.await()
+                cancelState = PttState.TRANSCRIBING_SEND
+                abortController.requestStop()
+                allowAbortPrepFinish.complete(Unit)
+                burstJob.join()
+
+                assertTrue(abortStoppedEarly)
+                assertFalse(abortOutcomeCalled)
+                assertTrue(abortEvents.isEmpty())
             } finally {
                 scope.cancel()
             }

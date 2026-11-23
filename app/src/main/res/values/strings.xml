@@ -30,4 +30,9 @@
     <string name="ptt_bubble_channel_name">Floating Voice Bubble</string>
     <string name="ptt_bubble_channel_description">Floating multitasking conversation bubble for OpenChamber PTT</string>
     <string name="ptt_bubble_activity_label">OpenChamber Voice</string>
+    <string name="ptt_recording_mirror_channel_name">Recording Watch Control</string>
+    <string name="ptt_recording_mirror_channel_desc">Silent notification mirrored to smartwatches with a Stop recording button</string>
+    <string name="ptt_recording_mirror_title">Recording voice prompt</string>
+    <string name="ptt_recording_mirror_body_fallback">Tap Stop recording to finish</string>
+    <string name="ptt_action_stop_recording">Stop recording</string>
 </resources>

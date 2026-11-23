@@ -1,8 +1,11 @@
 package com.openchamber.ptt.service
 
+import android.app.NotificationManager
+import androidx.core.app.NotificationCompat
 import com.openchamber.ptt.R
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -71,5 +74,29 @@ class PttNotificationBuilderTest {
         val speakingStandalone = PttNotificationBuilder.actionsForState(PttState.SPEAKING_TTS, promotedForStandaloneTts = true)
         assertEquals(listOf(PttForegroundService.ACTION_TOGGLE_PTT), speakingStandalone.map { it.action })
         assertFalse(speakingStandalone.any { it.action == PttForegroundService.ACTION_DISARM })
+    }
+
+    @Test
+    fun `recordingMirrorSpec enforces all Garmin Connect mirroring and silent-phone invariants`() {
+        val spec = PttNotificationBuilder.recordingMirrorSpec()
+        assertEquals(PttNotificationBuilder.RECORDING_MIRROR_CHANNEL_ID, spec.channelId)
+        assertEquals("openchamber_ptt_recording_mirror_v1", spec.channelId)
+        assertEquals(PttNotificationBuilder.RECORDING_MIRROR_NOTIFICATION_ID, spec.notificationId)
+        assertEquals(1004, spec.notificationId)
+        assertEquals(NotificationManager.IMPORTANCE_DEFAULT, spec.channelImportance)
+        assertFalse(spec.ongoing)
+        assertFalse(spec.localOnly)
+        assertEquals(NotificationCompat.VISIBILITY_PUBLIC, spec.visibility)
+        assertEquals(PttNotificationBuilder.RECORDING_MIRROR_GROUP, spec.groupKey)
+        assertEquals("openchamber_ptt_recording_mirror", spec.groupKey)
+        assertNull(spec.category)
+        assertFalse(spec.silentFlag)
+        assertTrue(spec.soundNull)
+        assertFalse(spec.vibrationEnabled)
+        assertEquals(R.drawable.ic_stop, spec.actionIconRes)
+        assertEquals(R.string.ptt_action_stop_recording, spec.actionTitleRes)
+        assertEquals(RecordingNotificationActionReceiver.ACTION_STOP_RECORDING_MIRROR, spec.actionIntentAction)
+        assertEquals(PttNotificationBuilder.REQUEST_CODE_STOP_RECORDING_MIRROR, spec.requestCode)
+        assertEquals(2008, spec.requestCode)
     }
 }

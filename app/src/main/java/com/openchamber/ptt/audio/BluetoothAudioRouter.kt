@@ -171,6 +171,12 @@ class BluetoothAudioRouter internal constructor(
         ),
     )
 
+    private enum class FocusKind {
+        NONE,
+        CAPTURE,
+        PLAYBACK,
+    }
+
     private val lock = Any()
     private var previousAudioMode: Int? = null
     private var legacyScoStarted: Boolean = false
@@ -183,58 +189,279 @@ class BluetoothAudioRouter internal constructor(
     private var pinGeneration: Long = 0L
     private var focusGeneration: Long = 0L
     private var audioFocusInterrupted: Boolean = false
+    private var telecomManagedCapture: Boolean = false
+    private var activeFocusKind: FocusKind = FocusKind.NONE
 
     @Volatile
     private var onScoDroppedListener: ((ScoDropEvent) -> Unit)? = null
+    @Volatile
+    var onDiagnosticEvent: ((event: String, outcome: String, details: Map<String, String>) -> Unit)? = null
     private var monitorsRegistered: Boolean = false
     private var scoStateReceiver: BroadcastReceiver? = null
     private var commDeviceObserverHandle: Any? = null
 
     val isScoPinned: Boolean
-        get() = synchronized(lock) { communicationDevicePinned || legacyScoStarted }
+        get() = synchronized(lock) { !telecomManagedCapture && (communicationDevicePinned || legacyScoStarted) }
+
+    fun acquireCaptureAudio(
+        pinSco: Boolean,
+        telecomManaged: Boolean = false,
+        onAudioFocusChange: (Int) -> Unit = {},
+    ): Boolean {
+        val result: Boolean
+        val diagnostic: DiagnosticSnapshot
+        synchronized(lock) {
+            pinGeneration++
+            if (telecomManaged) {
+                val clearedLingeringSco = hasLingeringScoStateLocked()
+                focusGeneration++
+                telecomManagedCapture = true
+                audioFocusInterrupted = false
+                if (clearedLingeringSco) {
+                    clearScoRoutingLocked()
+                }
+                if (activeFocusKind != FocusKind.NONE) {
+                    activeFocusKind = FocusKind.NONE
+                    platform.abandonTransientFocus()
+                }
+                result = true
+                diagnostic = DiagnosticSnapshot(
+                    event = "acquireCaptureAudio",
+                    outcome = "ACCEPTED",
+                    details = mapOf(
+                        "pinSco" to pinSco.toString(),
+                        "telecomManaged" to "true",
+                        "clearedLingeringSco" to clearedLingeringSco.toString(),
+                        "pinGeneration" to pinGeneration.toString(),
+                        "focusGeneration" to focusGeneration.toString(),
+                        "isScoPinned" to "false",
+                    ),
+                )
+            } else {
+                telecomManagedCapture = false
+                val focusGranted = requestTransientFocusLocked(
+                    forCommunication = pinSco,
+                    kind = FocusKind.CAPTURE,
+                    onAudioFocusChange = onAudioFocusChange,
+                )
+                audioFocusInterrupted = !focusGranted
+                result = if (pinSco) {
+                    pinBluetoothScoLocked()
+                } else {
+                    clearScoRoutingLocked()
+                    true
+                }
+                diagnostic = DiagnosticSnapshot(
+                    event = "acquireCaptureAudio",
+                    outcome = if (result) "ACCEPTED" else "ERROR",
+                    details = buildMap {
+                        put("pinSco", pinSco.toString())
+                        put("telecomManaged", "false")
+                        put("focusGranted", focusGranted.toString())
+                        put("pinGeneration", pinGeneration.toString())
+                        put("focusGeneration", focusGeneration.toString())
+                        put("isScoPinned", (communicationDevicePinned || legacyScoStarted).toString())
+                        if (!result) {
+                            put("reason", "pin_sco_failed")
+                        }
+                    },
+                )
+            }
+        }
+        emitDiagnostic(diagnostic)
+        return result
+    }
+
+    fun releaseCaptureAudio() {
+        val diagnostic: DiagnosticSnapshot
+        synchronized(lock) {
+            val wasTelecom = telecomManagedCapture
+            val hadSco = hasLingeringScoStateLocked()
+            val hadCaptureFocus = activeFocusKind == FocusKind.CAPTURE
+            pinGeneration++
+            telecomManagedCapture = false
+            clearScoRoutingLocked()
+            if (hadCaptureFocus) {
+                focusGeneration++
+                audioFocusInterrupted = false
+                activeFocusKind = FocusKind.NONE
+                platform.abandonTransientFocus()
+            }
+            val changed = wasTelecom || hadSco || hadCaptureFocus
+            diagnostic = DiagnosticSnapshot(
+                event = "releaseCaptureAudio",
+                outcome = if (changed) "STATE_CHANGE" else "IGNORED",
+                details = buildMap {
+                    put("wasTelecomManaged", wasTelecom.toString())
+                    put("hadSco", hadSco.toString())
+                    put("hadCaptureFocus", hadCaptureFocus.toString())
+                    put("pinGeneration", pinGeneration.toString())
+                    put("focusGeneration", focusGeneration.toString())
+                    if (!changed) {
+                        put("reason", "not_active")
+                    }
+                },
+            )
+        }
+        emitDiagnostic(diagnostic)
+    }
+
+    fun acquirePlaybackFocus(
+        onAudioFocusChange: (Int) -> Unit = {},
+    ): Boolean {
+        val focusGranted: Boolean
+        val diagnostic: DiagnosticSnapshot
+        synchronized(lock) {
+            val clearedLingeringSco = hasLingeringScoStateLocked()
+            pinGeneration++
+            telecomManagedCapture = false
+            clearScoRoutingLocked()
+            if (platform.getMode() == AudioManager.MODE_IN_COMMUNICATION) {
+                platform.setMode(AudioManager.MODE_NORMAL)
+            }
+            focusGranted = requestTransientFocusLocked(
+                forCommunication = false,
+                kind = FocusKind.PLAYBACK,
+                onAudioFocusChange = onAudioFocusChange,
+            )
+            audioFocusInterrupted = !focusGranted
+            diagnostic = DiagnosticSnapshot(
+                event = "acquirePlaybackFocus",
+                outcome = if (focusGranted) "ACCEPTED" else "ERROR",
+                details = buildMap {
+                    put("forCommunication", "false")
+                    put("focusGranted", focusGranted.toString())
+                    put("clearedLingeringSco", clearedLingeringSco.toString())
+                    put("audioMode", (platform.getMode()?.toString() ?: "null"))
+                    put("focusGeneration", focusGeneration.toString())
+                    put("isScoPinned", "false")
+                    if (!focusGranted) {
+                        put("reason", "audio_focus_denied")
+                    }
+                },
+            )
+        }
+        emitDiagnostic(diagnostic)
+        return focusGranted
+    }
+
+    fun releasePlaybackFocus() {
+        val diagnostic: DiagnosticSnapshot
+        synchronized(lock) {
+            val clearedLingeringSco = hasLingeringScoStateLocked()
+            if (clearedLingeringSco) {
+                pinGeneration++
+                clearScoRoutingLocked()
+            }
+            val hadPlaybackFocus = activeFocusKind == FocusKind.PLAYBACK
+            if (hadPlaybackFocus) {
+                focusGeneration++
+                audioFocusInterrupted = false
+                activeFocusKind = FocusKind.NONE
+                platform.abandonTransientFocus()
+            }
+            val changed = hadPlaybackFocus || clearedLingeringSco
+            diagnostic = DiagnosticSnapshot(
+                event = "releasePlaybackFocus",
+                outcome = if (changed) "STATE_CHANGE" else "IGNORED",
+                details = buildMap {
+                    put("hadPlaybackFocus", hadPlaybackFocus.toString())
+                    put("clearedLingeringSco", clearedLingeringSco.toString())
+                    put("activeFocusKind", activeFocusKind.name)
+                    put("focusGeneration", focusGeneration.toString())
+                    if (!changed) {
+                        put("reason", "playback_focus_not_active")
+                    }
+                },
+            )
+        }
+        emitDiagnostic(diagnostic)
+    }
 
     fun configureForPtt(
         pinSco: Boolean,
         onAudioFocusChange: (Int) -> Unit = {},
-    ): Boolean {
-        synchronized(lock) {
-            pinGeneration++
-            val focusGranted = requestTransientFocusLocked(
-                forCommunication = pinSco,
-                onAudioFocusChange = onAudioFocusChange,
-            )
-            audioFocusInterrupted = !focusGranted
-            return if (pinSco) {
-                pinBluetoothScoLocked()
-            } else {
-                clearScoRoutingLocked()
-                true
-            }
-        }
-    }
+    ): Boolean = acquireCaptureAudio(
+        pinSco = pinSco,
+        telecomManaged = false,
+        onAudioFocusChange = onAudioFocusChange,
+    )
 
     fun requestTransientFocus(
         forCommunication: Boolean = true,
         onAudioFocusChange: (Int) -> Unit = {},
     ): Boolean {
+        val granted: Boolean
+        val diagnostic: DiagnosticSnapshot
         synchronized(lock) {
-            return requestTransientFocusLocked(forCommunication, onAudioFocusChange)
+            granted = requestTransientFocusLocked(
+                forCommunication = forCommunication,
+                kind = if (forCommunication) FocusKind.CAPTURE else FocusKind.PLAYBACK,
+                onAudioFocusChange = onAudioFocusChange,
+            )
+            diagnostic = DiagnosticSnapshot(
+                event = "requestTransientFocus",
+                outcome = if (granted) "ACCEPTED" else "ERROR",
+                details = mapOf(
+                    "forCommunication" to forCommunication.toString(),
+                    "focusGranted" to granted.toString(),
+                    "focusGeneration" to focusGeneration.toString(),
+                ),
+            )
         }
+        emitDiagnostic(diagnostic)
+        return granted
     }
 
     fun isBluetoothScoAvailable(): Boolean = platform.isScoAvailable()
 
     fun release() {
+        val diagnostic: DiagnosticSnapshot
         synchronized(lock) {
+            val hadSco = hasLingeringScoStateLocked()
+            val wasTelecom = telecomManagedCapture
             releaseLocked()
+            diagnostic = DiagnosticSnapshot(
+                event = "release",
+                outcome = "STATE_CHANGE",
+                details = mapOf(
+                    "hadSco" to hadSco.toString(),
+                    "wasTelecomManaged" to wasTelecom.toString(),
+                    "pinGeneration" to pinGeneration.toString(),
+                    "focusGeneration" to focusGeneration.toString(),
+                ),
+            )
         }
+        emitDiagnostic(diagnostic)
     }
 
     fun releaseIfGeneration(generation: Long) {
+        val diagnostic: DiagnosticSnapshot
         synchronized(lock) {
-            if (pinGeneration != generation) return
-            releaseLocked()
+            if (pinGeneration != generation) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "releaseIfGeneration",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "stale_pin_generation",
+                        "requestedGeneration" to generation.toString(),
+                        "currentGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else {
+                releaseLocked()
+                diagnostic = DiagnosticSnapshot(
+                    event = "releaseIfGeneration",
+                    outcome = "STATE_CHANGE",
+                    details = mapOf(
+                        "requestedGeneration" to generation.toString(),
+                        "pinGeneration" to pinGeneration.toString(),
+                        "focusGeneration" to focusGeneration.toString(),
+                    ),
+                )
+            }
         }
+        emitDiagnostic(diagnostic)
     }
 
     internal fun isCurrentPinGeneration(generation: Long): Boolean =
@@ -243,7 +470,9 @@ class BluetoothAudioRouter internal constructor(
     private fun releaseLocked() {
         pinGeneration++
         focusGeneration++
+        telecomManagedCapture = false
         audioFocusInterrupted = false
+        activeFocusKind = FocusKind.NONE
         clearScoRoutingLocked()
         platform.abandonTransientFocus()
     }
@@ -324,52 +553,152 @@ class BluetoothAudioRouter internal constructor(
         focusChange: Int,
         expectedFocusGeneration: Long? = null,
     ) {
+        val diagnostic: DiagnosticSnapshot
         synchronized(lock) {
             if (expectedFocusGeneration != null && expectedFocusGeneration != focusGeneration) {
-                return
-            }
-            when (focusChange) {
-                AudioManager.AUDIOFOCUS_LOSS,
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-                -> audioFocusInterrupted = true
+                diagnostic = DiagnosticSnapshot(
+                    event = "onAudioFocusChange",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "stale_focus_generation",
+                        "focusChange" to focusChangeName(focusChange),
+                        "expectedGeneration" to expectedFocusGeneration.toString(),
+                        "currentGeneration" to focusGeneration.toString(),
+                    ),
+                )
+            } else {
+                val previousInterrupted = audioFocusInterrupted
+                when (focusChange) {
+                    AudioManager.AUDIOFOCUS_LOSS,
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                    -> audioFocusInterrupted = true
 
-                AudioManager.AUDIOFOCUS_GAIN -> audioFocusInterrupted = false
+                    AudioManager.AUDIOFOCUS_GAIN -> audioFocusInterrupted = false
+                }
+                diagnostic = DiagnosticSnapshot(
+                    event = "onAudioFocusChange",
+                    outcome = "STATE_CHANGE",
+                    details = mapOf(
+                        "focusChange" to focusChangeName(focusChange),
+                        "interrupted" to audioFocusInterrupted.toString(),
+                        "previousInterrupted" to previousInterrupted.toString(),
+                        "focusKind" to activeFocusKind.name,
+                        "focusGeneration" to focusGeneration.toString(),
+                    ),
+                )
             }
         }
+        emitDiagnostic(diagnostic)
     }
 
     internal fun handleCommunicationDeviceChanged(deviceType: Int?): ScoDropEvent? {
-        val eventToEmit: ScoDropEvent
+        var eventToEmit: ScoDropEvent? = null
+        val diagnostic: DiagnosticSnapshot
         synchronized(lock) {
-            if (!communicationDevicePinned) {
-                return null
-            }
-            if (deviceType == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+            if (telecomManagedCapture) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleCommunicationDeviceChanged",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "telecom_managed",
+                        "deviceType" to (deviceType?.toString() ?: "null"),
+                        "pinGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else if (!communicationDevicePinned) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleCommunicationDeviceChanged",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "sco_not_pinned",
+                        "deviceType" to (deviceType?.toString() ?: "null"),
+                        "pinGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else if (deviceType == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
                 scoConfirmedActive = true
                 scoConfirmedFromEvent = true
-                return null
-            }
-            if (!scoConfirmedActive || dropReportedForCurrentPin) {
-                return null
-            }
-            if (!scoConfirmedFromEvent && isWithinSettleWindowLocked()) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleCommunicationDeviceChanged",
+                    outcome = "STATE_CHANGE",
+                    details = mapOf(
+                        "reason" to "sco_confirmed",
+                        "deviceType" to deviceType.toString(),
+                        "pinGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else if (dropReportedForCurrentPin) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleCommunicationDeviceChanged",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "drop_already_reported",
+                        "deviceType" to (deviceType?.toString() ?: "null"),
+                        "pinGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else if (!scoConfirmedActive) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleCommunicationDeviceChanged",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "sco_never_confirmed",
+                        "deviceType" to (deviceType?.toString() ?: "null"),
+                        "pinGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else if (!scoConfirmedFromEvent && isWithinSettleWindowLocked()) {
                 // Previous teardown was still settling when we re-pinned; wait for fresh confirmation.
                 scoConfirmedActive = false
-                return null
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleCommunicationDeviceChanged",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "within_settle_window",
+                        "deviceType" to (deviceType?.toString() ?: "null"),
+                        "pinGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else {
+                dropReportedForCurrentPin = true
+                val btAvailable = platform.isScoAvailable()
+                val mode = platform.getMode()
+                val focusInterrupted = audioFocusInterrupted
+                val callMode = isCallAudioMode(mode)
+                val interrupted = focusInterrupted || callMode
+                val generation = pinGeneration
+                clearActiveScoFlagsLocked()
+                val drop = ScoDropEvent(
+                    source = ScoDropSource.COMMUNICATION_DEVICE,
+                    btScoStillAvailable = btAvailable,
+                    interruptedByFocusOrCall = interrupted,
+                    pinGeneration = generation,
+                )
+                eventToEmit = drop
+                val dropReason = when {
+                    focusInterrupted -> "interrupted_by_focus"
+                    callMode -> "interrupted_by_call"
+                    !btAvailable -> "bt_sco_unavailable"
+                    else -> "sco_dropped"
+                }
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleCommunicationDeviceChanged",
+                    outcome = "DROPPED",
+                    details = mapOf(
+                        "reason" to dropReason,
+                        "source" to drop.source.name,
+                        "deviceType" to (deviceType?.toString() ?: "null"),
+                        "btScoStillAvailable" to btAvailable.toString(),
+                        "interruptedByFocusOrCall" to interrupted.toString(),
+                        "pinGeneration" to generation.toString(),
+                    ),
+                )
             }
-            dropReportedForCurrentPin = true
-            val btAvailable = platform.isScoAvailable()
-            val interrupted = audioFocusInterrupted || isCallAudioMode(platform.getMode())
-            val generation = pinGeneration
-            clearActiveScoFlagsLocked()
-            eventToEmit = ScoDropEvent(
-                source = ScoDropSource.COMMUNICATION_DEVICE,
-                btScoStillAvailable = btAvailable,
-                interruptedByFocusOrCall = interrupted,
-                pinGeneration = generation,
-            )
         }
-        onScoDroppedListener?.invoke(eventToEmit)
+        emitDiagnostic(diagnostic)
+        if (eventToEmit != null) {
+            onScoDroppedListener?.invoke(eventToEmit)
+        }
         return eventToEmit
     }
 
@@ -378,65 +707,196 @@ class BluetoothAudioRouter internal constructor(
         previousState: Int,
         isInitialSticky: Boolean,
     ): ScoDropEvent? {
-        val eventToEmit: ScoDropEvent
+        var eventToEmit: ScoDropEvent? = null
+        val diagnostic: DiagnosticSnapshot
         synchronized(lock) {
-            if (isInitialSticky || !(communicationDevicePinned || legacyScoStarted)) {
-                return null
-            }
-            when (state) {
-                AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
-                    scoConfirmedActive = true
-                    scoConfirmedFromEvent = true
-                    return null
-                }
+            if (isInitialSticky) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleScoAudioStateUpdated",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "sticky_broadcast",
+                        "state" to state.toString(),
+                        "previousState" to previousState.toString(),
+                    ),
+                )
+            } else if (telecomManagedCapture) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleScoAudioStateUpdated",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "telecom_managed",
+                        "state" to state.toString(),
+                        "previousState" to previousState.toString(),
+                        "pinGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else if (!(communicationDevicePinned || legacyScoStarted)) {
+                diagnostic = DiagnosticSnapshot(
+                    event = "handleScoAudioStateUpdated",
+                    outcome = "IGNORED",
+                    details = mapOf(
+                        "reason" to "sco_not_pinned",
+                        "state" to state.toString(),
+                        "previousState" to previousState.toString(),
+                        "pinGeneration" to pinGeneration.toString(),
+                    ),
+                )
+            } else {
+                when (state) {
+                    AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
+                        scoConfirmedActive = true
+                        scoConfirmedFromEvent = true
+                        diagnostic = DiagnosticSnapshot(
+                            event = "handleScoAudioStateUpdated",
+                            outcome = "STATE_CHANGE",
+                            details = mapOf(
+                                "reason" to "sco_confirmed",
+                                "state" to state.toString(),
+                                "previousState" to previousState.toString(),
+                                "pinGeneration" to pinGeneration.toString(),
+                            ),
+                        )
+                    }
 
-                AudioManager.SCO_AUDIO_STATE_DISCONNECTED -> {
-                    if (previousState == AudioManager.SCO_AUDIO_STATE_CONNECTING) {
-                        // Initial SCO handshake failed before establishing an active audio link.
-                        scoConfirmedActive = false
-                        scoConfirmedFromEvent = false
-                        return null
+                    AudioManager.SCO_AUDIO_STATE_DISCONNECTED -> {
+                        if (previousState == AudioManager.SCO_AUDIO_STATE_CONNECTING) {
+                            // Initial SCO handshake failed before establishing an active audio link.
+                            scoConfirmedActive = false
+                            scoConfirmedFromEvent = false
+                            diagnostic = DiagnosticSnapshot(
+                                event = "handleScoAudioStateUpdated",
+                                outcome = "IGNORED",
+                                details = mapOf(
+                                    "reason" to "handshake_failed_connecting",
+                                    "state" to state.toString(),
+                                    "previousState" to previousState.toString(),
+                                    "pinGeneration" to pinGeneration.toString(),
+                                ),
+                            )
+                        } else if (dropReportedForCurrentPin) {
+                            diagnostic = DiagnosticSnapshot(
+                                event = "handleScoAudioStateUpdated",
+                                outcome = "IGNORED",
+                                details = mapOf(
+                                    "reason" to "drop_already_reported",
+                                    "state" to state.toString(),
+                                    "previousState" to previousState.toString(),
+                                    "pinGeneration" to pinGeneration.toString(),
+                                ),
+                            )
+                        } else if (!scoConfirmedActive) {
+                            diagnostic = DiagnosticSnapshot(
+                                event = "handleScoAudioStateUpdated",
+                                outcome = "IGNORED",
+                                details = mapOf(
+                                    "reason" to "sco_never_confirmed",
+                                    "state" to state.toString(),
+                                    "previousState" to previousState.toString(),
+                                    "pinGeneration" to pinGeneration.toString(),
+                                ),
+                            )
+                        } else if (!scoConfirmedFromEvent && isWithinSettleWindowLocked()) {
+                            scoConfirmedActive = false
+                            diagnostic = DiagnosticSnapshot(
+                                event = "handleScoAudioStateUpdated",
+                                outcome = "IGNORED",
+                                details = mapOf(
+                                    "reason" to "within_settle_window",
+                                    "state" to state.toString(),
+                                    "previousState" to previousState.toString(),
+                                    "pinGeneration" to pinGeneration.toString(),
+                                ),
+                            )
+                        } else {
+                            dropReportedForCurrentPin = true
+                            val btAvailable = platform.isScoAvailable()
+                            val mode = platform.getMode()
+                            val focusInterrupted = audioFocusInterrupted
+                            val callMode = isCallAudioMode(mode)
+                            val interrupted = focusInterrupted || callMode
+                            val generation = pinGeneration
+                            clearActiveScoFlagsLocked()
+                            val drop = ScoDropEvent(
+                                source = ScoDropSource.SCO_AUDIO_BROADCAST,
+                                btScoStillAvailable = btAvailable,
+                                interruptedByFocusOrCall = interrupted,
+                                pinGeneration = generation,
+                            )
+                            eventToEmit = drop
+                            val dropReason = when {
+                                focusInterrupted -> "interrupted_by_focus"
+                                callMode -> "interrupted_by_call"
+                                !btAvailable -> "bt_sco_unavailable"
+                                else -> "sco_dropped"
+                            }
+                            diagnostic = DiagnosticSnapshot(
+                                event = "handleScoAudioStateUpdated",
+                                outcome = "DROPPED",
+                                details = mapOf(
+                                    "reason" to dropReason,
+                                    "source" to drop.source.name,
+                                    "state" to state.toString(),
+                                    "previousState" to previousState.toString(),
+                                    "btScoStillAvailable" to btAvailable.toString(),
+                                    "interruptedByFocusOrCall" to interrupted.toString(),
+                                    "pinGeneration" to generation.toString(),
+                                ),
+                            )
+                        }
                     }
-                    if (!scoConfirmedActive) {
-                        return null
-                    }
-                    if (!scoConfirmedFromEvent && isWithinSettleWindowLocked()) {
-                        scoConfirmedActive = false
-                        return null
-                    }
-                    if (dropReportedForCurrentPin) {
-                        return null
-                    }
-                    dropReportedForCurrentPin = true
-                    val btAvailable = platform.isScoAvailable()
-                    val interrupted = audioFocusInterrupted || isCallAudioMode(platform.getMode())
-                    val generation = pinGeneration
-                    clearActiveScoFlagsLocked()
-                    eventToEmit = ScoDropEvent(
-                        source = ScoDropSource.SCO_AUDIO_BROADCAST,
-                        btScoStillAvailable = btAvailable,
-                        interruptedByFocusOrCall = interrupted,
-                        pinGeneration = generation,
-                    )
-                }
 
-                else -> return null
+                    else -> {
+                        diagnostic = DiagnosticSnapshot(
+                            event = "handleScoAudioStateUpdated",
+                            outcome = "IGNORED",
+                            details = mapOf(
+                                "reason" to "non_terminal_state",
+                                "state" to state.toString(),
+                                "previousState" to previousState.toString(),
+                            ),
+                        )
+                    }
+                }
             }
         }
-        onScoDroppedListener?.invoke(eventToEmit)
+        emitDiagnostic(diagnostic)
+        if (eventToEmit != null) {
+            onScoDroppedListener?.invoke(eventToEmit)
+        }
         return eventToEmit
     }
 
     private fun requestTransientFocusLocked(
         forCommunication: Boolean,
+        kind: FocusKind,
         onAudioFocusChange: (Int) -> Unit,
     ): Boolean {
         val gen = ++focusGeneration
-        return platform.requestTransientFocus(forCommunication) { focusChange ->
+        val granted = platform.requestTransientFocus(forCommunication) { focusChange ->
             handleAudioFocusChange(focusChange, expectedFocusGeneration = gen)
             onAudioFocusChange(focusChange)
         }
+        activeFocusKind = if (granted) kind else FocusKind.NONE
+        return granted
     }
+
+    private fun hasLingeringScoStateLocked(): Boolean =
+        communicationDevicePinned ||
+            legacyScoStarted ||
+            scoPlatformClearNeeded ||
+            previousAudioMode != null
+
+    private fun emitDiagnostic(snapshot: DiagnosticSnapshot?) {
+        if (snapshot == null) return
+        onDiagnosticEvent?.invoke(snapshot.event, snapshot.outcome, snapshot.details)
+    }
+
+    private data class DiagnosticSnapshot(
+        val event: String,
+        val outcome: String,
+        val details: Map<String, String>,
+    )
 
     private fun pinBluetoothScoLocked(): Boolean {
         val alreadyOnSco = if (platform.sdkInt >= Build.VERSION_CODES.S) {
@@ -537,5 +997,13 @@ class BluetoothAudioRouter internal constructor(
 
         internal fun isCallAudioMode(mode: Int?): Boolean =
             mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_RINGTONE
+
+        private fun focusChangeName(focusChange: Int): String = when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> "GAIN"
+            AudioManager.AUDIOFOCUS_LOSS -> "LOSS"
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> "LOSS_TRANSIENT"
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "LOSS_TRANSIENT_CAN_DUCK"
+            else -> focusChange.toString()
+        }
     }
 }

@@ -181,6 +181,20 @@ class MlKitTtsSpeaker(
         preferredVoiceName: String?,
         useCommunicationUsage: Boolean,
     ) {
+        speak(
+            text = text,
+            preferredVoiceName = preferredVoiceName,
+            useCommunicationUsage = useCommunicationUsage,
+            onPlaybackStarted = null,
+        )
+    }
+
+    override suspend fun speak(
+        text: String,
+        preferredVoiceName: String?,
+        useCommunicationUsage: Boolean,
+        onPlaybackStarted: (() -> Unit)?,
+    ) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
 
@@ -211,6 +225,7 @@ class MlKitTtsSpeaker(
             .getOrDefault(3_900)
             .coerceAtLeast(200)
         val chunks = splitTextForSpeech(trimmed, maxLen)
+        if (chunks.isEmpty()) return
 
         withContext(Dispatchers.IO) {
             for ((index, chunk) in chunks.withIndex()) {
@@ -224,6 +239,9 @@ class MlKitTtsSpeaker(
                     audioAttributes = attributes,
                     queueMode = queueMode,
                 )
+                if (index == 0) {
+                    onPlaybackStarted?.invoke()
+                }
                 var errorMessage: String? = null
                 client.synthesize(request).collect { response ->
                     when (response) {

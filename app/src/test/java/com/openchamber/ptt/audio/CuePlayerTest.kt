@@ -3,13 +3,16 @@ package com.openchamber.ptt.audio
 import com.openchamber.ptt.network.OpenChamberHttp
 import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.RoleVoiceProfileMap
+import com.openchamber.ptt.tts.SystemTtsSpeaker
 import com.openchamber.ptt.tts.TtsCache
 import com.openchamber.ptt.tts.TtsClient
 import com.openchamber.ptt.tts.TtsEngine
 import com.openchamber.ptt.tts.TtsEngineOption
 import com.openchamber.ptt.tts.WavAudio
 import com.openchamber.ptt.tts.WavParserTest
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
@@ -461,9 +464,97 @@ class CuePlayerTest {
             assertEquals(2, playedPcms.size)
             assertArrayEquals(decodedPcm, playedPcms[0])
             assertArrayEquals(decodedPcm, playedPcms[1])
+
+            // Clearing cache resets warmer state and decoded RAM cache cleanly
+            cache.clear()
+            cuePlayer.clearDecodedClipCache()
+            warmer.resetAfterCacheClear()
+            assertEquals(0, warmer.state.value.warmedCount)
+            assertFalse(warmer.state.value.isWarming)
         } finally {
             earconPlayer.release()
             cache.close()
         }
     }
+
+    @Test
+    fun `on-device latency bridge cues play when TTS is not yet audible and coordinate drain with AudioOutputCoordinator`() =
+        runTest {
+            val cache = TtsCache(tempFolder.newFolder("cue_on_device_cache"))
+            val earconPlayer = EarconPlayer(context = null)
+            val speakStarted = CompletableDeferred<Unit>()
+            val allowSpeakFinish = CompletableDeferred<Unit>()
+            val spokenPhrases = CopyOnWriteArrayList<String>()
+            var ttsAudible = false
+            val coordinator = AudioOutputCoordinator(clockElapsedMs = { System.nanoTime() / 1_000_000L })
+
+            val fakeSystemSpeaker = object : SystemTtsSpeaker {
+                override val availableVoices: List<String> = listOf("sys-cue")
+                override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
+                    spokenPhrases += text
+                    speakStarted.complete(Unit)
+                    allowSpeakFinish.await()
+                }
+                override fun stop() {
+                    allowSpeakFinish.complete(Unit)
+                }
+                override fun shutdown() = Unit
+            }
+
+            try {
+                val client = TtsClient(OpenChamberHttp.createClient(), ttsCache = cache)
+                val warmer = VocalCuePackWarmer(
+                    scope = this,
+                    ttsClient = client,
+                    ttsCache = cache,
+                    serverUrlProvider = { null },
+                    cueModeProvider = { AudioCueMode.HYBRID },
+                    pipelineProvider = { listOf(TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true)) },
+                    roleProfilesProvider = { RoleVoiceProfileMap() },
+                    availableSystemVoicesProvider = { listOf("sys-cue") },
+                    ioDispatcher = Dispatchers.IO,
+                )
+                val cuePlayer = CuePlayer(
+                    scope = this,
+                    earconPlayer = earconPlayer,
+                    ttsCache = cache,
+                    warmer = warmer,
+                    serverUrlProvider = { null },
+                    cueModeProvider = { AudioCueMode.HYBRID },
+                    pipelineProvider = { listOf(TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true)) },
+                    roleProfilesProvider = { RoleVoiceProfileMap() },
+                    availableSystemVoicesProvider = { listOf("sys-cue") },
+                    isTtsAudibleProvider = { ttsAudible },
+                    audioOutputCoordinator = coordinator,
+                    systemTtsSpeaker = fakeSystemSpeaker,
+                    ioDispatcher = Dispatchers.IO,
+                )
+
+                // Even while synthesis is busy (ttsAudible == false), REPLY_PREPARING speaks and arms AudioOutputCoordinator
+                cuePlayer.play(CueEvent.REPLY_PREPARING)
+                withContext(Dispatchers.Default) {
+                    withTimeout(3_000L) { speakStarted.await() }
+                }
+                assertEquals(listOf("Summarizing."), spokenPhrases.toList())
+
+                // Drain awaits active on-device cue until it stops
+                val drainJob = async(Dispatchers.Default) {
+                    coordinator.awaitCueDrainAndResolvePrerollMs(useCommunicationUsage = false)
+                }
+                allowSpeakFinish.complete(Unit)
+                val preroll = withContext(Dispatchers.Default) {
+                    withTimeout(3_000L) { drainJob.await() }
+                }
+                assertEquals(0, preroll)
+
+                // When ttsAudible == true, on-device vocal cue is suppressed instead of talking over active speech
+                ttsAudible = true
+                cuePlayer.play(CueEvent.READING_REPLY)
+                assertEquals(listOf("Summarizing."), spokenPhrases.toList())
+            } finally {
+                allowSpeakFinish.complete(Unit)
+                earconPlayer.release()
+                cache.close()
+            }
+        }
 }

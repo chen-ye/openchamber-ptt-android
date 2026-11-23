@@ -117,8 +117,8 @@ class EarconPlayerTest {
         val player = EarconPlayer(
             context = null,
             useCommunicationUsage = { false },
-            onCuePlaybackStarted = { _ -> },
-            onCuePlaybackStopped = {},
+            onCuePlaybackStarted = { _, _ -> },
+            onCuePlaybackStopped = { _ -> },
         )
         try {
             player.play(Earcon.ARMED)

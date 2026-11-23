@@ -20,6 +20,7 @@ import com.openchamber.ptt.tts.WavParser
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -189,6 +190,31 @@ class VocalCuePackWarmer internal constructor(
         prevJob?.cancel()
     }
 
+    fun resetAfterCacheClear() {
+        val prevJob: Job?
+        val signature = buildSignature()
+        synchronized(lock) {
+            prevJob = warmJob
+            warmJob = null
+            activeSignature = null
+            val resolved = signature.resolved
+            val isOnDevice = resolved?.engine == TtsEngine.MLKIT_GENAI ||
+                resolved?.engine == TtsEngine.ANDROID_SYSTEM
+            _state.value = CuePackWarmState(
+                isWarming = false,
+                warmedCount = if (signature.mode != AudioCueMode.TONES && isOnDevice) {
+                    VocalCueCatalog.ALL_PHRASES.size
+                } else {
+                    0
+                },
+                totalCount = VocalCueCatalog.ALL_PHRASES.size,
+                engine = resolved?.engine,
+                voiceId = resolved?.let(::displayCueVoiceId),
+            )
+        }
+        prevJob?.cancel()
+    }
+
     private suspend fun warmInternal(signature: WarmSignature) {
         warmMutex.withLock {
             val total = VocalCueCatalog.ALL_PHRASES.size
@@ -350,7 +376,8 @@ class CuePlayer internal constructor(
     private val availableMlKitVoicesProvider: () -> List<String> = { emptyList() },
     private val availableSystemVoicesProvider: () -> List<String> = { emptyList() },
     private val useCommunicationUsage: () -> Boolean = { false },
-    private val isTtsSpeakingProvider: () -> Boolean = { false },
+    private val isTtsAudibleProvider: () -> Boolean = { false },
+    private val audioOutputCoordinator: AudioOutputCoordinator? = null,
     private val mlKitTtsSpeaker: SystemTtsSpeaker? = null,
     private val systemTtsSpeaker: SystemTtsSpeaker? = null,
     private val encodedAudioDecoder: (ByteArray, String?) -> WavAudio = { bytes, contentType ->
@@ -364,6 +391,7 @@ class CuePlayer internal constructor(
     private val decodedClipCache = ConcurrentHashMap<String, PcmClip>()
     private var onDeviceCueJob: Job? = null
     private var activeOnDeviceSpeaker: SystemTtsSpeaker? = null
+    private var activeOnDeviceUseComm: Boolean = false
 
     fun play(cue: CueEvent) {
         val mode = cueModeProvider()
@@ -393,7 +421,7 @@ class CuePlayer internal constructor(
 
         if (resolved.engine == TtsEngine.MLKIT_GENAI || resolved.engine == TtsEngine.ANDROID_SYSTEM) {
             val speaker = if (resolved.engine == TtsEngine.MLKIT_GENAI) mlKitTtsSpeaker else systemTtsSpeaker
-            if (speaker != null && !isTtsSpeakingProvider()) {
+            if (speaker != null && !isTtsAudibleProvider()) {
                 launchOnDeviceCue(cue = cue, phrase = phrase, speaker = speaker, resolved = resolved)
             } else {
                 cancelOnDeviceCue()
@@ -464,6 +492,10 @@ class CuePlayer internal constructor(
         earconPlayer.stopUnless(Earcon.REC_START)
     }
 
+    fun clearDecodedClipCache() {
+        decodedClipCache.clear()
+    }
+
     fun release() {
         cancelOnDeviceCue()
         warmer.cancel()
@@ -478,21 +510,30 @@ class CuePlayer internal constructor(
     ) {
         val prevJob: Job?
         val prevSpeaker: SystemTtsSpeaker?
+        val prevUseComm: Boolean
         synchronized(lock) {
             prevJob = onDeviceCueJob
             prevSpeaker = activeOnDeviceSpeaker
+            prevUseComm = activeOnDeviceUseComm
             onDeviceCueJob = null
             activeOnDeviceSpeaker = null
+            activeOnDeviceUseComm = false
         }
-        prevJob?.cancel()
-        if (prevJob?.isActive == true) {
-            runCatching { prevSpeaker?.stop() }
+        if (prevJob != null) {
+            val wasActive = prevJob.isActive
+            prevJob.cancel()
+            if (wasActive) {
+                runCatching { prevSpeaker?.stop() }
+            }
+            audioOutputCoordinator?.onCueStopped(prevUseComm)
         }
         earconPlayer.stop()
 
         val useComm = useCommunicationUsage()
+        val estimatedMs = (phrase.length * 65L).coerceAtLeast(400L)
         var jobRef: Job? = null
-        val job = scope.launch(ioDispatcher) {
+        val job = scope.launch(ioDispatcher, start = CoroutineStart.LAZY) {
+            var fellBackToEarcon = false
             try {
                 speaker.speak(
                     text = phrase,
@@ -512,13 +553,34 @@ class CuePlayer internal constructor(
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Throwable) {
-                cue.fallbackEarcon?.let(earconPlayer::play)
-            } finally {
-                synchronized(lock) {
+                fellBackToEarcon = true
+                val shouldStopBeforeFallback = synchronized(lock) {
                     if (onDeviceCueJob === jobRef) {
                         onDeviceCueJob = null
                         activeOnDeviceSpeaker = null
+                        activeOnDeviceUseComm = false
+                        true
+                    } else {
+                        false
                     }
+                }
+                if (shouldStopBeforeFallback) {
+                    audioOutputCoordinator?.onCueStopped(useComm)
+                }
+                cue.fallbackEarcon?.let(earconPlayer::play)
+            } finally {
+                val shouldNotifyStop = synchronized(lock) {
+                    if (onDeviceCueJob === jobRef) {
+                        onDeviceCueJob = null
+                        activeOnDeviceSpeaker = null
+                        activeOnDeviceUseComm = false
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (shouldNotifyStop && !fellBackToEarcon) {
+                    audioOutputCoordinator?.onCueStopped(useComm)
                 }
             }
         }
@@ -526,17 +588,23 @@ class CuePlayer internal constructor(
         synchronized(lock) {
             onDeviceCueJob = job
             activeOnDeviceSpeaker = speaker
+            activeOnDeviceUseComm = useComm
         }
+        audioOutputCoordinator?.onCueStarted(estimatedMs, useCommunicationUsage = useComm)
+        job.start()
     }
 
     private fun cancelOnDeviceCue() {
         val job: Job?
         val speaker: SystemTtsSpeaker?
+        val useComm: Boolean
         synchronized(lock) {
             job = onDeviceCueJob
             speaker = activeOnDeviceSpeaker
+            useComm = activeOnDeviceUseComm
             onDeviceCueJob = null
             activeOnDeviceSpeaker = null
+            activeOnDeviceUseComm = false
         }
         if (job != null) {
             val wasActive = job.isActive
@@ -544,6 +612,7 @@ class CuePlayer internal constructor(
             if (wasActive) {
                 runCatching { speaker?.stop() }
             }
+            audioOutputCoordinator?.onCueStopped(useComm)
         }
     }
 

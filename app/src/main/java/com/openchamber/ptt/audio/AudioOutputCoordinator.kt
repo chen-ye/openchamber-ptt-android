@@ -9,27 +9,46 @@ class AudioOutputCoordinator(
 ) {
     private val lock = Any()
     private var activeCueEndElapsedMs: Long = 0L
+    private var activeCueUseCommunication: Boolean = false
     private var lastSinkActiveElapsedMs: Long = 0L
     private var hasSinkBeenActive: Boolean = false
 
-    fun onCueStarted(durationMs: Int) {
+    fun onCueStarted(durationMs: Int, useCommunicationUsage: Boolean = false) {
+        onCueStarted(durationMs.toLong(), useCommunicationUsage)
+    }
+
+    fun onCueStarted(durationMs: Long, useCommunicationUsage: Boolean = false) {
         val now = clockElapsedMs()
-        val endMs = now + durationMs.coerceAtLeast(0).toLong()
+        val endMs = now + durationMs.coerceAtLeast(0L)
         synchronized(lock) {
-            activeCueEndElapsedMs = endMs
-            hasSinkBeenActive = true
-            lastSinkActiveElapsedMs = maxOf(lastSinkActiveElapsedMs, endMs)
+            activeCueEndElapsedMs = maxOf(activeCueEndElapsedMs, endMs)
+            activeCueUseCommunication = useCommunicationUsage
+            if (!useCommunicationUsage) {
+                hasSinkBeenActive = true
+                lastSinkActiveElapsedMs = maxOf(lastSinkActiveElapsedMs, endMs)
+            }
         }
     }
 
-    fun onCueStopped() {
+    fun onCueStopped(useCommunicationUsage: Boolean = false) {
         val now = clockElapsedMs()
         synchronized(lock) {
             if (activeCueEndElapsedMs > 0L) {
+                val wasCommunicationCue = activeCueUseCommunication
                 activeCueEndElapsedMs = 0L
-                hasSinkBeenActive = true
-                lastSinkActiveElapsedMs = now
+                activeCueUseCommunication = false
+                if (!useCommunicationUsage && !wasCommunicationCue) {
+                    hasSinkBeenActive = true
+                    lastSinkActiveElapsedMs = now
+                }
             }
+        }
+    }
+
+    fun invalidateSinkWarmth() {
+        synchronized(lock) {
+            hasSinkBeenActive = false
+            lastSinkActiveElapsedMs = 0L
         }
     }
 
@@ -65,11 +84,15 @@ class AudioOutputCoordinator(
             delay(remainingCueMs + safeGapMs)
             val afterWait = clockElapsedMs()
             synchronized(lock) {
+                val wasCommCue = activeCueUseCommunication
                 if (activeCueEndElapsedMs <= afterWait) {
                     activeCueEndElapsedMs = 0L
+                    activeCueUseCommunication = false
                 }
-                hasSinkBeenActive = true
-                lastSinkActiveElapsedMs = maxOf(lastSinkActiveElapsedMs, afterWait)
+                if (!wasCommCue && !useCommunicationUsage) {
+                    hasSinkBeenActive = true
+                    lastSinkActiveElapsedMs = maxOf(lastSinkActiveElapsedMs, afterWait)
+                }
             }
         }
 

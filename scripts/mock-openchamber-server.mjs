@@ -582,10 +582,17 @@ const servers = ports.map((port, idx) => {
         }
 
         if (url.pathname === "/api/global/event/ws") {
-          if (server.upgrade(req, { data: { connectedAt: Date.now() } })) {
+          if (server.upgrade(req, { data: { kind: "events", connectedAt: Date.now() } })) {
             return undefined;
           }
           return Response.json({ error: "WebSocket upgrade failed" }, { status: 400 });
+        }
+
+        if (url.pathname === "/api/dictation/ws") {
+          if (server.upgrade(req, { data: { kind: "dictation", connectedAt: Date.now() } })) {
+            return undefined;
+          }
+          return Response.json({ error: "Dictation WebSocket upgrade failed" }, { status: 400 });
         }
 
         if (url.pathname === "/health") {
@@ -793,6 +800,10 @@ const servers = ports.map((port, idx) => {
       },
       websocket: {
         open(ws) {
+          if (ws.data?.kind === "dictation") {
+            ws.send(JSON.stringify({ type: "ready" }));
+            return;
+          }
           wsClients.add(ws);
           ws.send(JSON.stringify({ type: "ready", scope: "global" }));
           if (autoWakeupMs > 0) {
@@ -802,7 +813,30 @@ const servers = ports.map((port, idx) => {
             ws.data = { ...(ws.data || {}), autoWakeupTimer: timer };
           }
         },
-        message() {},
+        message(ws, message) {
+          if (ws.data?.kind !== "dictation" || typeof message !== "string") {
+            return;
+          }
+          let frame;
+          try {
+            frame = JSON.parse(message);
+          } catch {
+            return;
+          }
+          const dictationId = frame?.dictationId;
+          if (frame?.type === "start") {
+            ws.send(JSON.stringify({ type: "ack", dictationId, ackSeq: -1 }));
+          } else if (frame?.type === "finish") {
+            ws.send(JSON.stringify({ type: "finish_accepted", dictationId, timeoutMs: 5000 }));
+            ws.send(
+              JSON.stringify({
+                type: "final",
+                dictationId,
+                text: "Verify async reply queue and stop controls",
+              }),
+            );
+          }
+        },
         close(ws) {
           wsClients.delete(ws);
           const timer = ws.data?.autoWakeupTimer;

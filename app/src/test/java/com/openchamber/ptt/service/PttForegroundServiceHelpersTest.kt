@@ -1,8 +1,11 @@
 package com.openchamber.ptt.service
 
+import android.content.pm.ServiceInfo
+import android.os.Build
 import com.openchamber.ptt.audio.ScoDropEvent
 import com.openchamber.ptt.audio.ScoDropSource
 import com.openchamber.ptt.storage.PinnedSession
+import com.openchamber.ptt.tts.VoiceRole
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -30,6 +33,22 @@ class PttForegroundServiceHelpersTest {
         assertEquals(
             "Tool permission needed on screen for unknown",
             PttForegroundService.formatPermissionAlertSpeech("   "),
+        )
+    }
+
+    @Test
+    fun `previewSampleTextForRole returns concise role-appropriate phrases`() {
+        assertEquals(
+            "Build succeeded cleanly. Ready for your next prompt.",
+            PttForegroundService.previewSampleTextForRole(VoiceRole.AGENT),
+        )
+        assertEquals(
+            "Switched to Spoken mode and Balanced detail.",
+            PttForegroundService.previewSampleTextForRole(VoiceRole.OPERATOR),
+        )
+        assertEquals(
+            "Summarizing.",
+            PttForegroundService.previewSampleTextForRole(VoiceRole.CUE),
         )
     }
 
@@ -147,6 +166,18 @@ class PttForegroundServiceHelpersTest {
             event = PttEvent.DiscardCapture,
             effects = emptyList(),
         )
+        val transportInterruptedToIdle = PttTransition(
+            previous = PttState.SPEAKING_TTS,
+            current = PttState.ARMED_IDLE,
+            event = PttEvent.PlaybackInterruptedByTransport,
+            effects = emptyList(),
+        )
+        val transportInterruptedToDraft = PttTransition(
+            previous = PttState.STAGED_DRAFT_SPEAKING,
+            current = PttState.STAGED_DRAFT,
+            event = PttEvent.PlaybackInterruptedByTransport,
+            effects = emptyList(),
+        )
         val whileRecording = PttTransition(
             previous = PttState.ARMED_IDLE,
             current = PttState.RECORDING,
@@ -157,9 +188,51 @@ class PttForegroundServiceHelpersTest {
         assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(armFromDisarmed))
         assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(bargeInToIdle))
         assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(bargeInToDraft))
+        assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(transportInterruptedToIdle))
+        assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(transportInterruptedToDraft))
         assertTrue(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(ttsDoneToIdle))
         assertTrue(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(discardToDraft))
         assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(whileRecording))
+    }
+
+    @Test
+    fun `resolveForegroundServiceType omits MICROPHONE in DISARMED or standalone TTS mode`() {
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            PttForegroundService.resolveForegroundServiceType(
+                state = PttState.DISARMED,
+                promotedForStandaloneTts = false,
+                hasRecordAudioPermission = true,
+                sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+            ),
+        )
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            PttForegroundService.resolveForegroundServiceType(
+                state = PttState.SPEAKING_TTS,
+                promotedForStandaloneTts = true,
+                hasRecordAudioPermission = true,
+                sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+            ),
+        )
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+            PttForegroundService.resolveForegroundServiceType(
+                state = PttState.RECORDING,
+                promotedForStandaloneTts = false,
+                hasRecordAudioPermission = true,
+                sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+            ),
+        )
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+            PttForegroundService.resolveForegroundServiceType(
+                state = PttState.ARMED_IDLE,
+                promotedForStandaloneTts = false,
+                hasRecordAudioPermission = false,
+                sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+            ),
+        )
     }
 
     @Test
@@ -185,11 +258,11 @@ class PttForegroundServiceHelpersTest {
             PttForegroundService.resolveScoDropAction(PttState.RECORDING, btButtonDrop),
         )
         assertEquals(
-            PttForegroundService.ScoDropAction.TRIGGER_BARGE_IN,
+            PttForegroundService.ScoDropAction.RELEASE_ONLY,
             PttForegroundService.resolveScoDropAction(PttState.SPEAKING_TTS, btButtonDrop),
         )
         assertEquals(
-            PttForegroundService.ScoDropAction.TRIGGER_BARGE_IN,
+            PttForegroundService.ScoDropAction.RELEASE_ONLY,
             PttForegroundService.resolveScoDropAction(PttState.STAGED_DRAFT_SPEAKING, btButtonDrop),
         )
         assertEquals(

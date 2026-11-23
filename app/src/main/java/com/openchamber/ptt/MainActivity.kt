@@ -77,7 +77,6 @@ import com.openchamber.ptt.session.SessionRepository
 import com.openchamber.ptt.storage.TokenStore
 import com.openchamber.ptt.tts.SttEngine
 import com.openchamber.ptt.tts.TtsClient
-import com.openchamber.ptt.tts.TtsEngine
 import com.openchamber.ptt.tts.TtsInputMode
 import com.openchamber.ptt.ui.HeroPttControl
 import com.openchamber.ptt.ui.PermissionCheckRow
@@ -249,6 +248,16 @@ private fun OpenChamberPttScreen(
         if (showSettingsSheet) {
             refreshMlKitSttStatuses()
             cockpit.refreshMlKitTtsStatus()
+            cockpit.refreshTtsCacheStats()
+            if (cockpit.systemVoices.isEmpty()) {
+                cockpit.refreshSystemVoices()
+            }
+        }
+    }
+
+    LaunchedEffect(showSettingsSheet, cockpit.cuePackWarmState.warmedCount, cockpit.cuePackWarmState.isWarming) {
+        if (showSettingsSheet) {
+            cockpit.refreshTtsCacheStats()
         }
     }
 
@@ -743,12 +752,25 @@ private fun OpenChamberPttScreen(
             onSelectSpokenDetailLevel = { level ->
                 cockpit.selectSpokenDetailLevel(level)
             },
+            audioCueMode = cockpit.audioCueMode,
+            onSelectAudioCueMode = { mode ->
+                cockpit.selectAudioCueMode(mode)
+            },
+            cuePackWarmState = cockpit.cuePackWarmState,
+            roleVoiceProfiles = cockpit.roleVoiceProfiles,
+            availableGeminiVoiceIds = cockpit.availableGeminiVoiceIds,
+            availableMlKitVoiceNames = cockpit.availableMlKitVoiceNames,
+            systemVoiceLabels = cockpit.systemVoiceLabels,
+            ttsCacheStats = cockpit.ttsCacheStats,
+            onClearTtsCache = {
+                cockpit.clearTtsCache()
+            },
             selectedGeminiVoice = cockpit.selectedVoice,
             selectedOpenAiVoice = cockpit.selectedOpenAiVoice,
             selectedSystemVoiceLabel = cockpit.selectedSystemVoiceLabel,
-            onOpenVoicePickerFor = { targetEngine ->
+            onOpenVoicePickerFor = { targetEngine, targetRole ->
                 showSettingsSheet = false
-                cockpit.openVoicePickerFor(targetEngine)
+                cockpit.openVoicePickerFor(targetEngine, targetRole)
             },
             sttEngine = cockpit.sttEngine,
             onSelectSttEngine = { engine ->
@@ -819,6 +841,23 @@ private fun OpenChamberPttScreen(
                 showSettingsSheet = false
                 showTelemetrySheet = true
                 refreshTelemetrySummary()
+            },
+            onOpenAudioDebug = {
+                showSettingsSheet = false
+                context.startActivity(Intent(context, AudioDebugActivity::class.java))
+            },
+            pinBluetoothSco = cockpit.pinSco,
+            volumeKeyStopRecording = cockpit.volumeKeyStopRecording,
+            onToggleVolumeKeyStopRecording = { enabled ->
+                cockpit.setVolumeKeyStop(enabled)
+            },
+            telecomCallForRecording = cockpit.telecomCallForRecording,
+            onToggleTelecomCallForRecording = { enabled ->
+                cockpit.setTelecomCallMode(enabled)
+            },
+            mirrorRecordingNotification = cockpit.mirrorRecordingNotification,
+            onToggleMirrorRecordingNotification = { enabled ->
+                cockpit.setMirrorRecordingNotif(enabled)
             },
             onConnect = { performConnect() },
             onDisconnect = {

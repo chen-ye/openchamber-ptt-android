@@ -49,8 +49,8 @@ class EarconPlayer internal constructor(
     @Suppress("unused") private val streamType: Int = AudioManager.STREAM_MUSIC,
     private val volumePercent: Int = DEFAULT_VOLUME_PERCENT,
     private val useCommunicationUsage: () -> Boolean = { false },
-    private val onCuePlaybackStarted: ((durationMs: Int) -> Unit)? = null,
-    private val onCuePlaybackStopped: (() -> Unit)? = null,
+    private val onCuePlaybackStarted: ((durationMs: Int, useCommunicationUsage: Boolean) -> Unit)? = null,
+    private val onCuePlaybackStopped: ((useCommunicationUsage: Boolean) -> Unit)? = null,
     private val clipObserver: ((Earcon, DecodedClip) -> Unit)? = null,
     private val playbackSpecObserver: ((Earcon, PlaybackSpec) -> Unit)? = null,
     private val customClipObserver: ((String?, PcmClip, PlaybackSpec) -> Unit)? = null,
@@ -60,8 +60,8 @@ class EarconPlayer internal constructor(
         streamType: Int = AudioManager.STREAM_MUSIC,
         volumePercent: Int = DEFAULT_VOLUME_PERCENT,
         useCommunicationUsage: () -> Boolean = { false },
-        onCuePlaybackStarted: ((durationMs: Int) -> Unit)? = null,
-        onCuePlaybackStopped: (() -> Unit)? = null,
+        onCuePlaybackStarted: ((durationMs: Int, useCommunicationUsage: Boolean) -> Unit)? = null,
+        onCuePlaybackStopped: ((useCommunicationUsage: Boolean) -> Unit)? = null,
     ) : this(
         context = context,
         streamType = streamType,
@@ -94,7 +94,10 @@ class EarconPlayer internal constructor(
     private var activeEarcon: Earcon? = null
     private var activeKeepTag: String? = null
     private var stopGeneration: Long = 0L
+    private var playSeq: Long = 0L
+    private var activePlaySeq: Long = 0L
     private var cueActive: Boolean = false
+    private var activeUseCommunication: Boolean = false
     private val decodedClips = ConcurrentHashMap<Earcon, DecodedClip>()
 
     @Volatile
@@ -112,68 +115,104 @@ class EarconPlayer internal constructor(
 
     fun play(earcon: Earcon) {
         val useCommunication = useCommunicationUsage()
-        var wasActive = false
-        var myStopGeneration = 0L
+        val estimatedDurationMs = decodedClips[earcon]?.durationMs ?: toneSpecFor(earcon).durationMs
+        val prevStopped: StoppedCueState
+        val myStopGeneration: Long
+        val myPlaySeq: Long
         val exec = synchronized(lock) {
             if (released) return
-            wasActive = stopActiveTrackLocked()
+            val executor = playExecutor ?: return
+            prevStopped = stopActiveTrackLocked()
             activeEarcon = earcon
+            activeKeepTag = null
+            cueActive = true
+            activeUseCommunication = useCommunication
             myStopGeneration = stopGeneration
-            playExecutor
-        } ?: return
-
-        if (wasActive) {
-            onCuePlaybackStopped?.invoke()
+            myPlaySeq = ++playSeq
+            activePlaySeq = myPlaySeq
+            executor
         }
 
-        exec.execute {
-            val stillValid = synchronized(lock) { !released && stopGeneration == myStopGeneration }
-            if (!stillValid) return@execute
-            val clip = decodedClips[earcon] ?: appContext?.let { ctx ->
-                decodeRawOgg(ctx, rawResFor(earcon), myStopGeneration)?.also { decodedClips.putIfAbsent(earcon, it) }
-            } ?: synthesizeFallbackClip(earcon)
-            val activeForPlay = synchronized(lock) { !released && stopGeneration == myStopGeneration }
-            if (!activeForPlay) return@execute
-            clipObserver?.invoke(earcon, clip)
-            playClip(earcon, earcon.cueName, clip, useCommunication, myStopGeneration)
+        if (prevStopped.wasActive) {
+            onCuePlaybackStopped?.invoke(prevStopped.useCommunication)
+        }
+        onCuePlaybackStarted?.invoke(estimatedDurationMs, useCommunication)
+
+        try {
+            exec.execute {
+                val stillValid = synchronized(lock) { !released && stopGeneration == myStopGeneration }
+                if (!stillValid) {
+                    notifyStoppedIfCurrentPlay(myStopGeneration, myPlaySeq)
+                    return@execute
+                }
+                val clip = decodedClips[earcon] ?: appContext?.let { ctx ->
+                    decodeRawOgg(ctx, rawResFor(earcon), myStopGeneration)?.also { decodedClips.putIfAbsent(earcon, it) }
+                } ?: synthesizeFallbackClip(earcon)
+                val activeForPlay = synchronized(lock) { !released && stopGeneration == myStopGeneration }
+                if (!activeForPlay) {
+                    notifyStoppedIfCurrentPlay(myStopGeneration, myPlaySeq)
+                    return@execute
+                }
+                clipObserver?.invoke(earcon, clip)
+                playClip(earcon, earcon.cueName, clip, useCommunication, myStopGeneration, myPlaySeq)
+            }
+        } catch (_: Throwable) {
+            notifyStoppedIfCurrentPlay(myStopGeneration, myPlaySeq)
         }
     }
 
     fun playCustomClip(clip: PcmClip, keepTag: String? = null) {
         if (clip.pcmBytes.isEmpty()) return
         val useCommunication = useCommunicationUsage()
-        var wasActive = false
-        var myStopGeneration = 0L
+        val durationMs = clip.durationMs.coerceAtLeast(20)
+        val prevStopped: StoppedCueState
+        val myStopGeneration: Long
+        val myPlaySeq: Long
         val exec = synchronized(lock) {
             if (released) return
-            wasActive = stopActiveTrackLocked()
+            val executor = playExecutor ?: return
+            prevStopped = stopActiveTrackLocked()
+            activeEarcon = null
             activeKeepTag = keepTag
+            cueActive = true
+            activeUseCommunication = useCommunication
             myStopGeneration = stopGeneration
-            playExecutor
-        } ?: return
-
-        if (wasActive) {
-            onCuePlaybackStopped?.invoke()
+            myPlaySeq = ++playSeq
+            activePlaySeq = myPlaySeq
+            executor
         }
+
+        if (prevStopped.wasActive) {
+            onCuePlaybackStopped?.invoke(prevStopped.useCommunication)
+        }
+        onCuePlaybackStarted?.invoke(durationMs, useCommunication)
 
         val decoded = DecodedClip(
             pcmBytes = clip.pcmBytes,
             sampleRateHz = clip.sampleRateHz.coerceAtLeast(8_000),
             channelCount = clip.channelCount.coerceIn(1, 2),
-            durationMs = clip.durationMs.coerceAtLeast(20),
+            durationMs = durationMs,
         )
 
-        exec.execute {
-            val activeForPlay = synchronized(lock) { !released && stopGeneration == myStopGeneration }
-            if (!activeForPlay) return@execute
-            customClipObserver?.invoke(keepTag, clip, playbackSpecFor(useCommunication))
-            playClip(
-                earcon = null,
-                keepTag = keepTag,
-                clip = decoded,
-                useCommunication = useCommunication,
-                myStopGeneration = myStopGeneration,
-            )
+        try {
+            exec.execute {
+                val activeForPlay = synchronized(lock) { !released && stopGeneration == myStopGeneration }
+                if (!activeForPlay) {
+                    notifyStoppedIfCurrentPlay(myStopGeneration, myPlaySeq)
+                    return@execute
+                }
+                customClipObserver?.invoke(keepTag, clip, playbackSpecFor(useCommunication))
+                playClip(
+                    earcon = null,
+                    keepTag = keepTag,
+                    clip = decoded,
+                    useCommunication = useCommunication,
+                    myStopGeneration = myStopGeneration,
+                    myPlaySeq = myPlaySeq,
+                )
+            }
+        } catch (_: Throwable) {
+            notifyStoppedIfCurrentPlay(myStopGeneration, myPlaySeq)
         }
     }
 
@@ -184,26 +223,26 @@ class EarconPlayer internal constructor(
     }
 
     fun stop() {
-        val wasActive = synchronized(lock) {
+        val stopped = synchronized(lock) {
             stopGeneration += 1L
             stopActiveTrackLocked()
         }
-        if (wasActive) {
-            onCuePlaybackStopped?.invoke()
+        if (stopped.wasActive) {
+            onCuePlaybackStopped?.invoke(stopped.useCommunication)
         }
     }
 
     fun stopUnless(keep: Earcon) {
-        val wasActive = synchronized(lock) {
+        val stopped = synchronized(lock) {
             if (activeEarcon == keep || activeKeepTag == keep.cueName) {
-                false
+                StoppedCueState(wasActive = false, useCommunication = false)
             } else {
                 stopGeneration += 1L
                 stopActiveTrackLocked()
             }
         }
-        if (wasActive) {
-            onCuePlaybackStopped?.invoke()
+        if (stopped.wasActive) {
+            onCuePlaybackStopped?.invoke(stopped.useCommunication)
         }
     }
 
@@ -211,7 +250,7 @@ class EarconPlayer internal constructor(
         val preloadToShutdown: ExecutorService?
         val playToShutdown: ExecutorService?
         val schedulerToShutdown: ScheduledExecutorService?
-        val wasActive: Boolean
+        val stopped: StoppedCueState
         synchronized(lock) {
             released = true
             stopGeneration += 1L
@@ -221,10 +260,10 @@ class EarconPlayer internal constructor(
             playExecutor = null
             schedulerToShutdown = releaseScheduler
             releaseScheduler = null
-            wasActive = stopActiveTrackLocked()
+            stopped = stopActiveTrackLocked()
         }
-        if (wasActive) {
-            onCuePlaybackStopped?.invoke()
+        if (stopped.wasActive) {
+            onCuePlaybackStopped?.invoke(stopped.useCommunication)
         }
         runCatching { preloadToShutdown?.shutdownNow() }
         runCatching { playToShutdown?.shutdownNow() }
@@ -232,7 +271,23 @@ class EarconPlayer internal constructor(
         decodedClips.clear()
     }
 
-    private fun stopActiveTrackLocked(): Boolean {
+    private fun notifyStoppedIfCurrentPlay(
+        expectedStopGen: Long,
+        expectedPlaySeq: Long,
+    ) {
+        val stopped = synchronized(lock) {
+            if (stopGeneration == expectedStopGen && activePlaySeq == expectedPlaySeq && cueActive) {
+                stopActiveTrackLocked()
+            } else {
+                StoppedCueState(wasActive = false, useCommunication = false)
+            }
+        }
+        if (stopped.wasActive) {
+            onCuePlaybackStopped?.invoke(stopped.useCommunication)
+        }
+    }
+
+    private fun stopActiveTrackLocked(): StoppedCueState {
         activeReleaseFuture?.cancel(false)
         activeReleaseFuture = null
         activeEarcon = null
@@ -240,12 +295,14 @@ class EarconPlayer internal constructor(
         val prev = activeTrack
         activeTrack = null
         val wasCueActive = cueActive
+        val wasUseComm = activeUseCommunication
         cueActive = false
+        activeUseCommunication = false
         if (prev != null) {
             runCatching { prev.stop() }
             runCatching { prev.release() }
         }
-        return wasCueActive
+        return StoppedCueState(wasActive = wasCueActive, useCommunication = wasUseComm)
     }
 
     private fun synthesizeFallbackClip(earcon: Earcon): DecodedClip {
@@ -281,8 +338,12 @@ class EarconPlayer internal constructor(
         clip: DecodedClip,
         useCommunication: Boolean,
         myStopGeneration: Long,
+        myPlaySeq: Long,
     ) {
-        if (clip.pcmBytes.isEmpty()) return
+        if (clip.pcmBytes.isEmpty()) {
+            notifyStoppedIfCurrentPlay(myStopGeneration, myPlaySeq)
+            return
+        }
         val spec = playbackSpecFor(useCommunication)
         earcon?.let { playbackSpecObserver?.invoke(it, spec) }
         val channelMask = if (clip.channelCount >= 2) {
@@ -308,22 +369,29 @@ class EarconPlayer internal constructor(
                 .setTransferMode(AudioTrack.MODE_STATIC)
                 .setBufferSizeInBytes(clip.pcmBytes.size)
                 .build()
-        }.getOrNull() ?: return
+        }.getOrNull()
+        if (track == null) {
+            notifyStoppedIfCurrentPlay(myStopGeneration, myPlaySeq)
+            return
+        }
 
-        var prevWasActive = false
         val scheduler = synchronized(lock) {
-            if (released || stopGeneration != myStopGeneration) {
+            if (released || stopGeneration != myStopGeneration || activePlaySeq != myPlaySeq) {
                 runCatching { track.release() }
                 return
             }
-            prevWasActive = stopActiveTrackLocked()
+            activeReleaseFuture?.cancel(false)
+            activeReleaseFuture = null
+            activeTrack?.let { prev ->
+                runCatching { prev.stop() }
+                runCatching { prev.release() }
+            }
             activeEarcon = earcon
             activeKeepTag = keepTag
             activeTrack = track
+            cueActive = true
+            activeUseCommunication = useCommunication
             releaseScheduler
-        }
-        if (prevWasActive) {
-            onCuePlaybackStopped?.invoke()
         }
 
         val started = try {
@@ -337,34 +405,37 @@ class EarconPlayer internal constructor(
         }
 
         if (!started || scheduler == null) {
-            synchronized(lock) {
+            val stopped = synchronized(lock) {
                 if (activeTrack === track) {
-                    activeTrack = null
+                    stopActiveTrackLocked()
+                } else {
+                    StoppedCueState(wasActive = false, useCommunication = false)
                 }
             }
             runCatching { track.stop() }
             runCatching { track.release() }
+            if (stopped.wasActive) {
+                onCuePlaybackStopped?.invoke(stopped.useCommunication)
+            }
             return
         }
 
-        val shouldNotifyStart = synchronized(lock) {
-            if (!released && activeTrack === track && stopGeneration == myStopGeneration) {
-                cueActive = true
-                true
-            } else {
-                false
-            }
+        val stillActive = synchronized(lock) {
+            !released && activeTrack === track && stopGeneration == myStopGeneration && activePlaySeq == myPlaySeq
         }
-        if (shouldNotifyStart) {
-            onCuePlaybackStarted?.invoke(clip.durationMs)
-        } else {
-            synchronized(lock) {
+        if (!stillActive) {
+            val stopped = synchronized(lock) {
                 if (activeTrack === track) {
-                    activeTrack = null
+                    stopActiveTrackLocked()
+                } else {
+                    StoppedCueState(wasActive = false, useCommunication = false)
                 }
             }
             runCatching { track.stop() }
             runCatching { track.release() }
+            if (stopped.wasActive) {
+                onCuePlaybackStopped?.invoke(stopped.useCommunication)
+            }
             return
         }
 
@@ -372,6 +443,7 @@ class EarconPlayer internal constructor(
         val future = runCatching {
             scheduler.schedule(
                 {
+                    var stoppedUseComm = false
                     val shouldNotifyStop = synchronized(lock) {
                         if (activeTrack === track) {
                             activeTrack = null
@@ -379,7 +451,9 @@ class EarconPlayer internal constructor(
                             activeEarcon = null
                             activeKeepTag = null
                             val wasCueActive = cueActive
+                            stoppedUseComm = activeUseCommunication
                             cueActive = false
+                            activeUseCommunication = false
                             wasCueActive
                         } else {
                             false
@@ -388,7 +462,7 @@ class EarconPlayer internal constructor(
                     runCatching { track.stop() }
                     runCatching { track.release() }
                     if (shouldNotifyStop) {
-                        onCuePlaybackStopped?.invoke()
+                        onCuePlaybackStopped?.invoke(stoppedUseComm)
                     }
                 },
                 delayMs,
@@ -396,11 +470,27 @@ class EarconPlayer internal constructor(
             )
         }.getOrNull()
 
+        if (future == null) {
+            val stopped = synchronized(lock) {
+                if (activeTrack === track) {
+                    stopActiveTrackLocked()
+                } else {
+                    StoppedCueState(wasActive = false, useCommunication = false)
+                }
+            }
+            runCatching { track.stop() }
+            runCatching { track.release() }
+            if (stopped.wasActive) {
+                onCuePlaybackStopped?.invoke(stopped.useCommunication)
+            }
+            return
+        }
+
         synchronized(lock) {
             if (activeTrack === track) {
                 activeReleaseFuture = future
             } else {
-                future?.cancel(false)
+                future.cancel(false)
             }
         }
     }
@@ -424,6 +514,11 @@ class EarconPlayer internal constructor(
             durationMs = pcmClip.durationMs.coerceAtLeast(20),
         )
     }
+
+    private data class StoppedCueState(
+        val wasActive: Boolean,
+        val useCommunication: Boolean,
+    )
 
     internal data class DecodedClip(
         val pcmBytes: ByteArray,

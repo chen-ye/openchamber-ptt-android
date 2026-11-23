@@ -1,8 +1,10 @@
 package com.openchamber.ptt.service
 
 import android.annotation.SuppressLint
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioRouting
 import android.media.MediaRecorder
 import android.os.SystemClock
 import com.openchamber.ptt.logging.VoiceUxLogger
@@ -29,6 +31,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+
+internal sealed interface CaptureTransportPrepResult {
+    data class Ready(val playStartCueAfterPrep: Boolean = false) : CaptureTransportPrepResult
+    data object Aborted : CaptureTransportPrepResult
+}
 
 internal data class CaptureOutcome(
     val transcript: String?,
@@ -87,12 +95,18 @@ internal class CaptureController {
 
 private class AndroidPcmCaptureSource(
     private val audioRecord: AudioRecord,
+    private val onRouteResolved: ((source: Int, deviceType: Int?, productName: String?) -> Unit)? = null,
 ) : PcmCaptureSource {
+    private val routeLock = Any()
+    private var lastReportedRoute: Triple<Int, Int?, String?>? = null
+    private var routingListener: AudioRouting.OnRoutingChangedListener? = null
+
     override fun startRecording() {
         audioRecord.startRecording()
         if (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
             throw IllegalStateException("AudioRecord did not enter RECORDSTATE_RECORDING")
         }
+        attachAndReportRoute()
     }
 
     override fun readBlocking(buffer: ByteArray, sizeInBytes: Int): Int =
@@ -107,8 +121,50 @@ private class AndroidPcmCaptureSource(
     }
 
     override fun release() {
+        detachRoutingListener()
         stopIfRecording()
         runCatching { audioRecord.release() }
+    }
+
+    private fun attachAndReportRoute() {
+        val callback = onRouteResolved ?: return
+        val listener = AudioRouting.OnRoutingChangedListener { router ->
+            reportRoutedDevice(callback, router?.routedDevice)
+        }
+        synchronized(routeLock) {
+            routingListener = listener
+        }
+        runCatching { audioRecord.addOnRoutingChangedListener(listener, null) }
+        val initialDevice = runCatching { audioRecord.routedDevice }.getOrNull()
+        reportRoutedDevice(callback, initialDevice)
+    }
+
+    private fun detachRoutingListener() {
+        val listener = synchronized(routeLock) {
+            routingListener.also { routingListener = null }
+        } ?: return
+        runCatching { audioRecord.removeOnRoutingChangedListener(listener) }
+    }
+
+    private fun reportRoutedDevice(
+        callback: (source: Int, deviceType: Int?, productName: String?) -> Unit,
+        device: AudioDeviceInfo?,
+    ) {
+        val source = runCatching { audioRecord.audioSource }.getOrDefault(MediaRecorder.AudioSource.DEFAULT)
+        val deviceType = device?.type
+        val productName = device?.productName?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        val snapshot = Triple(source, deviceType, productName)
+        val shouldNotify = synchronized(routeLock) {
+            if (lastReportedRoute == snapshot) {
+                false
+            } else {
+                lastReportedRoute = snapshot
+                true
+            }
+        }
+        if (shouldNotify) {
+            callback(source, deviceType, productName)
+        }
     }
 }
 
@@ -128,15 +184,22 @@ internal class AudioBurstRecorder internal constructor(
     private val onMaxCapAutoStage: () -> Unit,
     private val onPartialTranscript: (String) -> Unit,
     private val onStatusUpdate: (String) -> Unit,
+    private val prepareCaptureTransport: suspend (captureGeneration: Long) -> CaptureTransportPrepResult = {
+        CaptureTransportPrepResult.Ready(playStartCueAfterPrep = false)
+    },
+    private val onPlayDeferredStartCue: () -> Unit = {},
+    private val onCaptureRouteResolved: ((source: Int, deviceType: Int?, productName: String?) -> Unit)? = null,
     private val maxUtteranceMs: Long = PttForegroundService.MAX_UTTERANCE_MS,
     private val maxUtteranceWarningMs: Long = PttForegroundService.MAX_UTTERANCE_WARNING_MS,
     private val bargeInCooldownMs: Long = PttForegroundService.BARGE_IN_COOLDOWN_MS,
     private val maxFallbackPcmBytes: Int = PttForegroundService.MAX_FALLBACK_PCM_BYTES,
     private val chunkSizeBytes: Int = PttForegroundService.CHUNK_SIZE_BYTES,
-    private val clockElapsedMs: () -> Long = { SystemClock.elapsedRealtime() },
+    private val clockElapsedMs: () -> Long = {
+        runCatching { SystemClock.elapsedRealtime() }.getOrElse { System.nanoTime() / 1_000_000L }
+    },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val captureSourceFactory: (useCommunicationSource: Boolean) -> PcmCaptureSource = { useComm ->
-        createAndroidCaptureSource(useComm, chunkSizeBytes)
+        createAndroidCaptureSource(useComm, chunkSizeBytes, onCaptureRouteResolved)
     },
     private val mlKitTranscribe: suspend (
         engine: SttEngine,
@@ -151,6 +214,7 @@ internal class AudioBurstRecorder internal constructor(
     },
 ) {
     private val lock = Any()
+    private val nextCaptureGeneration = AtomicLong(0L)
     private var activeCaptureJob: Job? = null
     private var activeCaptureController: CaptureController? = null
 
@@ -168,6 +232,7 @@ internal class AudioBurstRecorder internal constructor(
         onFailure: (serverId: String, error: Throwable) -> Unit,
     ) {
         val controller = CaptureController()
+        val captureGeneration = nextCaptureGeneration.incrementAndGet()
         var jobRef: Job? = null
         val job = scope.launch(ioDispatcher, start = CoroutineStart.LAZY) {
             try {
@@ -179,6 +244,7 @@ internal class AudioBurstRecorder internal constructor(
                     onStoppedEarly = onStoppedEarly,
                     onOutcome = onOutcome,
                     onFailure = onFailure,
+                    captureGeneration = captureGeneration,
                 )
             } finally {
                 synchronized(lock) {
@@ -238,6 +304,7 @@ internal class AudioBurstRecorder internal constructor(
             outcome: CaptureOutcome?,
         ) -> Unit,
         onFailure: (serverId: String, error: Throwable) -> Unit,
+        captureGeneration: Long = nextCaptureGeneration.incrementAndGet(),
     ) {
         try {
             val cooldownRemaining = PttForegroundService.remainingBargeInCooldownMs(
@@ -249,6 +316,26 @@ internal class AudioBurstRecorder internal constructor(
                 delay(cooldownRemaining)
             }
 
+            if (captureController.isStopRequested || currentState() != PttState.RECORDING) {
+                onStoppedEarly()
+                return
+            }
+
+            val prep = prepareCaptureTransport(captureGeneration)
+            if (prep is CaptureTransportPrepResult.Aborted ||
+                captureController.isStopRequested ||
+                currentState() != PttState.RECORDING
+            ) {
+                onStoppedEarly()
+                return
+            }
+            if (prep is CaptureTransportPrepResult.Ready &&
+                prep.playStartCueAfterPrep &&
+                !captureController.isStopRequested &&
+                currentState() == PttState.RECORDING
+            ) {
+                onPlayDeferredStartCue()
+            }
             if (captureController.isStopRequested || currentState() != PttState.RECORDING) {
                 onStoppedEarly()
                 return
@@ -466,6 +553,7 @@ internal class AudioBurstRecorder internal constructor(
         private fun createAndroidCaptureSource(
             useCommunicationSource: Boolean,
             chunkSizeBytes: Int,
+            onCaptureRouteResolved: ((source: Int, deviceType: Int?, productName: String?) -> Unit)? = null,
         ): PcmCaptureSource {
             val minBufferBytes = AudioRecord.getMinBufferSize(
                 PttForegroundService.SAMPLE_RATE_HZ,
@@ -494,7 +582,7 @@ internal class AudioBurstRecorder internal constructor(
                 runCatching { audioRecord.release() }
                 throw IllegalStateException("AudioRecord failed to initialize")
             }
-            return AndroidPcmCaptureSource(audioRecord)
+            return AndroidPcmCaptureSource(audioRecord, onCaptureRouteResolved)
         }
     }
 }

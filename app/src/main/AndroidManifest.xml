@@ -4,6 +4,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
@@ -45,10 +47,19 @@
             android:theme="@style/Theme.OpenChamberPtt"
             android:windowSoftInputMode="adjustResize" />
 
+        <activity
+            android:name=".AudioDebugActivity"
+            android:exported="false"
+            android:label="Audio &amp; BT Debug" />
+
         <service
             android:name=".service.PttForegroundService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback|microphone" />
+
+        <receiver
+            android:name=".service.RecordingNotificationActionReceiver"
+            android:exported="false" />
 
         <receiver
             android:name="androidx.media.session.MediaButtonReceiver"

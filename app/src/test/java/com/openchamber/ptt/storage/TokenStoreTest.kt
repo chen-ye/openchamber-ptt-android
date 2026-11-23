@@ -426,6 +426,32 @@ class TokenStoreTest {
     }
 
     @Test
+    fun `device-scoped hardware and wearable settings default, persist across instances, and notify changes`() {
+        val sharedPrefs = InMemorySharedPreferences()
+        val storeA = TokenStore(sharedPrefs)
+        val storeB = TokenStore(sharedPrefs)
+
+        assertFalse(storeA.getVolumeKeyStopRecording())
+        assertFalse(storeA.getTelecomCallForRecording())
+        assertTrue(storeA.getMirrorRecordingNotification())
+
+        val v0 = storeB.changes.value
+        storeA.setVolumeKeyStopRecording(true)
+        assertTrue(storeB.changes.value > v0)
+        assertTrue(storeB.getVolumeKeyStopRecording())
+
+        val v1 = storeB.changes.value
+        storeA.setTelecomCallForRecording(true)
+        assertTrue(storeB.changes.value > v1)
+        assertTrue(storeB.getTelecomCallForRecording())
+
+        val v2 = storeB.changes.value
+        storeA.setMirrorRecordingNotification(false)
+        assertTrue(storeB.changes.value > v2)
+        assertFalse(storeB.getMirrorRecordingNotification())
+    }
+
+    @Test
     fun `role voice profiles resolve global vs ServerVoiceOverride while keeping ML Kit and System voices strictly global`() {
         val store = TokenStore(InMemorySharedPreferences())
         val srvA = store.upsertServer("http://srv-a:14096", label = "Server A", token = "tok_a")

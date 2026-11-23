@@ -1,6 +1,7 @@
 package com.openchamber.ptt.ui
 
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -21,6 +22,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.openchamber.ptt.audio.CuePackWarmState
 import com.openchamber.ptt.network.OpenChamberHttp
 import com.openchamber.ptt.network.OpenChamberLauncher
 import com.openchamber.ptt.service.PttForegroundService
@@ -40,9 +42,12 @@ import com.openchamber.ptt.storage.toServerCloudOverride
 import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.MlKitTtsSpeaker
 import com.openchamber.ptt.tts.MlKitTtsVoiceSummary
+import com.openchamber.ptt.tts.RoleVoiceProfileMap
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.SttEngine
 import com.openchamber.ptt.tts.SystemTtsVoiceSummary
+import com.openchamber.ptt.tts.TtsCache
+import com.openchamber.ptt.tts.TtsCacheStats
 import com.openchamber.ptt.tts.TtsClient
 import com.openchamber.ptt.tts.TtsEngine
 import com.openchamber.ptt.tts.TtsEngineOption
@@ -51,6 +56,8 @@ import com.openchamber.ptt.tts.TtsInputMode
 import com.openchamber.ptt.tts.TtsPlayer
 import com.openchamber.ptt.tts.TtsVoice
 import com.openchamber.ptt.tts.VoicePipelineDefaults
+import com.openchamber.ptt.tts.VoiceRole
+import com.openchamber.ptt.tts.VoiceRoleResolver
 import com.openchamber.ptt.voice.AssistantResponseItem
 import com.openchamber.ptt.voice.MlKitAvailability
 import com.openchamber.ptt.voice.MlKitDownloadEvent
@@ -59,8 +66,10 @@ import com.openchamber.ptt.voice.ResponseFeedState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.coroutines.coroutineContext
 
 @Stable
@@ -85,9 +94,11 @@ internal class VoiceCockpitState(
     private val sendGraceRemainingMsState: State<Long?>,
     private val isOrganizingDraftState: State<Boolean>,
     private val responseFeedState: State<ResponseFeedState>,
+    private val cuePackWarmStateState: State<CuePackWarmState>,
     showSessionPickerState: MutableState<Boolean>,
     showVoicePickerState: MutableState<Boolean>,
     voicePickerInitialEngineState: MutableState<TtsEngine>,
+    voicePickerInitialRoleState: MutableState<VoiceRole>,
     val mlKitTtsSpeaker: MlKitTtsSpeaker,
     initialPinSco: Boolean,
     private val onSessionExpiredAuthErrorState: State<(String) -> Unit>,
@@ -112,6 +123,12 @@ internal class VoiceCockpitState(
     var showSessionPicker by showSessionPickerState
     var showVoicePicker by showVoicePickerState
     var voicePickerInitialEngine by voicePickerInitialEngineState
+    var voicePickerInitialRole by voicePickerInitialRoleState
+
+    var roleVoiceProfiles by mutableStateOf(tokenStore.getEffectiveRoleVoiceProfiles())
+        private set
+    var ttsCacheStats by mutableStateOf(TtsCacheStats(0, 0L, 0, 0L))
+        private set
 
     var selectedVoice by mutableStateOf(tokenStore.getEffectiveTtsVoice())
         private set
@@ -146,6 +163,13 @@ internal class VoiceCockpitState(
     var quickTranscriptCleanup by mutableStateOf(tokenStore.getEffectiveQuickTranscriptCleanup())
         private set
     var audioCueMode by mutableStateOf(tokenStore.getEffectiveAudioCueMode())
+        private set
+
+    var volumeKeyStopRecording by mutableStateOf(tokenStore.getVolumeKeyStopRecording())
+        private set
+    var telecomCallForRecording by mutableStateOf(tokenStore.getTelecomCallForRecording())
+        private set
+    var mirrorRecordingNotification by mutableStateOf(tokenStore.getMirrorRecordingNotification())
         private set
 
     var mlKitTtsStatus by mutableStateOf<MlKitStatusReport?>(null)
@@ -194,6 +218,8 @@ internal class VoiceCockpitState(
         get() = isOrganizingDraftState.value
     val responseFeed: ResponseFeedState
         get() = responseFeedState.value
+    val cuePackWarmState: CuePackWarmState
+        get() = cuePackWarmStateState.value
     val unreadCount: Int
         get() = responseFeed.unreadQueue.size
     val inspectableResponses: List<AssistantResponseItem>
@@ -227,9 +253,21 @@ internal class VoiceCockpitState(
                 ?: id.substringAfterLast('-').ifBlank { id }
         }
 
+    val systemVoiceLabels: Map<String, String>
+        get() = systemVoices.associate { it.name to it.label }
+
+    val availableGeminiVoiceIds: List<String>
+        get() = voices.map { it.id }
+
+    val availableMlKitVoiceNames: List<String>
+        get() = mlKitTtsVoices
+            .filter { it.availability == MlKitAvailability.AVAILABLE }
+            .map { it.name }
+            .ifEmpty { mlKitTtsVoices.map { it.name } }
+
     val activeVoiceChipLabel: String
         get() = VoicePipelineDefaults.resolveActiveVoiceChipLabel(
-            pipeline = ttsPipeline,
+            pipeline = VoiceRoleResolver.resolvePipelineForRole(ttsPipeline, roleVoiceProfiles.agent),
             geminiVoice = selectedVoice,
             mlKitVoice = selectedMlKitTtsVoice,
             openAiVoice = selectedOpenAiVoice,
@@ -241,6 +279,7 @@ internal class VoiceCockpitState(
     }
 
     fun syncEffectiveVoiceState(serverId: String? = tokenStore.getActiveServer()?.id) {
+        roleVoiceProfiles = tokenStore.getEffectiveRoleVoiceProfiles(serverId)
         selectedVoice = tokenStore.getEffectiveTtsVoice(serverId)
         selectedOpenAiVoice = tokenStore.getEffectiveOpenAiTtsVoice(serverId)
         selectedMlKitTtsVoice = tokenStore.getMlKitTtsVoice()
@@ -255,6 +294,43 @@ internal class VoiceCockpitState(
         audioCueMode = tokenStore.getEffectiveAudioCueMode(serverId)
     }
 
+    fun refreshTtsCacheStats() {
+        scope.launch(Dispatchers.IO) {
+            val stats = boundService?.getTtsCacheStats() ?: run {
+                val fallback = TtsCache(context.applicationContext)
+                try {
+                    fallback.stats()
+                } finally {
+                    fallback.close()
+                }
+            }
+            withContext(Dispatchers.Main) {
+                ttsCacheStats = stats
+            }
+        }
+    }
+
+    fun clearTtsCache() {
+        scope.launch(Dispatchers.IO) {
+            val service = boundService
+            val next = if (service != null) {
+                service.clearTtsCache()
+                service.getTtsCacheStats()
+            } else {
+                val fallback = TtsCache(context.applicationContext)
+                try {
+                    fallback.clear()
+                    fallback.stats()
+                } finally {
+                    fallback.close()
+                }
+            }
+            withContext(Dispatchers.Main) {
+                ttsCacheStats = next
+            }
+        }
+    }
+
     fun syncServerStateFromStore() {
         val list = tokenStore.getServers()
         val active = tokenStore.getActiveServer()
@@ -263,6 +339,9 @@ internal class VoiceCockpitState(
         pinnedSession = active?.lastPinnedSession
         storeChangeVersion = tokenStore.changes.value
         syncEffectiveVoiceState(active?.id)
+        volumeKeyStopRecording = tokenStore.getVolumeKeyStopRecording()
+        telecomCallForRecording = tokenStore.getTelecomCallForRecording()
+        mirrorRecordingNotification = tokenStore.getMirrorRecordingNotification()
     }
 
     private fun cancelSessionRefresh() {
@@ -445,17 +524,17 @@ internal class VoiceCockpitState(
     }
 
     fun openVoicePicker() {
-        if (voices.isEmpty()) refreshVoices()
-        voicePickerInitialEngine = VoicePipelineDefaults.primaryEnabledEngine(ttsPipeline)
-            ?: TtsEngine.GEMINI_BRIDGE
-        showVoicePicker = true
+        val rolePipeline = VoiceRoleResolver.resolvePipelineForRole(ttsPipeline, roleVoiceProfiles.agent)
+        val primary = VoicePipelineDefaults.primaryEnabledEngine(rolePipeline) ?: TtsEngine.GEMINI_BRIDGE
+        openVoicePickerFor(primary, VoiceRole.AGENT)
     }
 
-    fun openVoicePickerFor(targetEngine: TtsEngine) {
+    fun openVoicePickerFor(targetEngine: TtsEngine, role: VoiceRole = VoiceRole.AGENT) {
         if (targetEngine == TtsEngine.GEMINI_BRIDGE && voices.isEmpty()) {
             refreshVoices()
         }
         voicePickerInitialEngine = targetEngine
+        voicePickerInitialRole = role
         showVoicePicker = true
     }
 
@@ -477,35 +556,56 @@ internal class VoiceCockpitState(
         showSessionPicker = false
     }
 
-    fun selectGeminiVoice(voice: TtsVoice) {
-        selectedVoice = voice.id
-        tokenStore.saveTtsVoice(voice.id, customServerId)
+    fun selectRoleGeminiVoice(role: VoiceRole, voiceId: String?) {
+        tokenStore.saveRoleGeminiVoice(role, voiceId, customServerId)
         syncServerStateFromStore()
-        showVoicePicker = false
     }
 
-    fun selectMlKitTtsVoice(voiceName: String) {
-        selectedMlKitTtsVoice = voiceName
-        tokenStore.setMlKitTtsVoice(voiceName)
-        val pickedAvail = mlKitTtsVoices
-            .firstOrNull { it.name.equals(voiceName, ignoreCase = true) }
-            ?.availability
-        if (pickedAvail == MlKitAvailability.AVAILABLE) {
-            showVoicePicker = false
+    fun selectRoleMlKitVoice(role: VoiceRole, voiceName: String?) {
+        tokenStore.setRoleMlKitVoice(role, voiceName)
+        syncServerStateFromStore()
+    }
+
+    fun selectRoleOpenAiVoice(role: VoiceRole, voiceId: String?) {
+        tokenStore.saveRoleOpenAiVoice(role, voiceId, customServerId)
+        syncServerStateFromStore()
+    }
+
+    fun selectRoleSystemVoice(role: VoiceRole, voiceName: String?) {
+        tokenStore.setRoleSystemVoice(role, voiceName)
+        syncServerStateFromStore()
+    }
+
+    fun setRolePreferredEngine(role: VoiceRole, engine: TtsEngine?) {
+        tokenStore.saveRolePreferredEngine(role, engine, customServerId)
+        syncServerStateFromStore()
+    }
+
+    fun previewVoiceSample(
+        role: VoiceRole,
+        engine: TtsEngine,
+        voiceId: String?,
+        kokoroSpeakerId: Int = TtsClient.DEFAULT_KOKORO_SPEAKER_ID,
+    ) {
+        val service = boundService
+        if (service != null) {
+            service.previewVoiceSample(
+                role = role,
+                engine = engine,
+                voiceId = voiceId,
+                kokoroSpeakerId = kokoroSpeakerId,
+            )
+        } else {
+            Toast.makeText(
+                context,
+                "Voice service connecting — try preview again in a moment",
+                Toast.LENGTH_SHORT,
+            ).show()
         }
     }
 
-    fun selectOpenAiVoice(voiceId: String) {
-        selectedOpenAiVoice = voiceId
-        tokenStore.saveOpenAiTtsVoice(voiceId, customServerId)
-        syncServerStateFromStore()
-        showVoicePicker = false
-    }
-
-    fun selectSystemVoice(voiceName: String?) {
-        selectedSystemVoice = voiceName
-        tokenStore.setSystemTtsVoice(voiceName)
-        showVoicePicker = false
+    fun stopVoicePreview() {
+        boundService?.stopVoicePreview()
     }
 
     fun selectSpokenDetailLevel(level: SpokenDetailLevel) {
@@ -581,6 +681,24 @@ internal class VoiceCockpitState(
     fun selectAudioCueMode(mode: AudioCueMode) {
         audioCueMode = mode
         tokenStore.saveAudioCueMode(mode, customServerId)
+        syncServerStateFromStore()
+    }
+
+    fun setVolumeKeyStop(enabled: Boolean) {
+        volumeKeyStopRecording = enabled
+        tokenStore.setVolumeKeyStopRecording(enabled)
+        syncServerStateFromStore()
+    }
+
+    fun setTelecomCallMode(enabled: Boolean) {
+        telecomCallForRecording = enabled
+        tokenStore.setTelecomCallForRecording(enabled)
+        syncServerStateFromStore()
+    }
+
+    fun setMirrorRecordingNotif(enabled: Boolean) {
+        mirrorRecordingNotification = enabled
+        tokenStore.setMirrorRecordingNotification(enabled)
         syncServerStateFromStore()
     }
 
@@ -759,6 +877,7 @@ internal fun rememberVoiceCockpitState(
                 ?: TtsEngine.GEMINI_BRIDGE,
         )
     }
+    val voicePickerInitialRoleState = rememberSaveable { mutableStateOf(VoiceRole.AGENT) }
 
     val mlKitTtsSpeaker = remember {
         MlKitTtsSpeaker()
@@ -783,6 +902,9 @@ internal fun rememberVoiceCockpitState(
     val isOrganizingDraftState = rememberUpdatedState(boundService?.isOrganizingDraft?.collectAsState()?.value ?: false)
     val responseFeedState = rememberUpdatedState(
         boundService?.responseFeed?.collectAsState()?.value ?: ResponseFeedState(),
+    )
+    val cuePackWarmStateState = rememberUpdatedState(
+        boundService?.cuePackWarmState?.collectAsState()?.value ?: CuePackWarmState(),
     )
     val onSessionExpiredAuthErrorState = rememberUpdatedState(onSessionExpiredAuthError)
 
@@ -810,9 +932,11 @@ internal fun rememberVoiceCockpitState(
             sendGraceRemainingMsState = sendGraceRemainingMsState,
             isOrganizingDraftState = isOrganizingDraftState,
             responseFeedState = responseFeedState,
+            cuePackWarmStateState = cuePackWarmStateState,
             showSessionPickerState = showSessionPickerState,
             showVoicePickerState = showVoicePickerState,
             voicePickerInitialEngineState = voicePickerInitialEngineState,
+            voicePickerInitialRoleState = voicePickerInitialRoleState,
             mlKitTtsSpeaker = mlKitTtsSpeaker,
             initialPinSco = boundService?.pinBluetoothSco ?: false,
             onSessionExpiredAuthErrorState = onSessionExpiredAuthErrorState,
@@ -847,6 +971,9 @@ internal fun rememberVoiceCockpitState(
             state.refreshMlKitTtsStatus()
             if (state.systemVoices.isEmpty()) {
                 state.refreshSystemVoices()
+            }
+            if (state.voices.isEmpty() && !state.isLoadingVoices) {
+                state.refreshVoices()
             }
         }
     }
@@ -919,32 +1046,43 @@ internal fun VoiceCockpitSheets(
     if (state.showVoicePicker) {
         VoicePickerSheet(
             ttsPipeline = state.ttsPipeline,
+            roleProfiles = state.roleVoiceProfiles,
             initialEngine = state.voicePickerInitialEngine,
+            initialRole = state.voicePickerInitialRole,
             geminiVoices = state.voices,
-            selectedGeminiVoiceId = state.selectedVoice,
             isLoadingGemini = state.isLoadingVoices,
             geminiError = state.voicesError,
             onRefreshGemini = { state.refreshVoices() },
-            onSelectGeminiVoice = { voice -> state.selectGeminiVoice(voice) },
+            onSelectGeminiVoice = { role, voiceId -> state.selectRoleGeminiVoice(role, voiceId) },
             mlKitStatus = state.mlKitTtsStatus,
             mlKitVoices = state.mlKitTtsVoices,
-            selectedMlKitVoice = state.selectedMlKitTtsVoice,
             mlKitDownloadStatus = state.mlKitTtsDownloadStatus,
             isDownloadingMlKit = state.isDownloadingMlKitTts,
             onRefreshMlKit = { state.refreshMlKitTtsStatus() },
-            onSelectMlKitVoice = { voiceName -> state.selectMlKitTtsVoice(voiceName) },
+            onSelectMlKitVoice = { role, voiceName -> state.selectRoleMlKitVoice(role, voiceName) },
             onDownloadMlKitVoice = { voiceName ->
                 state.downloadMlKitTtsVoice(voiceName ?: state.selectedMlKitTtsVoice)
             },
-            selectedOpenAiVoice = state.selectedOpenAiVoice,
-            onSelectOpenAiVoice = { voiceId -> state.selectOpenAiVoice(voiceId) },
+            onSelectOpenAiVoice = { role, voiceId -> state.selectRoleOpenAiVoice(role, voiceId) },
             systemVoices = state.systemVoices,
-            selectedSystemVoice = state.selectedSystemVoice,
             isLoadingSystemVoices = state.isLoadingSystemVoices,
             onRefreshSystemVoices = { state.refreshSystemVoices() },
-            onSelectSystemVoice = { voiceName -> state.selectSystemVoice(voiceName) },
+            onSelectSystemVoice = { role, voiceName -> state.selectRoleSystemVoice(role, voiceName) },
+            onSetRolePreferredEngine = { role, engine -> state.setRolePreferredEngine(role, engine) },
+            onPreviewVoice = { role, engine, voiceId ->
+                state.previewVoiceSample(
+                    role = role,
+                    engine = engine,
+                    voiceId = voiceId,
+                    kokoroSpeakerId = state.roleVoiceProfiles[role].kokoroSpeakerId
+                        ?: TtsClient.DEFAULT_KOKORO_SPEAKER_ID,
+                )
+            },
             onOpenSettings = onOpenSettings,
-            onDismiss = { state.showVoicePicker = false },
+            onDismiss = {
+                state.stopVoicePreview()
+                state.showVoicePicker = false
+            },
         )
     }
 }

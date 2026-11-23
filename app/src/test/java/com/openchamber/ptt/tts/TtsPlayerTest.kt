@@ -6,14 +6,21 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
+import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import okio.Buffer
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
@@ -24,7 +31,9 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class TtsPlayerTest {
     @get:Rule
@@ -1086,5 +1095,748 @@ class TtsPlayerTest {
 
         // 12_000ms cap / 200ms chunk = 60 chunks
         assertEquals(60, keepAliveChunks.size)
+    }
+
+    @Test
+    fun `speakPreview synthesizes requested engine raw without summary callback, caches audio, and does not fallback`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24_000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x0A, 0x0B, 0x0C, 0x0D),
+        )
+        // 1. Gemini preview succeeds
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+        // 2. OpenAI preview fails -> must throw without silently falling back to Android System TTS
+        server.enqueue(MockResponse().setResponseCode(503))
+
+        val playedWavs = mutableListOf<WavAudio>()
+        val spokenSummaries = mutableListOf<String>()
+        val statusEvents = mutableListOf<String>()
+        val stats = mutableListOf<TtsSpeakStats>()
+        val systemCalls = mutableListOf<Pair<String, String?>>()
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playedWavs += wav
+            }
+            override fun stopNow() = Unit
+        }
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
+                systemCalls += text to preferredVoiceName
+            }
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val cache = TtsCache(tempFolder.newFolder("preview_cache"))
+        try {
+            val player = TtsPlayer(
+                ttsClient = TtsClient(OpenChamberHttp.createClient(), ttsCache = cache),
+                pcmPlayerFactory = { fakeTrack },
+                systemTtsSpeaker = fakeSystem,
+                ioDispatcher = Dispatchers.Unconfined,
+                onStatusEvent = { statusEvents += it },
+                onSpokenTextSynthesized = { spokenSummaries += it },
+                onSpeakStats = { stats += it },
+            )
+            val baseUrl = server.url("/").toString().trimEnd('/')
+
+            // First Gemini preview hits network and populates cache
+            player.speakPreview(
+                serverUrl = baseUrl,
+                text = "Summarizing.",
+                engine = TtsEngine.GEMINI_BRIDGE,
+                voiceId = "Zephyr",
+                role = VoiceRole.CUE,
+            )
+            assertEquals(1, server.requestCount)
+            val reqBody = server.takeRequest().body.readUtf8()
+            assertTrue(reqBody.contains("\"voice\":\"Zephyr\""))
+            assertTrue(reqBody.contains("Summarizing."))
+            assertTrue(spokenSummaries.isEmpty())
+            assertTrue(statusEvents.isEmpty())
+            assertEquals(1, stats.size)
+            assertEquals(TtsPlayer.KIND_PREVIEW, stats[0].kind)
+            assertEquals(VoiceRole.CUE, stats[0].role)
+            assertEquals("Zephyr", stats[0].voiceId)
+            assertEquals(TtsInputMode.RAW, stats[0].inputMode)
+            assertFalse(stats[0].audioCacheHit)
+
+            // Second identical preview hits TtsCache with 0 new network calls
+            player.speakPreview(
+                serverUrl = baseUrl,
+                text = "Summarizing.",
+                engine = TtsEngine.GEMINI_BRIDGE,
+                voiceId = "Zephyr",
+                role = VoiceRole.CUE,
+            )
+            assertEquals(1, server.requestCount)
+            assertTrue(stats[1].audioCacheHit)
+            assertEquals(2, playedWavs.size)
+
+            // Explicit Android System preview routes requested voice directly
+            player.speakPreview(
+                serverUrl = "",
+                text = "Switched to Spoken mode and Balanced detail.",
+                engine = TtsEngine.ANDROID_SYSTEM,
+                voiceId = "en-us-x-sfg-local",
+                role = VoiceRole.OPERATOR,
+            )
+            assertEquals(listOf("Switched to Spoken mode and Balanced detail." to "en-us-x-sfg-local"), systemCalls)
+            assertEquals(VoiceRole.OPERATOR, stats[2].role)
+            assertEquals(TtsEngine.ANDROID_SYSTEM, stats[2].engine)
+
+            // Failing OpenAI preview propagates error instead of falling back to System TTS
+            var caught: TtsException? = null
+            try {
+                player.speakPreview(
+                    serverUrl = baseUrl,
+                    text = "Build succeeded cleanly.",
+                    engine = TtsEngine.OPENAI_CLOUD,
+                    voiceId = "onyx",
+                    role = VoiceRole.AGENT,
+                )
+            } catch (ex: TtsException) {
+                caught = ex
+            }
+            assertEquals(503, caught?.statusCode)
+            assertEquals(1, systemCalls.size)
+        } finally {
+            cache.close()
+        }
+    }
+
+    @Test
+    fun `concurrent speakWithResult calls queue FIFO on playbackMutex without cancelling caller parent jobs`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24_000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        val synthesizedOrder = CopyOnWriteArrayList<String>()
+        val fakeClient = object : TtsClient(OpenChamberHttp.createClient()) {
+            override suspend fun prepareTextForTtsDetailed(
+                serverUrl: String,
+                text: String,
+                inputMode: TtsInputMode,
+                sessionLabel: String?,
+                detailLevel: SpokenDetailLevel,
+            ): PreparedSpeechText = PreparedSpeechText(text = text, cacheHit = false)
+
+            override suspend fun synthesizeWithEngineDetailed(
+                serverUrl: String,
+                text: String,
+                voice: String,
+                engine: TtsEngine,
+                kokoroSpeakerId: Int,
+            ): SynthesizedSpeechAudio {
+                synthesizedOrder += text
+                return SynthesizedSpeechAudio(
+                    audio = TtsAudio(bytes = wavBytes, contentType = "audio/wav"),
+                    cacheHit = false,
+                )
+            }
+        }
+
+        val playStartedGates = listOf(
+            CompletableDeferred<Unit>(),
+            CompletableDeferred<Unit>(),
+            CompletableDeferred<Unit>(),
+        )
+        val playReleaseGates = listOf(
+            CompletableDeferred<Unit>(),
+            CompletableDeferred<Unit>(),
+            CompletableDeferred<Unit>(),
+        )
+        val playIndex = AtomicInteger(0)
+        val activeConcurrency = AtomicInteger(0)
+        val maxConcurrency = AtomicInteger(0)
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                val cur = activeConcurrency.incrementAndGet()
+                maxConcurrency.accumulateAndGet(cur) { a, b -> maxOf(a, b) }
+                val idx = playIndex.getAndIncrement()
+                try {
+                    playStartedGates[idx].complete(Unit)
+                    playReleaseGates[idx].await()
+                } finally {
+                    activeConcurrency.decrementAndGet()
+                }
+            }
+
+            override fun stopNow() = Unit
+        }
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val messageCallbacks = CopyOnWriteArrayList<Pair<String?, String>>()
+        val player = TtsPlayer(
+            ttsClient = fakeClient,
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+            onSpokenTextSynthesizedForMessage = { msgId, spoken -> messageCallbacks += msgId to spoken },
+        )
+
+        val job1 = async { player.speakWithResult("http://localhost:4096", "First", messageId = "m1") }
+        playStartedGates[0].await()
+        assertTrue(player.isSpeaking)
+
+        val job2 = async { player.speakWithResult("http://localhost:4096", "Second", messageId = "m2") }
+        yield()
+        val job3 = async { player.speakWithResult("http://localhost:4096", "Third", messageId = "m3") }
+        yield()
+
+        assertEquals(listOf("First"), synthesizedOrder.toList())
+        assertFalse(job1.isCancelled)
+        assertFalse(job2.isCancelled)
+        assertFalse(job3.isCancelled)
+
+        playReleaseGates[0].complete(Unit)
+        playStartedGates[1].await()
+        assertEquals(listOf("First", "Second"), synthesizedOrder.toList())
+        assertFalse(job1.isCancelled)
+
+        playReleaseGates[1].complete(Unit)
+        playStartedGates[2].await()
+        assertEquals(listOf("First", "Second", "Third"), synthesizedOrder.toList())
+
+        playReleaseGates[2].complete(Unit)
+
+        assertEquals(TtsPlaybackResult.COMPLETED, job1.await())
+        assertEquals(TtsPlaybackResult.COMPLETED, job2.await())
+        assertEquals(TtsPlaybackResult.COMPLETED, job3.await())
+        assertEquals(1, maxConcurrency.get())
+        assertEquals(listOf("m1" to "First", "m2" to "Second", "m3" to "Third"), messageCallbacks.toList())
+        assertFalse(player.isSpeaking)
+    }
+
+    @Test
+    fun `stop during stalled cloud synthesis aborts in under 50ms, returns ABORTED to active and queued callers, and allows subsequent playback`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24_000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x0A, 0x0B, 0x0C, 0x0D),
+        )
+        val stalledRequestArrived = CompletableDeferred<Unit>()
+        val requestedBodies = CopyOnWriteArrayList<String>()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = request.body.readUtf8()
+                requestedBodies += body
+                return if (body.contains("Stalled cloud TTS")) {
+                    stalledRequestArrived.complete(Unit)
+                    MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE)
+                } else {
+                    MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("Content-Type", "audio/wav")
+                        .setBody(Buffer().write(wavBytes))
+                }
+            }
+        }
+
+        val playedPcms = CopyOnWriteArrayList<ByteArray>()
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playedPcms += wav.pcmData
+            }
+
+            override fun stopNow() = Unit
+        }
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = Dispatchers.IO,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        withContext(Dispatchers.Default) {
+            withTimeout(5_000L) {
+                val caller1 = async {
+                    player.speakWithResult(baseUrl, "Stalled cloud TTS", messageId = "m-stalled")
+                }
+                stalledRequestArrived.await()
+                assertTrue(player.isSpeaking)
+                assertFalse(player.isAudibleOutputActive)
+
+                val caller2Entered = CompletableDeferred<Unit>()
+                val caller2 = async {
+                    caller2Entered.complete(Unit)
+                    player.speakWithResult(baseUrl, "Queued before stop", messageId = "m-queued")
+                }
+                caller2Entered.await()
+                delay(25L)
+
+                val stopStartNs = System.nanoTime()
+                player.stop()
+                val res1 = caller1.await()
+                val res2 = caller2.await()
+                val abortElapsedMs = (System.nanoTime() - stopStartNs) / 1_000_000L
+
+                assertEquals(TtsPlaybackResult.ABORTED, res1)
+                assertEquals(TtsPlaybackResult.ABORTED, res2)
+                assertFalse(caller1.isCancelled)
+                assertFalse(caller2.isCancelled)
+                assertFalse(player.isSpeaking)
+                assertFalse(player.isAudibleOutputActive)
+                assertTrue(
+                    "Expected stalled synthesis abort in < 1000ms, took ${abortElapsedMs}ms",
+                    abortElapsedMs < 1_000L,
+                )
+                assertTrue(playedPcms.isEmpty())
+
+                val res3 = player.speakWithResult(baseUrl, "Fresh after stop", messageId = "m-fresh")
+                assertEquals(TtsPlaybackResult.COMPLETED, res3)
+                assertEquals(1, playedPcms.size)
+                assertArrayEquals(byteArrayOf(0x0A, 0x0B, 0x0C, 0x0D), playedPcms[0])
+                assertFalse(requestedBodies.any { it.contains("Queued before stop") })
+            }
+        }
+    }
+
+    @Test
+    fun `cancelling speakPreview caller job halts hardware and releases mutex for next speakPreview without affecting abortEpoch`() = runTest {
+        val wav1 = WavParserTest.buildStandardWav(24_000, 1, 16, byteArrayOf(0x11, 0x22, 0x33, 0x44))
+        val wav2 = WavParserTest.buildStandardWav(24_000, 1, 16, byteArrayOf(0x55, 0x66, 0x77, 0x08))
+        val wav3 = WavParserTest.buildStandardWav(24_000, 1, 16, byteArrayOf(0x09, 0x0A, 0x0B, 0x0C))
+
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val body = request.body.readUtf8()
+                val bytes = when {
+                    body.contains("Preview one") -> wav1
+                    body.contains("Preview two") -> wav2
+                    else -> wav3
+                }
+                return MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "audio/wav")
+                    .setBody(Buffer().write(bytes))
+            }
+        }
+
+        val firstPlayEntered = CompletableDeferred<Unit>()
+        val firstPlayGate = CompletableDeferred<Unit>()
+        val firstStopNowCalled = CompletableDeferred<Unit>()
+        val playedPcms = CopyOnWriteArrayList<ByteArray>()
+        val playCount = AtomicInteger(0)
+
+        val fakeTrackFactory = {
+            val idx = playCount.getAndIncrement()
+            object : PcmTrackPlayer {
+                override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                    if (idx == 0) {
+                        firstPlayEntered.complete(Unit)
+                        firstPlayGate.await()
+                    } else {
+                        playedPcms += wav.pcmData
+                    }
+                }
+
+                override fun stopNow() {
+                    if (idx == 0) {
+                        firstStopNowCalled.complete(Unit)
+                        firstPlayGate.cancel(CancellationException("Preview 1 stopped"))
+                    }
+                }
+            }
+        }
+        val systemStopCount = AtomicInteger(0)
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override fun stop() {
+                systemStopCount.incrementAndGet()
+            }
+            override fun shutdown() = Unit
+        }
+
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = fakeTrackFactory,
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = Dispatchers.IO,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        withContext(Dispatchers.Default) {
+            withTimeout(5_000L) {
+                val preview1Job = launch {
+                    player.speakPreview(baseUrl, "Preview one", TtsEngine.GEMINI_BRIDGE, voiceId = "Kore")
+                }
+                firstPlayEntered.await()
+
+                val preview2Entered = CompletableDeferred<Unit>()
+                val preview2Job = launch {
+                    preview2Entered.complete(Unit)
+                    player.speakPreview(baseUrl, "Preview two", TtsEngine.GEMINI_BRIDGE, voiceId = "Puck")
+                }
+                preview2Entered.await()
+                delay(20L)
+
+                val queuedSpeakEntered = CompletableDeferred<Unit>()
+                val queuedSpeak = async {
+                    queuedSpeakEntered.complete(Unit)
+                    player.speakWithResult(baseUrl, "Queued speak", messageId = "m-queued")
+                }
+                queuedSpeakEntered.await()
+                delay(20L)
+
+                preview1Job.cancel()
+                preview1Job.join()
+                assertTrue(preview1Job.isCancelled)
+                firstStopNowCalled.await()
+                assertTrue(systemStopCount.get() >= 1)
+
+                preview2Job.join()
+                assertFalse(preview2Job.isCancelled)
+                assertEquals(TtsPlaybackResult.COMPLETED, queuedSpeak.await())
+                assertEquals(2, playedPcms.size)
+                assertTrue(playedPcms.any { it.contentEquals(wav2.copyOfRange(44, wav2.size)) })
+                assertTrue(playedPcms.any { it.contentEquals(wav3.copyOfRange(44, wav3.size)) })
+                assertFalse(player.isSpeaking)
+                assertFalse(player.isAudibleOutputActive)
+            }
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `isAudibleOutputActive tracks only sink playback while onAudibleStart reports speech duration for cloud and on-device engines`() = runTest {
+        val speechPcm = ByteArray(24_000) { (it and 0x7F).toByte() } // 24kHz mono 16-bit -> exact 500ms
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24_000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = speechPcm,
+        )
+
+        val playerRef = arrayOfNulls<TtsPlayer>(1)
+        val prepObservedAudible = AtomicBoolean(true)
+        val synthStartObservedAudible = AtomicBoolean(true)
+        val synthEndObservedAudible = AtomicBoolean(true)
+        val audibleDuringKeepAlive = CopyOnWriteArrayList<Boolean>()
+        val cloudAudibleEvents = CopyOnWriteArrayList<Pair<String?, Long?>>()
+        var playObservedAudible = false
+        var playedWavSize = 0
+        var playedAudibleSnapshot = emptyList<Pair<String?, Long?>>()
+
+        val fakeClient = object : TtsClient(OpenChamberHttp.createClient()) {
+            override suspend fun prepareTextForTtsDetailed(
+                serverUrl: String,
+                text: String,
+                inputMode: TtsInputMode,
+                sessionLabel: String?,
+                detailLevel: SpokenDetailLevel,
+            ): PreparedSpeechText {
+                val p = playerRef[0]!!
+                assertTrue(p.isSpeaking)
+                prepObservedAudible.set(p.isAudibleOutputActive)
+                return PreparedSpeechText(text = "Prepared cloud reply.", cacheHit = false)
+            }
+
+            override suspend fun synthesizeWithEngineDetailed(
+                serverUrl: String,
+                text: String,
+                voice: String,
+                engine: TtsEngine,
+                kokoroSpeakerId: Int,
+            ): SynthesizedSpeechAudio {
+                val p = playerRef[0]!!
+                assertTrue(p.isSpeaking)
+                synthStartObservedAudible.set(p.isAudibleOutputActive)
+                delay(600L)
+                synthEndObservedAudible.set(p.isAudibleOutputActive)
+                return SynthesizedSpeechAudio(
+                    audio = TtsAudio(bytes = wavBytes, contentType = "audio/wav"),
+                    cacheHit = false,
+                )
+            }
+        }
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                val p = playerRef[0]!!
+                assertTrue(p.isSpeaking)
+                playObservedAudible = p.isAudibleOutputActive
+                playedWavSize = wav.pcmData.size
+                playedAudibleSnapshot = cloudAudibleEvents.toList()
+            }
+
+            override fun stopNow() = Unit
+        }
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val coordinator = AudioOutputCoordinator(clockElapsedMs = { testScheduler.currentTime })
+        val cloudPlayer = TtsPlayer(
+            ttsClient = fakeClient,
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = StandardTestDispatcher(testScheduler),
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.SUMMARIZED },
+            audioOutputCoordinator = coordinator,
+            latencyBridgeDelayMs = 450L,
+            keepAliveSinkPlayer = { _, _ ->
+                audibleDuringKeepAlive += playerRef[0]!!.isAudibleOutputActive
+            },
+        )
+        playerRef[0] = cloudPlayer
+
+        val cloudResult = cloudPlayer.speakWithResult(
+            serverUrl = "http://localhost:4096",
+            text = "Raw markdown reply",
+            messageId = "msg-cloud",
+            onAudibleStart = { id, durMs -> cloudAudibleEvents += id to durMs },
+        )
+
+        assertEquals(TtsPlaybackResult.COMPLETED, cloudResult)
+        assertFalse(prepObservedAudible.get())
+        assertFalse(synthStartObservedAudible.get())
+        assertFalse(synthEndObservedAudible.get())
+        assertTrue(audibleDuringKeepAlive.isNotEmpty() && audibleDuringKeepAlive.all { !it })
+        assertTrue(playObservedAudible)
+        assertEquals(speechPcm.size, playedWavSize) // keep-alive warmed sink -> 0ms cold preroll, exact 500ms duration
+        assertEquals(listOf("msg-cloud" to 500L), playedAudibleSnapshot)
+        assertEquals(listOf("msg-cloud" to 500L), cloudAudibleEvents.toList())
+        assertFalse(cloudPlayer.isAudibleOutputActive)
+        assertFalse(cloudPlayer.isSpeaking)
+
+        // Verify cold sink without bridge prepends 160ms preroll while onAudibleStart still reports exact speech WAV duration (500ms)
+        cloudAudibleEvents.clear()
+        playObservedAudible = false
+        val coldCoordinator = AudioOutputCoordinator(clockElapsedMs = { testScheduler.currentTime })
+        val coldClient = object : TtsClient(OpenChamberHttp.createClient()) {
+            override suspend fun prepareTextForTtsDetailed(
+                serverUrl: String,
+                text: String,
+                inputMode: TtsInputMode,
+                sessionLabel: String?,
+                detailLevel: SpokenDetailLevel,
+            ): PreparedSpeechText = PreparedSpeechText(text = text, cacheHit = true)
+
+            override suspend fun synthesizeWithEngineDetailed(
+                serverUrl: String,
+                text: String,
+                voice: String,
+                engine: TtsEngine,
+                kokoroSpeakerId: Int,
+            ): SynthesizedSpeechAudio = SynthesizedSpeechAudio(
+                audio = TtsAudio(bytes = wavBytes, contentType = "audio/wav"),
+                cacheHit = true,
+            )
+        }
+        val coldPlayer = TtsPlayer(
+            ttsClient = coldClient,
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = StandardTestDispatcher(testScheduler),
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+            audioOutputCoordinator = coldCoordinator,
+        )
+        playerRef[0] = coldPlayer
+        val coldRes = coldPlayer.speakWithResult(
+            serverUrl = "http://localhost:4096",
+            text = "Cold reply.",
+            messageId = "msg-cold",
+            onAudibleStart = { id, durMs -> cloudAudibleEvents += id to durMs },
+        )
+        assertEquals(TtsPlaybackResult.COMPLETED, coldRes)
+        assertTrue(playObservedAudible)
+        assertEquals((24_000 * 160 / 1000) * 2 + speechPcm.size, playedWavSize)
+        assertEquals(listOf("msg-cold" to 500L), playedAudibleSnapshot)
+        assertEquals(listOf("msg-cold" to 500L), cloudAudibleEvents.toList())
+        assertFalse(coldPlayer.isAudibleOutputActive)
+        assertFalse(coldPlayer.isSpeaking)
+
+        // Verify ANDROID_SYSTEM holds audibleOutputFlag false during init delay and fires onAudibleStart on playback start
+        val sysPlayerRef = arrayOfNulls<TtsPlayer>(1)
+        val sysAudibleEvents = CopyOnWriteArrayList<Pair<String?, Long?>>()
+        var sysObservedFalseDuringInit = false
+        var sysObservedTrueAfterStart = false
+        val delayedSystemSpeaker = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+
+            override suspend fun speak(
+                text: String,
+                preferredVoiceName: String?,
+                useCommunicationUsage: Boolean,
+                onPlaybackStarted: (() -> Unit)?,
+            ) {
+                val p = sysPlayerRef[0]!!
+                assertTrue(p.isSpeaking)
+                sysObservedFalseDuringInit = !p.isAudibleOutputActive && sysAudibleEvents.isEmpty()
+                delay(50L)
+                onPlaybackStarted?.invoke()
+                sysObservedTrueAfterStart = p.isAudibleOutputActive
+            }
+
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+        val sysPlayer = TtsPlayer(
+            ttsClient = coldClient,
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = delayedSystemSpeaker,
+            ioDispatcher = StandardTestDispatcher(testScheduler),
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+        sysPlayerRef[0] = sysPlayer
+
+        val sysResult = sysPlayer.speakWithResult(
+            serverUrl = "http://localhost:4096",
+            text = "Hello system",
+            messageId = "msg-sys",
+            onAudibleStart = { id, durMs -> sysAudibleEvents += id to durMs },
+        )
+        assertEquals(TtsPlaybackResult.COMPLETED, sysResult)
+        assertTrue(sysObservedFalseDuringInit)
+        assertTrue(sysObservedTrueAfterStart)
+        assertEquals(listOf("msg-sys" to ("Hello system".length * 65L).coerceAtLeast(600L)), sysAudibleEvents.toList())
+        assertFalse(sysPlayer.isAudibleOutputActive)
+        assertFalse(sysPlayer.isSpeaking)
+
+        // Short system utterance enforces >= 600ms floor
+        sysAudibleEvents.clear()
+        val shortSysRes = sysPlayer.speakWithResult(
+            serverUrl = "http://localhost:4096",
+            text = "Hi",
+            messageId = "msg-short",
+            onAudibleStart = { id, durMs -> sysAudibleEvents += id to durMs },
+        )
+        assertEquals(TtsPlaybackResult.COMPLETED, shortSysRes)
+        assertEquals(listOf("msg-short" to 600L), sysAudibleEvents.toList())
+    }
+
+    @Test
+    fun `fallback after premature onPlaybackStarted triggers onAudibleReset before succeeding engine plays`() = runTest {
+        val events = CopyOnWriteArrayList<String>()
+        val unavailableMlKit = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(
+                text: String,
+                preferredVoiceName: String?,
+                useCommunicationUsage: Boolean,
+                onPlaybackStarted: (() -> Unit)?,
+            ) {
+                throw TtsException(message = "ML Kit GenAI TTS unavailable")
+            }
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+        val lateFailMlKit = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(
+                text: String,
+                preferredVoiceName: String?,
+                useCommunicationUsage: Boolean,
+                onPlaybackStarted: (() -> Unit)?,
+            ) {
+                onPlaybackStarted?.invoke()
+                throw TtsException(message = "ML Kit synthesis error mid-stream")
+            }
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+        val succeedingSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(
+                text: String,
+                preferredVoiceName: String?,
+                useCommunicationUsage: Boolean,
+                onPlaybackStarted: (() -> Unit)?,
+            ) {
+                onPlaybackStarted?.invoke()
+            }
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+
+        // 1. Unavailable ML Kit overriding 4-arg speak never fires onAudibleStart or onAudibleReset
+        val p1 = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = succeedingSystem,
+            mlKitTtsSpeaker = unavailableMlKit,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = {
+                listOf(
+                    TtsEngineOption(TtsEngine.MLKIT_GENAI, enabled = true),
+                    TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true),
+                )
+            },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+        val r1 = p1.speakWithResult(
+            serverUrl = "http://localhost:4096",
+            text = "Hello",
+            messageId = "m1",
+            onAudibleStart = { id, _ -> events += "start:$id" },
+            onAudibleReset = { id -> events += "reset:$id" },
+        )
+        assertEquals(TtsPlaybackResult.COMPLETED, r1)
+        assertEquals(listOf("start:m1"), events.toList())
+
+        // 2. Late mid-utterance failure after onPlaybackStarted fires onAudibleReset before fallback succeeds
+        events.clear()
+        val p2 = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = succeedingSystem,
+            mlKitTtsSpeaker = lateFailMlKit,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = {
+                listOf(
+                    TtsEngineOption(TtsEngine.MLKIT_GENAI, enabled = true),
+                    TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true),
+                )
+            },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+        val r2 = p2.speakWithResult(
+            serverUrl = "http://localhost:4096",
+            text = "Hello",
+            messageId = "m2",
+            onAudibleStart = { id, _ -> events += "start:$id" },
+            onAudibleReset = { id -> events += "reset:$id" },
+        )
+        assertEquals(TtsPlaybackResult.COMPLETED, r2)
+        assertEquals(listOf("start:m2", "reset:m2", "start:m2"), events.toList())
     }
 }

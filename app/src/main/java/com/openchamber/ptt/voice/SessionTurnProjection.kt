@@ -243,12 +243,11 @@ object SessionTurnProjection {
             lastTurn = lastTurn,
         )
 
-        val hasLaterBoundary = computeHasLaterSiblingOrIdle(chronologicalRecords)
-        val hasIncompleteStreamingAssistant = lastTurn.responses.any { !it.isCompleted } ||
-            (trailingRecordsStartIdx until chronologicalRecords.size).any { idx ->
-                val rec = chronologicalRecords[idx]
-                rec is ParsedSessionRecord.AssistantRecord && !isAssistantCompleted(rec, hasLaterBoundary[idx])
-            }
+        val hasIncompleteStreamingAssistant = hasTrailingIncompleteAssistant(
+            chronologicalRecords = chronologicalRecords,
+            lastTurn = lastTurn,
+            trailingRecordsStartIdx = trailingRecordsStartIdx,
+        )
 
         if (!hasIncompleteStreamingAssistant) {
             return chronologicalRecords.last().id
@@ -261,6 +260,196 @@ object SessionTurnProjection {
             chronologicalRecords[trailingRecordsStartIdx - 1].id
         } else {
             null
+        }
+    }
+
+    internal fun hasIncompleteAssistantFrom(
+        chronologicalRecords: List<ParsedSessionRecord>,
+        startIdx: Int,
+    ): Boolean {
+        if (chronologicalRecords.isEmpty() || startIdx >= chronologicalRecords.size) return false
+        val safeStart = startIdx.coerceAtLeast(0)
+        val hasLaterBoundary = computeHasLaterSiblingOrIdle(chronologicalRecords)
+        return (safeStart until chronologicalRecords.size).any { idx ->
+            val rec = chronologicalRecords[idx]
+            rec is ParsedSessionRecord.AssistantRecord && !isAssistantCompleted(rec, hasLaterBoundary[idx])
+        }
+    }
+
+    internal fun computeRolledBackSettledAnchor(
+        turns: List<SessionTurn>,
+        records: List<ParsedSessionRecord>,
+        settledTurnsToStepBack: Int,
+        minFloorMessageId: String?,
+        minFloorCreatedAtMs: Long,
+    ): Pair<String, Long> {
+        if (settledTurnsToStepBack <= 0) {
+            val baseId = computeLatestSettledMessageId(records, turns) ?: SESSION_START_BASELINE
+            val baseTs = if (baseId == SESSION_START_BASELINE) {
+                0L
+            } else {
+                records.firstOrNull { it.id == baseId }?.createdAtMs ?: 0L
+            }
+            return clampAnchorToFloor(
+                candidateId = baseId,
+                candidateCreatedAtMs = baseTs,
+                records = records,
+                minFloorMessageId = minFloorMessageId,
+                minFloorCreatedAtMs = minFloorCreatedAtMs,
+            )
+        }
+
+        val lastTurn = turns.lastOrNull()
+        val lastTurnHasIncompleteAssistant = if (lastTurn != null && !lastTurn.isIdle) {
+            val previousSettledTurn = if (turns.size >= 2) turns[turns.lastIndex - 1] else null
+            val trailingStartIdx = resolveTrailingRecordsStartIdx(
+                chronologicalRecords = records,
+                previousSettledTurn = previousSettledTurn,
+                lastTurn = lastTurn,
+            )
+            hasTrailingIncompleteAssistant(
+                chronologicalRecords = records,
+                lastTurn = lastTurn,
+                trailingRecordsStartIdx = trailingStartIdx,
+            )
+        } else {
+            false
+        }
+
+        var latestSettledIdx = -1
+        for (idx in turns.lastIndex downTo 0) {
+            if (idx == turns.lastIndex && lastTurnHasIncompleteAssistant) continue
+            if (turns[idx].responses.any { it.isCompleted }) {
+                latestSettledIdx = idx
+                break
+            }
+        }
+
+        val targetIdx = latestSettledIdx - settledTurnsToStepBack
+        val (candidateId, candidateTs) = if (latestSettledIdx < 0 || targetIdx < 0) {
+            SESSION_START_BASELINE to 0L
+        } else {
+            val targetTurn = turns[targetIdx]
+            val settledId = targetTurn.latestMessageId?.trim()?.takeIf { it.isNotEmpty() }
+                ?: targetTurn.responses.lastOrNull()?.messageId
+                ?: SESSION_START_BASELINE
+            val settledTs = if (settledId == SESSION_START_BASELINE) {
+                0L
+            } else {
+                records.firstOrNull { it.id == settledId }?.createdAtMs
+                    ?: targetTurn.responses.lastOrNull()?.createdAtMs
+                    ?: 0L
+            }
+            settledId to settledTs
+        }
+
+        return clampAnchorToFloor(
+            candidateId = candidateId,
+            candidateCreatedAtMs = candidateTs,
+            records = records,
+            minFloorMessageId = minFloorMessageId,
+            minFloorCreatedAtMs = minFloorCreatedAtMs,
+        )
+    }
+
+    internal fun clampAnchorToFloor(
+        candidateId: String,
+        candidateCreatedAtMs: Long,
+        records: List<ParsedSessionRecord>,
+        minFloorMessageId: String?,
+        minFloorCreatedAtMs: Long,
+    ): Pair<String, Long> {
+        val floorId = minFloorMessageId?.trim()?.takeIf { it.isNotEmpty() }
+        val floorTs = minFloorCreatedAtMs.coerceAtLeast(0L)
+        if ((floorId == null || floorId == SESSION_START_BASELINE) && floorTs <= 0L) {
+            return candidateId to candidateCreatedAtMs
+        }
+
+        val floorIdx = if (floorId != null && floorId != SESSION_START_BASELINE) {
+            records.indexOfFirst { it.id == floorId }
+        } else {
+            -1
+        }
+        val resolvedFloorTs = if (floorIdx >= 0) {
+            maxOf(floorTs, records[floorIdx].createdAtMs.coerceAtLeast(0L))
+        } else {
+            floorTs
+        }
+
+        if (candidateId == SESSION_START_BASELINE) {
+            return if (floorId != null && floorId != SESSION_START_BASELINE) {
+                floorId to resolvedFloorTs
+            } else if (resolvedFloorTs > 0L) {
+                val fallbackId = records.lastOrNull { it.createdAtMs in 1L..resolvedFloorTs }?.id
+                    ?: SESSION_START_BASELINE
+                fallbackId to resolvedFloorTs
+            } else {
+                candidateId to candidateCreatedAtMs
+            }
+        }
+
+        val candidateIdx = records.indexOfFirst { it.id == candidateId }
+        if (candidateIdx >= 0 && floorIdx >= 0) {
+            return if (candidateIdx < floorIdx) {
+                floorId!! to resolvedFloorTs
+            } else {
+                candidateId to candidateCreatedAtMs
+            }
+        }
+
+        if (resolvedFloorTs > 0L && candidateCreatedAtMs > 0L && candidateCreatedAtMs < resolvedFloorTs) {
+            return (floorId ?: candidateId) to resolvedFloorTs
+        }
+
+        return candidateId to candidateCreatedAtMs
+    }
+
+    internal fun resolveHigherFloor(
+        records: List<ParsedSessionRecord>,
+        firstId: String?,
+        firstCreatedAtMs: Long,
+        secondId: String?,
+        secondCreatedAtMs: Long,
+    ): Pair<String?, Long> {
+        val aId = firstId?.trim()?.takeIf { it.isNotEmpty() }
+        val aTs = firstCreatedAtMs.coerceAtLeast(0L)
+        val bId = secondId?.trim()?.takeIf { it.isNotEmpty() }
+        val bTs = secondCreatedAtMs.coerceAtLeast(0L)
+        if (aId == null && aTs <= 0L) return bId to bTs
+        if (bId == null && bTs <= 0L) return aId to aTs
+
+        val aIdx = aId?.takeIf { it != SESSION_START_BASELINE }?.let { id -> records.indexOfFirst { it.id == id } } ?: -1
+        val bIdx = bId?.takeIf { it != SESSION_START_BASELINE }?.let { id -> records.indexOfFirst { it.id == id } } ?: -1
+        if (aIdx >= 0 && bIdx >= 0) {
+            return if (bIdx >= aIdx) {
+                bId to maxOf(bTs, records[bIdx].createdAtMs.coerceAtLeast(0L))
+            } else {
+                aId to maxOf(aTs, records[aIdx].createdAtMs.coerceAtLeast(0L))
+            }
+        }
+        if (aIdx >= 0 && bId == SESSION_START_BASELINE) {
+            return aId to maxOf(aTs, records[aIdx].createdAtMs.coerceAtLeast(0L))
+        }
+        if (bIdx >= 0 && aId == SESSION_START_BASELINE) {
+            return bId to maxOf(bTs, records[bIdx].createdAtMs.coerceAtLeast(0L))
+        }
+        if (bTs > aTs) return bId to bTs
+        if (aTs > bTs) return aId to aTs
+        return if (bId != null && bId != SESSION_START_BASELINE) bId to bTs else aId to aTs
+    }
+
+    private fun hasTrailingIncompleteAssistant(
+        chronologicalRecords: List<ParsedSessionRecord>,
+        lastTurn: SessionTurn,
+        trailingRecordsStartIdx: Int,
+    ): Boolean {
+        if (lastTurn.isIdle) return false
+        if (lastTurn.responses.any { !it.isCompleted }) return true
+        if (chronologicalRecords.isEmpty()) return false
+        val hasLaterBoundary = computeHasLaterSiblingOrIdle(chronologicalRecords)
+        return (trailingRecordsStartIdx until chronologicalRecords.size).any { idx ->
+            val rec = chronologicalRecords[idx]
+            rec is ParsedSessionRecord.AssistantRecord && !isAssistantCompleted(rec, hasLaterBoundary[idx])
         }
     }
 
@@ -294,6 +483,7 @@ object SessionTurnProjection {
         cursor: SessionReplyCursor?,
         previousState: ResponseFeedState,
         forceFocusLatest: Boolean = false,
+        reachedHistoryStart: Boolean = true,
     ): ResponseFeedState {
         val heardId = cursor?.lastHeardMessageId?.trim()?.takeIf { it.isNotEmpty() }
         val baselineId = cursor?.armedBaselineMessageId?.trim()?.takeIf { it.isNotEmpty() }
@@ -307,12 +497,14 @@ object SessionTurnProjection {
             }
             val heardIdx = heardId?.let { recordIndexById[it] } ?: -1
             val baselineIdx = baselineId?.let { recordIndexById[it] } ?: -1
+            val maxTimestamp = maxOf(cursor.lastHeardCreatedAtMs, cursor.armedBaselineCreatedAtMs)
             val cutoffIdx: Int? = when {
                 heardIdx >= 0 && baselineIdx >= 0 -> maxOf(heardIdx, baselineIdx)
                 heardIdx >= 0 -> heardIdx
                 baselineIdx >= 0 -> baselineIdx
                 baselineId == SESSION_START_BASELINE &&
                     (heardId == null || cursor.lastHeardCreatedAtMs <= 0L) -> -1
+                !reachedHistoryStart && maxTimestamp <= 0L -> -1
                 else -> null
             }
 
@@ -328,7 +520,6 @@ object SessionTurnProjection {
                     }
                     .toList()
             } else {
-                val maxTimestamp = maxOf(cursor.lastHeardCreatedAtMs, cursor.armedBaselineCreatedAtMs)
                 if (maxTimestamp > 0L) {
                     allCompleted
                         .filter { item -> item.createdAtMs > maxTimestamp }

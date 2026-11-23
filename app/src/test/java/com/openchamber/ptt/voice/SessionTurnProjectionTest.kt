@@ -365,4 +365,170 @@ class SessionTurnProjectionTest {
         )
         assertTrue(afterEvictedHeard.unreadQueue.isEmpty())
     }
+
+    @Test
+    fun `projectResponseFeed treats off-window cursor with zero timestamps as before index zero when reachedHistoryStart is false`() {
+        val records = listOf(
+            ParsedSessionRecord.UserRecord("u2", 0L, "Second prompt"),
+            ParsedSessionRecord.AssistantRecord("a2", 0L, completedAtMs = null, finish = "stop", hasTimeObject = true, text = "Reply 2"),
+            ParsedSessionRecord.UserRecord("u3", 0L, "Third prompt"),
+            ParsedSessionRecord.AssistantRecord("a3", 0L, completedAtMs = null, finish = "stop", hasTimeObject = true, text = "Reply 3"),
+        )
+        val turns = SessionTurnProjection.buildSessionTurns(records)
+
+        val offWindow = SessionTurnProjection.projectResponseFeed(
+            chronologicalRecords = records,
+            turns = turns,
+            cursor = SessionReplyCursor(
+                lastHeardMessageId = "evicted_a1",
+                lastHeardCreatedAtMs = 0L,
+                armedBaselineMessageId = "evicted_base",
+                armedBaselineCreatedAtMs = 0L,
+            ),
+            previousState = ResponseFeedState(),
+            reachedHistoryStart = false,
+        )
+        assertEquals(listOf("a2", "a3"), offWindow.unreadQueue.map { it.messageId })
+        assertEquals("a2", offWindow.focusedMessageId)
+
+        // When full history IS in window (reachedHistoryStart = true), missing zero-ts cursor IDs still produce empty unreadQueue
+        val inFullHistory = SessionTurnProjection.projectResponseFeed(
+            chronologicalRecords = records,
+            turns = turns,
+            cursor = SessionReplyCursor(lastHeardMessageId = "missing_id"),
+            previousState = ResponseFeedState(),
+            reachedHistoryStart = true,
+        )
+        assertTrue(inFullHistory.unreadQueue.isEmpty())
+
+        // When timestamps ARE present (> 0), off-window cursor uses timestamp cutoff instead of -1
+        val tsRecords = listOf(
+            ParsedSessionRecord.UserRecord("u2", 400L, "Second"),
+            ParsedSessionRecord.AssistantRecord("a2", 500L, 550L, "stop", true, "Reply 2"),
+            ParsedSessionRecord.UserRecord("u3", 700L, "Third"),
+            ParsedSessionRecord.AssistantRecord("a3", 800L, 850L, "stop", true, "Reply 3"),
+        )
+        val tsProjected = SessionTurnProjection.projectResponseFeed(
+            chronologicalRecords = tsRecords,
+            turns = SessionTurnProjection.buildSessionTurns(tsRecords),
+            cursor = SessionReplyCursor(lastHeardMessageId = "evicted_after_a2", lastHeardCreatedAtMs = 600L),
+            previousState = ResponseFeedState(),
+            reachedHistoryStart = false,
+        )
+        assertEquals(listOf("a3"), tsProjected.unreadQueue.map { it.messageId })
+    }
+
+    @Test
+    fun `computeRolledBackSettledAnchor steps back settled turns skips trailing incomplete turns and clamps to minFloor`() {
+        val records = listOf(
+            ParsedSessionRecord.UserRecord("u0", 100L, "Zero"),
+            ParsedSessionRecord.AssistantRecord("a0", 150L, 180L, "stop", true, "Reply 0"),
+            ParsedSessionRecord.IdleRecord("i0", 200L, "succeeded"),
+            ParsedSessionRecord.UserRecord("u1", 300L, "One"),
+            ParsedSessionRecord.AssistantRecord("a1", 350L, 380L, "stop", true, "Reply 1"),
+            ParsedSessionRecord.IdleRecord("i1", 400L, "succeeded"),
+            ParsedSessionRecord.UserRecord("u2", 500L, "Two"),
+            ParsedSessionRecord.AssistantRecord("a2", 550L, 580L, "stop", true, "Reply 2"),
+            ParsedSessionRecord.IdleRecord("i2", 600L, "succeeded"),
+        )
+        val turns = SessionTurnProjection.buildSessionTurns(records)
+
+        assertEquals(
+            "i1" to 400L,
+            SessionTurnProjection.computeRolledBackSettledAnchor(
+                turns = turns,
+                records = records,
+                settledTurnsToStepBack = 1,
+                minFloorMessageId = null,
+                minFloorCreatedAtMs = 0L,
+            ),
+        )
+        assertEquals(
+            "i0" to 200L,
+            SessionTurnProjection.computeRolledBackSettledAnchor(
+                turns = turns,
+                records = records,
+                settledTurnsToStepBack = 2,
+                minFloorMessageId = null,
+                minFloorCreatedAtMs = 0L,
+            ),
+        )
+        assertEquals(
+            SessionTurnProjection.SESSION_START_BASELINE to 0L,
+            SessionTurnProjection.computeRolledBackSettledAnchor(
+                turns = turns,
+                records = records,
+                settledTurnsToStepBack = 3,
+                minFloorMessageId = null,
+                minFloorCreatedAtMs = 0L,
+            ),
+        )
+
+        // Trailing incomplete single-step turn must NOT cause double-stepping
+        val withIncompleteTail = records + listOf(
+            ParsedSessionRecord.UserRecord("u3", 700L, "Three"),
+            ParsedSessionRecord.AssistantRecord("a3", 750L, completedAtMs = null, finish = null, hasTimeObject = true, text = "Streaming..."),
+        )
+        assertEquals(
+            "i1" to 400L,
+            SessionTurnProjection.computeRolledBackSettledAnchor(
+                turns = SessionTurnProjection.buildSessionTurns(withIncompleteTail),
+                records = withIncompleteTail,
+                settledTurnsToStepBack = 1,
+                minFloorMessageId = null,
+                minFloorCreatedAtMs = 0L,
+            ),
+        )
+
+        // Trailing multi-step turn with completed step 1 + incomplete blank step 2 must NOT double-step either
+        val withBlankStep2Tail = records + listOf(
+            ParsedSessionRecord.UserRecord("u3", 700L, "Three"),
+            ParsedSessionRecord.AssistantRecord("a3_1", 750L, completedAtMs = 770L, finish = "tool-calls", hasTimeObject = true, text = "Step 1"),
+            ParsedSessionRecord.AssistantRecord("a3_2", 800L, completedAtMs = null, finish = null, hasTimeObject = true, text = null),
+        )
+        assertEquals(
+            "i1" to 400L,
+            SessionTurnProjection.computeRolledBackSettledAnchor(
+                turns = SessionTurnProjection.buildSessionTurns(withBlankStep2Tail),
+                records = withBlankStep2Tail,
+                settledTurnsToStepBack = 1,
+                minFloorMessageId = null,
+                minFloorCreatedAtMs = 0L,
+            ),
+        )
+
+        // Clamps so anchor never moves earlier than minFloor in records
+        assertEquals(
+            "a1" to 350L,
+            SessionTurnProjection.computeRolledBackSettledAnchor(
+                turns = turns,
+                records = records,
+                settledTurnsToStepBack = 2,
+                minFloorMessageId = "a1",
+                minFloorCreatedAtMs = 350L,
+            ),
+        )
+        // Clamps SESSION_START_BASELINE to minFloor when stepping past index 0
+        assertEquals(
+            "a0" to 150L,
+            SessionTurnProjection.computeRolledBackSettledAnchor(
+                turns = turns,
+                records = records,
+                settledTurnsToStepBack = 4,
+                minFloorMessageId = "a0",
+                minFloorCreatedAtMs = 150L,
+            ),
+        )
+        // Evicted older floor does not drag a newer candidate backward
+        assertEquals(
+            "i1" to 400L,
+            SessionTurnProjection.computeRolledBackSettledAnchor(
+                turns = turns,
+                records = records,
+                settledTurnsToStepBack = 1,
+                minFloorMessageId = "evicted_older_id",
+                minFloorCreatedAtMs = 50L,
+            ),
+        )
+    }
 }

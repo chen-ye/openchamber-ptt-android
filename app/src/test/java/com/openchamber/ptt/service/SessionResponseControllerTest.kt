@@ -19,7 +19,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
@@ -41,6 +40,7 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import org.junit.rules.Timeout
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -48,6 +48,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class SessionResponseControllerTest {
+    @get:Rule
+    val globalTimeout: Timeout = Timeout.seconds(20)
+
     @get:Rule
     val tempFolder = TemporaryFolder()
 
@@ -107,6 +110,7 @@ class SessionResponseControllerTest {
         playbackProvider: () -> Boolean = { false },
         onAutoSpeak: () -> Unit = {},
         lookupCachedSpokenSummary: ((String) -> String?)? = null,
+        clockElapsedMs: () -> Long = { System.nanoTime() / 1_000_000L },
     ): Triple<TokenStore, BoundServerSession, SessionResponseController> {
         val store = TokenStore(InMemoryPrefs())
         val srv = store.upsertServer(baseUrl, label = "Local", token = "tok_test", makeActive = true)
@@ -131,6 +135,7 @@ class SessionResponseControllerTest {
             isPlaybackActive = playbackProvider,
             onTriggerAutoSpeak = onAutoSpeak,
             lookupCachedSpokenSummary = lookupCachedSpokenSummary,
+            clockElapsedMs = clockElapsedMs,
         )
         controller.bindSession(session, forceClear = true)
         return Triple(store, session, controller)
@@ -181,7 +186,7 @@ class SessionResponseControllerTest {
                 ctrl = controller
 
                 // Initial sync on empty session seeds SESSION_START_BASELINE
-                ctrl.syncSessionTurns("arm", captureAutoSpeakAnchor = true)
+                ctrl.syncSessionTurns("arm")
                 val wsSubscribedLatch = CountDownLatch(1)
                 server.dispatcher = object : Dispatcher() {
                     override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
@@ -302,7 +307,7 @@ class SessionResponseControllerTest {
                     onAutoSpeak = { triggerCount.incrementAndGet() },
                 )
 
-                controller.syncSessionTurns("arm", captureAutoSpeakAnchor = true)
+                controller.syncSessionTurns("arm")
                 controller.setArmed(true)
                 assertTrue(wsReadyLatch.await(3, TimeUnit.SECONDS))
                 val readyFence = CountDownLatch(1)
@@ -393,7 +398,7 @@ class SessionResponseControllerTest {
         }
 
     @Test
-    fun `barge-in during item 1 of 3 advances cursor pauses auto-speak keeps 2 and 3 unread and feeds VoiceReplyContext`() =
+    fun `barge-in during item 1 of 3 respects 1_5s audible threshold advances cursor pauses auto-speak and feeds VoiceReplyContext`() =
         runBlocking {
             val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
             val currentBody = AtomicReference(
@@ -425,11 +430,13 @@ class SessionResponseControllerTest {
             try {
                 val baseUrl = server.url("/").toString().trimEnd('/')
                 val triggerCount = AtomicInteger(0)
+                var nowElapsedMs = 10_000L
                 val (store, session, controller) = createController(
                     scope = scope,
                     baseUrl = baseUrl,
                     stateProvider = { PttState.ARMED_IDLE },
                     onAutoSpeak = { triggerCount.incrementAndGet() },
+                    clockElapsedMs = { nowElapsedMs },
                 )
 
                 // Seed cursor & armed anchor at session start so all 3 items are post-arm unread
@@ -440,13 +447,28 @@ class SessionResponseControllerTest {
                         updatedAtMs = 10L,
                     ),
                 )
-                controller.ensureAutoSpeakAnchorBeforeTurn(SessionTurnProjection.SESSION_START_BASELINE)
                 controller.setArmed(true)
+                controller.ensureAutoSpeakAnchorBeforeTurn(SessionTurnProjection.SESSION_START_BASELINE)
                 controller.syncSessionTurns("initial")
                 assertEquals(listOf("a1", "a2", "a3"), controller.feedState.value.unreadQueue.map { it.messageId })
 
-                // Start speaking item 1 then barge in
+                // 1) Barge in after < 1.5s audible -> keeps a1 unread, pauses auto-speak, preserves focus on a1
                 controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 5_000L)
+                nowElapsedMs += 1_499L
+                controller.onUserBargeIn()
+
+                assertNull(store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+                assertTrue(controller.feedState.value.autoSpeakPaused)
+                assertEquals("a1", controller.feedState.value.focusedMessageId)
+                assertNull(controller.feedState.value.speakingMessageId)
+                assertEquals(listOf("a1", "a2", "a3"), controller.feedState.value.unreadQueue.map { it.messageId })
+
+                // 2) Resume item 1 and barge in after >= 1.5s audible -> marks a1 heard and keeps 2 & 3 unread
+                nowElapsedMs = 20_000L
+                controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 5_000L)
+                nowElapsedMs += 1_500L
                 controller.onUserBargeIn()
 
                 assertEquals("a1", store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
@@ -467,7 +489,7 @@ class SessionResponseControllerTest {
                 assertEquals(listOf("a2", "a3"), ctx.pendingUnreadPreviews.map { it.messageId })
                 assertEquals(listOf("Worker A", "explore"), ctx.pendingUnreadPreviews.map { it.sourceLabel })
 
-                // When a brand-new 4th completed item arrives after autoSpeakAnchorId, autoSpeakPaused resets
+                // When a brand-new 4th completed item arrives after Established anchor, autoSpeakPaused resets
                 currentBody.set(
                     """
                     {
@@ -611,7 +633,7 @@ class SessionResponseControllerTest {
                     baseUrl = baseUrl,
                     stateProvider = { PttState.ARMED_IDLE },
                 )
-                ctrl1.syncSessionTurns("desktop_init", captureAutoSpeakAnchor = true)
+                ctrl1.syncSessionTurns("desktop_init")
                 val cursor1 = store1.getReplyCursor(session1.sessionKey)
                 assertEquals("idle_2", cursor1?.armedBaselineMessageId)
                 assertTrue(ctrl1.feedState.value.unreadQueue.isEmpty())
@@ -647,7 +669,7 @@ class SessionResponseControllerTest {
                     baseUrl = baseUrl,
                     stateProvider = { PttState.ARMED_IDLE },
                 )
-                ctrl2.syncSessionTurns("empty_init", captureAutoSpeakAnchor = true)
+                ctrl2.syncSessionTurns("empty_init")
                 val cursor2 = store2.getReplyCursor(session2.sessionKey)
                 assertEquals(SessionTurnProjection.SESSION_START_BASELINE, cursor2?.armedBaselineMessageId)
                 assertTrue(ctrl2.feedState.value.unreadQueue.isEmpty())
@@ -721,7 +743,7 @@ class SessionResponseControllerTest {
                     baseUrl = baseUrl,
                     stateProvider = { PttState.ARMED_IDLE },
                 )
-                controller.syncSessionTurns("init", captureAutoSpeakAnchor = true)
+                controller.syncSessionTurns("init")
                 controller.setArmed(true)
                 assertTrue(wsReadyLatch.await(3, TimeUnit.SECONDS))
 
@@ -867,7 +889,7 @@ class SessionResponseControllerTest {
                     ),
                 )
                 controller.setArmed(true)
-                controller.requestBackgroundSync("arm", triggerAutoSpeak = false, captureAutoSpeakAnchor = true)
+                controller.requestBackgroundSync("arm", triggerAutoSpeak = false)
                 assertTrue(armFetchStarted.await(3, TimeUnit.SECONDS))
 
                 // User taps PTT immediately -> RECORDING, then discards -> ARMED_IDLE before sync finishes
@@ -1048,6 +1070,1052 @@ class SessionResponseControllerTest {
             } finally {
                 scope.cancel()
                 cache2.close()
+            }
+        }
+
+    @Test
+    fun `20-min stale windowCache before arm and cross-session bindSession never auto-speaks pre-arm desktop history`() =
+        runBlocking {
+            val ses1Path = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val ses2Path = "/api/session/ses_2/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val ses1Body = AtomicReference(
+                """
+                {
+                  "data": [
+                    {"id":"idle_0","type":"idle","outcome":"succeeded","time":{"created":200}},
+                    {"id":"a0","type":"assistant","finish":"stop","time":{"created":150,"completed":180},"content":[{"type":"text","text":"Initial reply"}]},
+                    {"id":"u0","type":"user","time":{"created":100},"text":"Start"}
+                  ],
+                  "cursor":{}
+                }
+                """.trimIndent(),
+            )
+            val ses2Body = AtomicReference(
+                """
+                {
+                  "data": [
+                    {"id":"s2_idle_0","type":"idle","outcome":"succeeded","time":{"created":200}},
+                    {"id":"s2_a0","type":"assistant","finish":"stop","time":{"created":150,"completed":180},"content":[{"type":"text","text":"Session 2 old"}]},
+                    {"id":"s2_u0","type":"user","time":{"created":100},"text":"S2 Start"}
+                  ],
+                  "cursor":{}
+                }
+                """.trimIndent(),
+            )
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    ses1Path -> MockResponse().setResponseCode(200).setBody(ses1Body.get())
+                    ses2Path -> MockResponse().setResponseCode(200).setBody(ses2Body.get())
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val triggerCount = AtomicInteger(0)
+                val (store, session1, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.ARMED_IDLE },
+                    onAutoSpeak = { triggerCount.incrementAndGet() },
+                )
+
+                // Populate windowCache for ses_1 and ses_2 while disarmed, with a0/s2_a0 heard
+                controller.syncSessionTurns("disarmed_seed_1")
+                controller.markAllResponsesRead()
+                val srvId = session1.serverId
+                val session2 = BoundServerSession(
+                    serverId = srvId,
+                    serverUrl = baseUrl,
+                    pinnedSession = PinnedSession("ses_2", "/repo", "Second"),
+                )
+                controller.bindSession(session2, forceClear = false)
+                controller.syncSessionTurns("disarmed_seed_2")
+                controller.markAllResponsesRead()
+                controller.bindSession(session1, forceClear = false)
+
+                // 20 minutes pass while disarmed: desktop adds a1 and a2 on ses_1, and s2_a1 on ses_2
+                ses1Body.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"idle_2","type":"idle","outcome":"succeeded","time":{"created":600}},
+                        {"id":"a2","type":"assistant","finish":"stop","time":{"created":550,"completed":580},"content":[{"type":"text","text":"Desktop 20m later 2"}]},
+                        {"id":"u2","type":"user","time":{"created":500},"text":"Desktop 2"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":400}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":350,"completed":380},"content":[{"type":"text","text":"Desktop 20m later 1"}]},
+                        {"id":"u1","type":"user","time":{"created":300},"text":"Desktop 1"},
+                        {"id":"idle_0","type":"idle","outcome":"succeeded","time":{"created":200}},
+                        {"id":"a0","type":"assistant","finish":"stop","time":{"created":150,"completed":180},"content":[{"type":"text","text":"Initial reply"}]},
+                        {"id":"u0","type":"user","time":{"created":100},"text":"Start"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                ses2Body.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"s2_idle_1","type":"idle","outcome":"succeeded","time":{"created":400}},
+                        {"id":"s2_a1","type":"assistant","finish":"stop","time":{"created":350,"completed":380},"content":[{"type":"text","text":"Session 2 desktop history"}]},
+                        {"id":"s2_u1","type":"user","time":{"created":300},"text":"S2 Desktop"},
+                        {"id":"s2_idle_0","type":"idle","outcome":"succeeded","time":{"created":200}},
+                        {"id":"s2_a0","type":"assistant","finish":"stop","time":{"created":150,"completed":180},"content":[{"type":"text","text":"Session 2 old"}]},
+                        {"id":"s2_u0","type":"user","time":{"created":100},"text":"S2 Start"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+
+                // Arm ses_1 -> must stay Uninitialized until post-arm HTTP sync (must NOT use stale windowCache)
+                controller.setArmed(true)
+                assertNull(controller.nextItemToAutoSpeak())
+                controller.syncSessionTurns("arm", triggerAutoSpeak = true)
+                assertEquals(0, triggerCount.get())
+                assertNull(controller.nextItemToAutoSpeak())
+                assertEquals(listOf("a1", "a2"), controller.feedState.value.unreadQueue.map { it.messageId })
+
+                // Cross-session bindSession(ses_2, forceClear = false) while armed -> must NOT anchor from stale windowCache
+                controller.bindSession(session2, forceClear = false)
+                assertNull(controller.nextItemToAutoSpeak())
+                controller.syncSessionTurns("session_switch_armed", triggerAutoSpeak = true)
+                assertEquals(0, triggerCount.get())
+                assertNull(controller.nextItemToAutoSpeak())
+                assertEquals(listOf("s2_a1"), controller.feedState.value.unreadQueue.map { it.messageId })
+                assertEquals("s2_a0", store.getReplyCursor(session2.sessionKey)?.lastHeardMessageId)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `cursor null plus live WS Completed during arm aligns cursor armedBaseline so Reply 1 speaks`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val currentBody = AtomicReference(
+                """
+                {
+                  "data": [
+                    {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                    {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Reply 1"}]},
+                    {"id":"u1","type":"user","time":{"created":100},"text":"Prompt 1"}
+                  ],
+                  "cursor":{}
+                }
+                """.trimIndent(),
+            )
+            val wsSocketRef = AtomicReference<WebSocket?>(null)
+            val wsReadyLatch = CountDownLatch(1)
+
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> MockResponse().setResponseCode(200).setBody(currentBody.get())
+                    "/api/global/event/ws" -> MockResponse().withWebSocketUpgrade(
+                        object : WebSocketListener() {
+                            override fun onOpen(webSocket: WebSocket, response: Response) {
+                                wsSocketRef.set(webSocket)
+                                webSocket.send("""{"type":"ready","scope":"global"}""")
+                                wsReadyLatch.countDown()
+                            }
+                        },
+                    )
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val autoSpeakLatch = CountDownLatch(1)
+                val (store, session, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.ARMED_IDLE },
+                    onAutoSpeak = { autoSpeakLatch.countDown() },
+                )
+                assertNull(store.getReplyCursor(session.sessionKey))
+
+                controller.setArmed(true)
+                assertTrue(wsReadyLatch.await(3, TimeUnit.SECONDS))
+                val readyFence = CountDownLatch(1)
+                val readyJob = async(Dispatchers.IO) {
+                    controller.observeEventsForActiveTurn(baseUrl, "ses_1") { readyFence.countDown() }
+                        .take(1)
+                        .toList()
+                }
+                assertTrue(readyFence.await(3, TimeUnit.SECONDS))
+                readyJob.cancel()
+
+                // Live WS Completed arrives while watermark is Uninitialized and cursor is null
+                wsSocketRef.get()!!.send(
+                    """{"type":"event","eventId":"e1","payload":{"type":"session.execution.succeeded","data":{"sessionID":"ses_1"}}}""",
+                )
+
+                assertTrue("Expected auto-speak for Reply 1", autoSpeakLatch.await(3, TimeUnit.SECONDS))
+                assertEquals(
+                    SessionTurnProjection.SESSION_START_BASELINE,
+                    store.getReplyCursor(session.sessionKey)?.armedBaselineMessageId,
+                )
+                assertEquals(listOf("a1"), controller.feedState.value.unreadQueue.map { it.messageId })
+                assertEquals("a1", controller.nextItemToAutoSpeak()?.messageId)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `torn HTTP GET 1 returning after WS Completed waits for coalesced resync without poisoning cursor`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val reqCount = AtomicInteger(0)
+            val get1Started = CountDownLatch(1)
+            val allowGet1Finish = CountDownLatch(1)
+            val get2Completed = CountDownLatch(1)
+            val wsSocketRef = AtomicReference<WebSocket?>(null)
+            val wsReadyLatch = CountDownLatch(1)
+
+            // GET #1 already sees [u1, a1, idle_1] while WS Completed races ahead of GET #1's response;
+            // GET #1 must NOT poison cursor == null to idle_1 before coalesced GET #2 runs.
+            val bodyWithReply1 = """
+                {
+                  "data": [
+                    {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                    {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Reply 1"}]},
+                    {"id":"u1","type":"user","time":{"created":100},"text":"Prompt 1"}
+                  ],
+                  "cursor":{}
+                }
+            """.trimIndent()
+
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> {
+                        val idx = reqCount.getAndIncrement()
+                        if (idx == 0) {
+                            get1Started.countDown()
+                            allowGet1Finish.await(3, TimeUnit.SECONDS)
+                            MockResponse().setResponseCode(200).setBody(bodyWithReply1)
+                        } else {
+                            get2Completed.countDown()
+                            MockResponse().setResponseCode(200).setBody(bodyWithReply1)
+                        }
+                    }
+                    "/api/global/event/ws" -> MockResponse().withWebSocketUpgrade(
+                        object : WebSocketListener() {
+                            override fun onOpen(webSocket: WebSocket, response: Response) {
+                                wsSocketRef.set(webSocket)
+                                webSocket.send("""{"type":"ready","scope":"global"}""")
+                                wsReadyLatch.countDown()
+                            }
+                        },
+                    )
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val triggerCount = AtomicInteger(0)
+                val autoSpeakLatch = CountDownLatch(1)
+                val (store, session, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.ARMED_IDLE },
+                    onAutoSpeak = {
+                        triggerCount.incrementAndGet()
+                        autoSpeakLatch.countDown()
+                    },
+                )
+
+                controller.setArmed(true)
+                assertTrue(wsReadyLatch.await(3, TimeUnit.SECONDS))
+                val readyFence = CountDownLatch(1)
+                val readyJob = async(Dispatchers.IO) {
+                    controller.observeEventsForActiveTurn(baseUrl, "ses_1") { readyFence.countDown() }
+                        .take(1)
+                        .toList()
+                }
+                assertTrue(readyFence.await(3, TimeUnit.SECONDS))
+                readyJob.cancel()
+
+                // Start GET #1 ("arm") with fetchLiveSeq == 0
+                val ready = CountDownLatch(1)
+                val eventObserved = async(Dispatchers.IO) {
+                    controller.observeEventsForActiveTurn(baseUrl, "ses_1") { ready.countDown() }.first()
+                }
+                assertTrue(ready.await(3, TimeUnit.SECONDS))
+
+                val sync1 = async(Dispatchers.IO) {
+                    controller.syncSessionTurns("arm", triggerAutoSpeak = false)
+                }
+                assertTrue(get1Started.await(3, TimeUnit.SECONDS))
+
+                // WS Completed arrives while GET #1 is in flight -> liveCompletionSeq = 1, resyncRequested = true
+                wsSocketRef.get()!!.send(
+                    """{"type":"event","eventId":"e1","payload":{"type":"session.execution.succeeded","data":{"sessionID":"ses_1"}}}""",
+                )
+                assertEquals(TurnEvent.Completed, eventObserved.await())
+
+                // Release GET #1 -> must defer finalization & cursor seeding to coalesced GET #2
+                allowGet1Finish.countDown()
+                sync1.await()
+                assertTrue(get2Completed.await(3, TimeUnit.SECONDS))
+                assertTrue(autoSpeakLatch.await(3, TimeUnit.SECONDS))
+
+                assertEquals(1, triggerCount.get())
+                assertEquals(
+                    SessionTurnProjection.SESSION_START_BASELINE,
+                    store.getReplyCursor(session.sessionKey)?.armedBaselineMessageId,
+                )
+                assertEquals(listOf("a1"), controller.feedState.value.unreadQueue.map { it.messageId })
+                assertEquals("a1", controller.nextItemToAutoSpeak()?.messageId)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `SyntheticArrived during Uninitialized does not roll back pre-arm history`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val reqCount = AtomicInteger(0)
+            val get1Started = CountDownLatch(1)
+            val allowGet1Finish = CountDownLatch(1)
+            val preArmOnlyBody = """
+                {
+                  "data": [
+                    {"id":"idle_0","type":"idle","outcome":"succeeded","time":{"created":200}},
+                    {"id":"a0","type":"assistant","finish":"stop","time":{"created":150,"completed":180},"content":[{"type":"text","text":"Pre-arm desktop reply"}]},
+                    {"id":"u0","type":"user","time":{"created":100},"text":"Pre-arm"}
+                  ],
+                  "cursor":{}
+                }
+            """.trimIndent()
+            val afterTurn1Body = """
+                {
+                  "data": [
+                    {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":400}},
+                    {"id":"a1","type":"assistant","finish":"stop","time":{"created":350,"completed":380},"content":[{"type":"text","text":"Async after arm"}]},
+                    {"id":"syn_1","type":"synthetic","time":{"created":300},"metadata":{"source":"openchamber-session","title":"Worker"},"text":"<openchamber-session title=\"Worker\">done</openchamber-session>"},
+                    {"id":"idle_0","type":"idle","outcome":"succeeded","time":{"created":200}},
+                    {"id":"a0","type":"assistant","finish":"stop","time":{"created":150,"completed":180},"content":[{"type":"text","text":"Pre-arm desktop reply"}]},
+                    {"id":"u0","type":"user","time":{"created":100},"text":"Pre-arm"}
+                  ],
+                  "cursor":{}
+                }
+            """.trimIndent()
+            val wsSocketRef = AtomicReference<WebSocket?>(null)
+            val wsReadyLatch = CountDownLatch(1)
+
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> {
+                        val idx = reqCount.getAndIncrement()
+                        if (idx == 0) {
+                            get1Started.countDown()
+                            allowGet1Finish.await(3, TimeUnit.SECONDS)
+                            MockResponse().setResponseCode(200).setBody(preArmOnlyBody)
+                        } else {
+                            MockResponse().setResponseCode(200).setBody(afterTurn1Body)
+                        }
+                    }
+                    "/api/global/event/ws" -> MockResponse().withWebSocketUpgrade(
+                        object : WebSocketListener() {
+                            override fun onOpen(webSocket: WebSocket, response: Response) {
+                                wsSocketRef.set(webSocket)
+                                webSocket.send("""{"type":"ready","scope":"global"}""")
+                                wsReadyLatch.countDown()
+                            }
+                        },
+                    )
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val autoSpeakLatch = CountDownLatch(1)
+                val (store, session, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.ARMED_IDLE },
+                    onAutoSpeak = { autoSpeakLatch.countDown() },
+                )
+
+                controller.setArmed(true)
+                assertTrue(wsReadyLatch.await(3, TimeUnit.SECONDS))
+                val readyFence = CountDownLatch(1)
+                val twoEvents = async(Dispatchers.IO) {
+                    controller.observeEventsForActiveTurn(baseUrl, "ses_1") { readyFence.countDown() }
+                        .take(2)
+                        .toList()
+                }
+                assertTrue(readyFence.await(3, TimeUnit.SECONDS))
+
+                // Hold initial arm GET #1 while BOTH SyntheticArrived and Completed arrive in Uninitialized state.
+                val armSync = async(Dispatchers.IO) {
+                    controller.syncSessionTurns("arm", triggerAutoSpeak = false)
+                }
+                assertTrue(get1Started.await(3, TimeUnit.SECONDS))
+
+                val ws = wsSocketRef.get()!!
+                ws.send("""{"type":"event","eventId":"e1","payload":{"type":"session.synthetic","data":{"sessionID":"ses_1","metadata":{"source":"openchamber-session"}}}}""")
+                ws.send("""{"type":"event","eventId":"e2","payload":{"type":"session.execution.succeeded","data":{"sessionID":"ses_1"}}}""")
+                assertEquals(2, twoEvents.await().size)
+
+                // Release GET #1; SyntheticArrived must NOT increment liveCompletionCount,
+                // so rollback is 1 turn (idle_0), NOT 2 (SESSION_START_BASELINE), keeping pre-arm a0 silent.
+                allowGet1Finish.countDown()
+                armSync.await()
+
+                assertTrue(autoSpeakLatch.await(3, TimeUnit.SECONDS))
+                assertEquals("idle_0", store.getReplyCursor(session.sessionKey)?.armedBaselineMessageId)
+                assertEquals(listOf("a1"), controller.feedState.value.unreadQueue.map { it.messageId })
+                assertEquals("a1", controller.nextItemToAutoSpeak()?.messageId)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `short-clip half-duration barge-in and onSpeechInterruptedByTransport preserve unread on interruption`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val body = """
+                {
+                  "data": [
+                    {"id":"idle_2","type":"idle","outcome":"succeeded","time":{"created":500}},
+                    {"id":"a2","type":"assistant","finish":"stop","time":{"created":450,"completed":480},"content":[{"type":"text","text":"Second item"}]},
+                    {"id":"u2","type":"user","time":{"created":400},"text":"Two"},
+                    {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                    {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Short clip"}]},
+                    {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                  ],
+                  "cursor":{}
+                }
+            """.trimIndent()
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> MockResponse().setResponseCode(200).setBody(body)
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val triggerCount = AtomicInteger(0)
+                var nowElapsedMs = 1_000L
+                val (store, session, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.ARMED_IDLE },
+                    onAutoSpeak = { triggerCount.incrementAndGet() },
+                    clockElapsedMs = { nowElapsedMs },
+                )
+
+                store.saveReplyCursor(
+                    session.sessionKey,
+                    SessionReplyCursor(armedBaselineMessageId = SessionTurnProjection.SESSION_START_BASELINE, updatedAtMs = 1L),
+                )
+                controller.setArmed(true)
+                controller.ensureAutoSpeakAnchorBeforeTurn(SessionTurnProjection.SESSION_START_BASELINE)
+                controller.syncSessionTurns("initial")
+                assertEquals(listOf("a1", "a2"), controller.feedState.value.unreadQueue.map { it.messageId })
+
+                // Preparing barge-in (before notifySpeechPlaybackStarted) does NOT mark a1 heard
+                controller.setSpeakingMessage("a1")
+                controller.onUserBargeIn(nowElapsedMs + 5_000L)
+                assertNull(store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+                assertEquals(listOf("a1", "a2"), controller.feedState.value.unreadQueue.map { it.messageId })
+                assertTrue(controller.feedState.value.autoSpeakPaused)
+
+                // Transport interruption even after 2.5s audible NEVER calls markItemHeardLocked
+                controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 5_000L)
+                nowElapsedMs += 2_500L
+                controller.onSpeechInterruptedByTransport()
+                assertNull(store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+                assertEquals(listOf("a1", "a2"), controller.feedState.value.unreadQueue.map { it.messageId })
+                assertTrue(controller.feedState.value.autoSpeakPaused)
+                assertNull(controller.feedState.value.speakingMessageId)
+                assertEquals("a1", controller.feedState.value.focusedMessageId)
+                controller.maybeTriggerAutoSpeakIfIdle()
+                assertEquals(0, triggerCount.get())
+
+                // Zero / negative estimatedDurationMs is sanitized to null (requires full 1.5s, not 0ms/2)
+                controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 0L)
+                nowElapsedMs += 600L
+                controller.onUserBargeIn()
+                assertNull(store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+
+                // Short clip (< 3_000ms) < half duration stays unread; >= half duration commits heard
+                controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 1_200L)
+                nowElapsedMs += 599L
+                controller.onUserBargeIn()
+                assertNull(store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+
+                controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 1_200L)
+                nowElapsedMs += 600L
+                controller.onUserBargeIn()
+                assertEquals("a1", store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+                assertEquals(listOf("a2"), controller.feedState.value.unreadQueue.map { it.messageId })
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `syncForPromptTurnCompletion distinguishes TurnStillRunning FlushLagRetryNeeded ReadyToSpeak and SettledNoSpeech`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val currentBody = AtomicReference(
+                """
+                {
+                  "data": [
+                    {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                    {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"First reply"}]},
+                    {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                  ],
+                  "cursor":{}
+                }
+                """.trimIndent(),
+            )
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> MockResponse().setResponseCode(200).setBody(currentBody.get())
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val (store, session, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.WAITING_AGENT },
+                )
+                controller.syncSessionTurns("baseline")
+                controller.ensureAutoSpeakAnchorBeforeTurn("idle_1", 300L)
+                controller.ensureCursorSeededBeforeTurn("idle_1", 300L)
+
+                // 1) sentUserMessageId not yet in window and preSendLatestRecordId matches tail -> TurnStillRunning
+                assertEquals(
+                    PromptTurnSettlement.TurnStillRunning,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+
+                // 2) User step just opened with 0 assistant items (!lastTurn.isIdle) -> TurnStillRunning
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"u2","type":"user","time":{"created":400},"text":"Two"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"First reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                assertEquals(
+                    PromptTurnSettlement.TurnStillRunning,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+
+                // 3) Single-step incomplete assistant (flush lag) -> FlushLagRetryNeeded
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"a2","type":"assistant","time":{"created":450},"content":[{"type":"text","text":"Partial..."}]},
+                        {"id":"u2","type":"user","time":{"created":400},"text":"Two"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"First reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                assertEquals(
+                    PromptTurnSettlement.FlushLagRetryNeeded,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+
+                // 4) Multi-step with completed step 1 + incomplete blank step 2 -> still FlushLagRetryNeeded
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"a2_2","type":"assistant","time":{"created":470}},
+                        {"id":"a2_1","type":"assistant","finish":"tool-calls","time":{"created":450,"completed":460},"content":[{"type":"text","text":"Step 1"}]},
+                        {"id":"u2","type":"user","time":{"created":400},"text":"Two"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"First reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                assertEquals(
+                    PromptTurnSettlement.FlushLagRetryNeeded,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+
+                // 5) Completed reply -> ReadyToSpeak
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"idle_2","type":"idle","outcome":"succeeded","time":{"created":500}},
+                        {"id":"a2_2","type":"assistant","finish":"stop","time":{"created":470,"completed":490},"content":[{"type":"text","text":"Step 2"}]},
+                        {"id":"a2_1","type":"assistant","finish":"tool-calls","time":{"created":450,"completed":460},"content":[{"type":"text","text":"Step 1"}]},
+                        {"id":"u2","type":"user","time":{"created":400},"text":"Two"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"First reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                assertEquals(
+                    PromptTurnSettlement.ReadyToSpeak,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+
+                // 6) Settled tool-only turn with no speakable text -> SettledNoSpeech
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"idle_3","type":"idle","outcome":"succeeded","time":{"created":650}},
+                        {"id":"u3","type":"user","time":{"created":600},"text":"Silent tool"},
+                        {"id":"idle_2","type":"idle","outcome":"succeeded","time":{"created":500}},
+                        {"id":"a2_2","type":"assistant","finish":"stop","time":{"created":470,"completed":490},"content":[{"type":"text","text":"Step 2"}]},
+                        {"id":"a2_1","type":"assistant","finish":"tool-calls","time":{"created":450,"completed":460},"content":[{"type":"text","text":"Step 1"}]},
+                        {"id":"u2","type":"user","time":{"created":400},"text":"Two"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"First reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                controller.markAllResponsesRead()
+                assertEquals(
+                    PromptTurnSettlement.SettledNoSpeech,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u3", preSendLatestRecordId = "idle_2"),
+                )
+                assertEquals("a2_2", store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `armed WS SyntheticArrived syncs feed during activePromptTurn while gating auto-speak until idle`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val currentBody = AtomicReference("""{"data":[],"cursor":{}}""")
+            val wsSocketRef = AtomicReference<WebSocket?>(null)
+            val wsReadyLatch = CountDownLatch(1)
+
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> MockResponse().setResponseCode(200).setBody(currentBody.get())
+                    "/api/global/event/ws" -> MockResponse().withWebSocketUpgrade(
+                        object : WebSocketListener() {
+                            override fun onOpen(webSocket: WebSocket, response: Response) {
+                                wsSocketRef.set(webSocket)
+                                webSocket.send("""{"type":"ready","scope":"global"}""")
+                                wsReadyLatch.countDown()
+                            }
+                        },
+                    )
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val triggerCount = AtomicInteger(0)
+                val currentState = AtomicReference(PttState.ARMED_IDLE)
+                val (_, _, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { currentState.get() },
+                    onAutoSpeak = { triggerCount.incrementAndGet() },
+                )
+
+                controller.setArmed(true)
+                controller.syncSessionTurns("arm")
+                assertTrue(wsReadyLatch.await(3, TimeUnit.SECONDS))
+                val readyFence = CountDownLatch(1)
+                val readyJob = async(Dispatchers.IO) {
+                    controller.observeEventsForActiveTurn(baseUrl, "ses_1") { readyFence.countDown() }
+                        .take(1)
+                        .toList()
+                }
+                assertTrue(readyFence.await(3, TimeUnit.SECONDS))
+                readyJob.cancel()
+
+                // Even while activePromptTurn == true and state == ARMED_IDLE, WS SyntheticArrived still syncs feed
+                // without triggering auto-speak until activePromptTurn resets to false.
+                controller.setActivePromptTurn(true)
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Async while active"}]},
+                        {"id":"syn_1","type":"synthetic","time":{"created":100},"metadata":{"source":"openchamber-session","title":"Worker"},"text":"<openchamber-session title=\"Worker\">done</openchamber-session>"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                wsSocketRef.get()!!.send(
+                    """{"type":"event","eventId":"e1","payload":{"type":"session.synthetic","data":{"sessionID":"ses_1","metadata":{"source":"openchamber-session"}}}}""",
+                )
+                withTimeout(3_000L) {
+                    controller.feedState.first { it.unreadQueue.map(AssistantResponseItem::messageId) == listOf("a1") }
+                }
+                assertEquals(0, triggerCount.get())
+
+                controller.setActivePromptTurn(false)
+                controller.maybeTriggerAutoSpeakIfIdle()
+                assertEquals(1, triggerCount.get())
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `back-to-back TurnEvent Completed frames during Uninitialized roll back only 1 turn`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val reqCount = AtomicInteger(0)
+            val get1Started = CountDownLatch(1)
+            val allowGet1Finish = CountDownLatch(1)
+            val preArmThreeTurns = """
+                {
+                  "data": [
+                    {"id":"idle_old3","type":"idle","outcome":"succeeded","time":{"created":600}},
+                    {"id":"a_old3","type":"assistant","finish":"stop","time":{"created":550,"completed":580},"content":[{"type":"text","text":"Old 3"}]},
+                    {"id":"u_old3","type":"user","time":{"created":500},"text":"U3"},
+                    {"id":"idle_old2","type":"idle","outcome":"succeeded","time":{"created":400}},
+                    {"id":"a_old2","type":"assistant","finish":"stop","time":{"created":350,"completed":380},"content":[{"type":"text","text":"Old 2"}]},
+                    {"id":"u_old2","type":"user","time":{"created":300},"text":"U2"},
+                    {"id":"idle_old1","type":"idle","outcome":"succeeded","time":{"created":200}},
+                    {"id":"a_old1","type":"assistant","finish":"stop","time":{"created":150,"completed":180},"content":[{"type":"text","text":"Old 1"}]},
+                    {"id":"u_old1","type":"user","time":{"created":100},"text":"U1"}
+                  ],
+                  "cursor":{}
+                }
+            """.trimIndent()
+            val afterTurn4Body = """
+                {
+                  "data": [
+                    {"id":"idle_4","type":"idle","outcome":"succeeded","time":{"created":800}},
+                    {"id":"a4","type":"assistant","finish":"stop","time":{"created":750,"completed":780},"content":[{"type":"text","text":"Turn 4 live reply"}]},
+                    {"id":"syn_4","type":"synthetic","time":{"created":700},"metadata":{"source":"openchamber-session","title":"Worker"},"text":"<openchamber-session title=\"Worker\">done</openchamber-session>"},
+                    {"id":"idle_old3","type":"idle","outcome":"succeeded","time":{"created":600}},
+                    {"id":"a_old3","type":"assistant","finish":"stop","time":{"created":550,"completed":580},"content":[{"type":"text","text":"Old 3"}]},
+                    {"id":"u_old3","type":"user","time":{"created":500},"text":"U3"},
+                    {"id":"idle_old2","type":"idle","outcome":"succeeded","time":{"created":400}},
+                    {"id":"a_old2","type":"assistant","finish":"stop","time":{"created":350,"completed":380},"content":[{"type":"text","text":"Old 2"}]},
+                    {"id":"u_old2","type":"user","time":{"created":300},"text":"U2"},
+                    {"id":"idle_old1","type":"idle","outcome":"succeeded","time":{"created":200}},
+                    {"id":"a_old1","type":"assistant","finish":"stop","time":{"created":150,"completed":180},"content":[{"type":"text","text":"Old 1"}]},
+                    {"id":"u_old1","type":"user","time":{"created":100},"text":"U1"}
+                  ],
+                  "cursor":{}
+                }
+            """.trimIndent()
+            val wsSocketRef = AtomicReference<WebSocket?>(null)
+            val wsReadyLatch = CountDownLatch(1)
+
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> {
+                        val idx = reqCount.getAndIncrement()
+                        if (idx == 0) {
+                            get1Started.countDown()
+                            allowGet1Finish.await(3, TimeUnit.SECONDS)
+                            MockResponse().setResponseCode(200).setBody(preArmThreeTurns)
+                        } else {
+                            MockResponse().setResponseCode(200).setBody(afterTurn4Body)
+                        }
+                    }
+                    "/api/global/event/ws" -> MockResponse().withWebSocketUpgrade(
+                        object : WebSocketListener() {
+                            override fun onOpen(webSocket: WebSocket, response: Response) {
+                                wsSocketRef.set(webSocket)
+                                webSocket.send("""{"type":"ready","scope":"global"}""")
+                                wsReadyLatch.countDown()
+                            }
+                        },
+                    )
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val autoSpeakLatch = CountDownLatch(1)
+                val (store, session, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.ARMED_IDLE },
+                    onAutoSpeak = { autoSpeakLatch.countDown() },
+                )
+
+                controller.setArmed(true)
+                assertTrue(wsReadyLatch.await(3, TimeUnit.SECONDS))
+                val readyFence = CountDownLatch(1)
+                val threeCompleted = async(Dispatchers.IO) {
+                    controller.observeEventsForActiveTurn(baseUrl, "ses_1") { readyFence.countDown() }
+                        .take(3)
+                        .toList()
+                }
+                assertTrue(readyFence.await(3, TimeUnit.SECONDS))
+
+                val armSync = async(Dispatchers.IO) {
+                    controller.syncSessionTurns("arm", triggerAutoSpeak = false)
+                }
+                assertTrue(get1Started.await(3, TimeUnit.SECONDS))
+
+                val ws = wsSocketRef.get()!!
+                ws.send("""{"type":"event","eventId":"e1","payload":{"type":"session.execution.succeeded","data":{"sessionID":"ses_1"}}}""")
+                ws.send("""{"type":"event","eventId":"e2","payload":{"type":"openchamber:session-status","properties":{"sessionID":"ses_1","status":"idle"}}}""")
+                ws.send("""{"type":"event","eventId":"e3","payload":{"type":"session.execution.succeeded","data":{"sessionID":"ses_1"}}}""")
+                assertEquals(listOf(TurnEvent.Completed, TurnEvent.Completed, TurnEvent.Completed), threeCompleted.await())
+
+                allowGet1Finish.countDown()
+                armSync.await()
+
+                assertTrue(autoSpeakLatch.await(3, TimeUnit.SECONDS))
+                assertEquals("idle_old3", store.getReplyCursor(session.sessionKey)?.armedBaselineMessageId)
+                assertEquals(listOf("a4"), controller.feedState.value.unreadQueue.map { it.messageId })
+                assertEquals("a4", controller.nextItemToAutoSpeak()?.messageId)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `syncForPromptTurnCompletion returns TurnStillRunning when earlier subagent reply is unread while sentUserMessageId is absent or tool-calls`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val currentBody = AtomicReference(
+                """
+                {
+                  "data": [
+                    {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                    {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Baseline reply"}]},
+                    {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                  ],
+                  "cursor":{}
+                }
+                """.trimIndent(),
+            )
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> MockResponse().setResponseCode(200).setBody(currentBody.get())
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val (_, _, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.WAITING_AGENT },
+                )
+                controller.syncSessionTurns("baseline")
+                controller.ensureAutoSpeakAnchorBeforeTurn("idle_1", 300L)
+                controller.ensureCursorSeededBeforeTurn("idle_1", 300L)
+
+                // 1) Earlier subagent unread reply exists while u2 is still absent from window -> TurnStillRunning
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"idle_sub","type":"idle","outcome":"succeeded","time":{"created":500}},
+                        {"id":"a_sub","type":"assistant","finish":"stop","time":{"created":450,"completed":480},"content":[{"type":"text","text":"Subagent finished."}]},
+                        {"id":"syn_sub","type":"synthetic","time":{"created":400},"metadata":{"source":"subagent","agent":"explore"},"text":"<subagent agent=\"explore\">done</subagent>"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Baseline reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                assertEquals(
+                    PromptTurnSettlement.TurnStillRunning,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+
+                // 2) u2 opened with 0 assistant records while a_sub is unread -> TurnStillRunning
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"u2","type":"user","time":{"created":600},"text":"Two"},
+                        {"id":"idle_sub","type":"idle","outcome":"succeeded","time":{"created":500}},
+                        {"id":"a_sub","type":"assistant","finish":"stop","time":{"created":450,"completed":480},"content":[{"type":"text","text":"Subagent finished."}]},
+                        {"id":"syn_sub","type":"synthetic","time":{"created":400},"metadata":{"source":"subagent","agent":"explore"},"text":"<subagent agent=\"explore\">done</subagent>"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Baseline reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                assertEquals(
+                    PromptTurnSettlement.TurnStillRunning,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+
+                // 3) u2 finished only a tool-calls step (!lastTurn.isIdle) -> TurnStillRunning
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"a2_1","type":"assistant","finish":"tool-calls","time":{"created":650,"completed":680},"content":[{"type":"text","text":"Let me check..."}]},
+                        {"id":"u2","type":"user","time":{"created":600},"text":"Two"},
+                        {"id":"idle_sub","type":"idle","outcome":"succeeded","time":{"created":500}},
+                        {"id":"a_sub","type":"assistant","finish":"stop","time":{"created":450,"completed":480},"content":[{"type":"text","text":"Subagent finished."}]},
+                        {"id":"syn_sub","type":"synthetic","time":{"created":400},"metadata":{"source":"subagent","agent":"explore"},"text":"<subagent agent=\"explore\">done</subagent>"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Baseline reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                assertEquals(
+                    PromptTurnSettlement.TurnStillRunning,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+
+                // 4) u2 produces final reply -> ReadyToSpeak
+                currentBody.set(
+                    """
+                    {
+                      "data": [
+                        {"id":"idle_2","type":"idle","outcome":"succeeded","time":{"created":750}},
+                        {"id":"a2_2","type":"assistant","finish":"stop","time":{"created":700,"completed":730},"content":[{"type":"text","text":"Final answer."}]},
+                        {"id":"a2_1","type":"assistant","finish":"tool-calls","time":{"created":650,"completed":680},"content":[{"type":"text","text":"Let me check..."}]},
+                        {"id":"u2","type":"user","time":{"created":600},"text":"Two"},
+                        {"id":"idle_sub","type":"idle","outcome":"succeeded","time":{"created":500}},
+                        {"id":"a_sub","type":"assistant","finish":"stop","time":{"created":450,"completed":480},"content":[{"type":"text","text":"Subagent finished."}]},
+                        {"id":"syn_sub","type":"synthetic","time":{"created":400},"metadata":{"source":"subagent","agent":"explore"},"text":"<subagent agent=\"explore\">done</subagent>"},
+                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                        {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Baseline reply"}]},
+                        {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                      ],
+                      "cursor":{}
+                    }
+                    """.trimIndent(),
+                )
+                assertEquals(
+                    PromptTurnSettlement.ReadyToSpeak,
+                    controller.syncForPromptTurnCompletion(sentUserMessageId = "u2", preSendLatestRecordId = "idle_1"),
+                )
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `resetSpeechProgressToPreparing and notifySpeechPlaybackStarted update progress across fallbacks`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val body = """
+                {
+                  "data": [
+                    {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                    {"id":"a1","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Fallback item"}]},
+                    {"id":"u1","type":"user","time":{"created":100},"text":"One"}
+                  ],
+                  "cursor":{}
+                }
+            """.trimIndent()
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> MockResponse().setResponseCode(200).setBody(body)
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                var nowElapsedMs = 1_000L
+                val (store, session, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.ARMED_IDLE },
+                    clockElapsedMs = { nowElapsedMs },
+                )
+                store.saveReplyCursor(
+                    session.sessionKey,
+                    SessionReplyCursor(armedBaselineMessageId = SessionTurnProjection.SESSION_START_BASELINE, updatedAtMs = 1L),
+                )
+                controller.setArmed(true)
+                controller.ensureAutoSpeakAnchorBeforeTurn(SessionTurnProjection.SESSION_START_BASELINE)
+                controller.syncSessionTurns("init")
+
+                // Resetting after an aborted engine prevents synthesis wait from counting as audible playback
+                controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 5_000L)
+                controller.resetSpeechProgressToPreparing("a1")
+                nowElapsedMs += 2_000L
+                controller.onUserBargeIn()
+                assertNull(store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+                assertEquals(listOf("a1"), controller.feedState.value.unreadQueue.map { it.messageId })
+
+                // Re-notifying updates start timestamp & estimated duration on the succeeding engine
+                nowElapsedMs = 5_000L
+                controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 5_000L)
+                nowElapsedMs = 10_000L
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 1_000L)
+                nowElapsedMs = 10_400L // 400ms < 500ms half-duration
+                controller.onUserBargeIn()
+                assertNull(store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+
+                nowElapsedMs = 20_000L
+                controller.setSpeakingMessage("a1")
+                controller.notifySpeechPlaybackStarted("a1", estimatedDurationMs = 1_000L)
+                nowElapsedMs = 20_500L // 500ms >= 500ms half-duration
+                controller.onUserBargeIn()
+                assertEquals("a1", store.getReplyCursor(session.sessionKey)?.lastHeardMessageId)
+                assertTrue(controller.feedState.value.unreadQueue.isEmpty())
+            } finally {
+                scope.cancel()
             }
         }
 }

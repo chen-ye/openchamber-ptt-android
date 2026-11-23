@@ -8,6 +8,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
 class BluetoothAudioRouterTest {
     private class FakeAudioRoutingPlatform(
@@ -18,6 +20,7 @@ class BluetoothAudioRouterTest {
         var pinScoResult: Boolean = true,
         var focusRequestResult: Boolean = true,
     ) : AudioRoutingPlatform {
+        var modeSetCalls = 0
         var pinCalls = 0
         var clearCalls = 0
         var focusRequests = 0
@@ -28,6 +31,7 @@ class BluetoothAudioRouterTest {
         override fun getMode(): Int? = audioMode
 
         override fun setMode(mode: Int) {
+            modeSetCalls++
             this.audioMode = mode
         }
 
@@ -433,5 +437,219 @@ class BluetoothAudioRouterTest {
             ),
             drop,
         )
+    }
+
+    @Test
+    fun `acquireCaptureAudio with telecomManaged true skips mode focus and pinSco while suppressing SCO drops`() {
+        val platform = FakeAudioRoutingPlatform(
+            sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+            audioMode = AudioManager.MODE_NORMAL,
+            scoAvailable = true,
+        )
+        val droppedEvents = mutableListOf<ScoDropEvent>()
+        val diagnostics = mutableListOf<Triple<String, String, Map<String, String>>>()
+        val router = BluetoothAudioRouter(appContext = null, audioManager = null, platform = platform) { 1000L }
+        router.startMonitoring { droppedEvents += it }
+        router.onDiagnosticEvent = { event, outcome, details ->
+            diagnostics += Triple(event, outcome, details)
+        }
+
+        assertTrue(router.acquireCaptureAudio(pinSco = true, telecomManaged = true))
+        assertFalse(router.isScoPinned)
+        assertTrue(router.isCurrentPinGeneration(1L))
+        assertEquals(AudioManager.MODE_NORMAL, platform.audioMode)
+        assertEquals(0, platform.modeSetCalls)
+        assertEquals(0, platform.focusRequests)
+        assertEquals(0, platform.pinCalls)
+        assertEquals(0, platform.clearCalls)
+
+        // Both communication device changes and SCO broadcasts are suppressed under Telecom ownership
+        assertNull(router.handleCommunicationDeviceChanged(AudioDeviceInfo.TYPE_BLUETOOTH_SCO))
+        assertNull(router.handleCommunicationDeviceChanged(null))
+        assertNull(
+            router.handleScoAudioStateUpdated(
+                state = AudioManager.SCO_AUDIO_STATE_CONNECTED,
+                previousState = AudioManager.SCO_AUDIO_STATE_CONNECTING,
+                isInitialSticky = false,
+            ),
+        )
+        assertNull(
+            router.handleScoAudioStateUpdated(
+                state = AudioManager.SCO_AUDIO_STATE_DISCONNECTED,
+                previousState = AudioManager.SCO_AUDIO_STATE_CONNECTED,
+                isInitialSticky = false,
+            ),
+        )
+        assertTrue(droppedEvents.isEmpty())
+        assertTrue(
+            diagnostics.any {
+                it.first == "handleCommunicationDeviceChanged" &&
+                    it.second == "IGNORED" &&
+                    it.third["reason"] == "telecom_managed"
+            },
+        )
+        assertTrue(
+            diagnostics.any {
+                it.first == "handleScoAudioStateUpdated" &&
+                    it.second == "IGNORED" &&
+                    it.third["reason"] == "telecom_managed"
+            },
+        )
+
+        // Release capture audio clears telecomManaged flag cleanly without calling clearSco/setMode
+        router.releaseCaptureAudio()
+        assertFalse(router.isScoPinned)
+        assertEquals(0, platform.clearCalls)
+        assertEquals(0, platform.modeSetCalls)
+    }
+
+    @Test
+    fun `acquireCaptureAudio with telecomManaged true clears lingering legacy SCO state and advances generations`() {
+        val platform = FakeAudioRoutingPlatform(
+            sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+            audioMode = AudioManager.MODE_NORMAL,
+            scoAvailable = true,
+        )
+        val router = BluetoothAudioRouter(appContext = null, audioManager = null, platform = platform) { 1000L }
+
+        assertTrue(router.acquireCaptureAudio(pinSco = true, telecomManaged = false))
+        assertTrue(router.isScoPinned)
+        assertEquals(1, platform.focusRequests)
+        assertEquals(1, platform.pinCalls)
+        assertEquals(AudioManager.MODE_IN_COMMUNICATION, platform.audioMode)
+
+        // Transitioning to Telecom-managed capture clears lingering SCO + focus and increments generations
+        assertTrue(router.acquireCaptureAudio(pinSco = true, telecomManaged = true))
+        assertFalse(router.isScoPinned)
+        assertFalse(router.isCurrentPinGeneration(1L))
+        assertTrue(router.isCurrentPinGeneration(2L))
+        assertEquals(1, platform.clearCalls)
+        assertEquals(1, platform.focusAbandons)
+        assertEquals(1, platform.focusRequests)
+        assertEquals(1, platform.pinCalls)
+        assertEquals(AudioManager.MODE_NORMAL, platform.audioMode)
+
+        // Stale focus listener from generation 1 is ignored
+        platform.dispatchFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT, listenerIndex = 0)
+        assertFalse(router.isScoPinned)
+    }
+
+    @Test
+    fun `acquirePlaybackFocus and releasePlaybackFocus isolate media focus from SCO pinning`() {
+        val platform = FakeAudioRoutingPlatform(
+            sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+            audioMode = AudioManager.MODE_NORMAL,
+            scoAvailable = true,
+        )
+        val router = BluetoothAudioRouter(appContext = null, audioManager = null, platform = platform) { 1000L }
+
+        // From idle, playback focus requests non-communication focus without pinning SCO or changing mode
+        assertTrue(router.acquirePlaybackFocus())
+        assertFalse(router.isScoPinned)
+        assertEquals(1, platform.focusRequests)
+        assertEquals(false, platform.lastFocusForComm)
+        assertEquals(0, platform.pinCalls)
+        assertEquals(0, platform.clearCalls)
+        assertEquals(0, platform.modeSetCalls)
+
+        // Releasing playback focus abandons focus without touching SCO
+        router.releasePlaybackFocus()
+        assertEquals(1, platform.focusAbandons)
+        assertEquals(0, platform.clearCalls)
+        assertEquals(0, platform.modeSetCalls)
+
+        // If SCO was lingering, acquirePlaybackFocus clears SCO and restores MODE_NORMAL
+        assertTrue(router.acquireCaptureAudio(pinSco = true, telecomManaged = false))
+        assertTrue(router.isScoPinned)
+        assertEquals(AudioManager.MODE_IN_COMMUNICATION, platform.audioMode)
+
+        assertTrue(router.acquirePlaybackFocus())
+        assertFalse(router.isScoPinned)
+        assertEquals(1, platform.clearCalls)
+        assertEquals(AudioManager.MODE_NORMAL, platform.audioMode)
+        assertEquals(false, platform.lastFocusForComm)
+        assertEquals(1, platform.pinCalls)
+
+        // releasePlaybackFocus does NOT abandon active CAPTURE focus
+        assertTrue(router.acquireCaptureAudio(pinSco = false, telecomManaged = false))
+        val abandonsBefore = platform.focusAbandons
+        router.releasePlaybackFocus()
+        assertEquals(abandonsBefore, platform.focusAbandons)
+        router.releaseCaptureAudio()
+        assertEquals(abandonsBefore + 1, platform.focusAbandons)
+    }
+
+    @Test
+    fun `onDiagnosticEvent reports exact suppression reasons and never holds lock`() {
+        val platform = FakeAudioRoutingPlatform(
+            sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+            audioMode = AudioManager.MODE_NORMAL,
+            scoAvailable = true,
+            currentCommDeviceType = AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        )
+        var nowMs = 1000L
+        val diagnostics = mutableListOf<Triple<String, String, Map<String, String>>>()
+        val router = BluetoothAudioRouter(appContext = null, audioManager = null, platform = platform) { nowMs }
+        router.onDiagnosticEvent = { event, outcome, details ->
+            // Calling a lock-acquiring getter from another thread proves lock is NOT held during callback
+            val pinnedFromWorker = CompletableFuture.supplyAsync { router.isScoPinned }
+                .get(1, TimeUnit.SECONDS)
+            assertTrue(pinnedFromWorker || !pinnedFromWorker)
+            diagnostics += Triple(event, outcome, details)
+        }
+
+        // 1. Sticky broadcast ignored
+        assertNull(
+            router.handleScoAudioStateUpdated(
+                state = AudioManager.SCO_AUDIO_STATE_DISCONNECTED,
+                previousState = AudioManager.SCO_AUDIO_STATE_CONNECTED,
+                isInitialSticky = true,
+            ),
+        )
+        assertEquals("sticky_broadcast", diagnostics.last().third["reason"])
+
+        // 2. SCO not pinned ignored
+        assertNull(router.handleCommunicationDeviceChanged(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE))
+        assertEquals("sco_not_pinned", diagnostics.last().third["reason"])
+
+        // 3. Within settle window ignored
+        assertTrue(router.acquireCaptureAudio(pinSco = true, telecomManaged = false))
+        nowMs = 1050L
+        assertNull(
+            router.handleScoAudioStateUpdated(
+                state = AudioManager.SCO_AUDIO_STATE_DISCONNECTED,
+                previousState = AudioManager.SCO_AUDIO_STATE_CONNECTED,
+                isInitialSticky = false,
+            ),
+        )
+        assertEquals("within_settle_window", diagnostics.last().third["reason"])
+
+        // 4. SCO never confirmed ignored
+        nowMs = 1400L
+        assertNull(router.handleCommunicationDeviceChanged(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE))
+        assertEquals("sco_never_confirmed", diagnostics.last().third["reason"])
+
+        // 5. Handshake failed (CONNECTING -> DISCONNECTED) ignored
+        assertNull(
+            router.handleScoAudioStateUpdated(
+                state = AudioManager.SCO_AUDIO_STATE_DISCONNECTED,
+                previousState = AudioManager.SCO_AUDIO_STATE_CONNECTING,
+                isInitialSticky = false,
+            ),
+        )
+        assertEquals("handshake_failed_connecting", diagnostics.last().third["reason"])
+
+        // 6. Focus interruption emits DROPPED diagnostic with reason = interrupted_by_focus
+        assertNull(router.handleCommunicationDeviceChanged(AudioDeviceInfo.TYPE_BLUETOOTH_SCO))
+        platform.dispatchFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        val drop = router.handleCommunicationDeviceChanged(null)
+        assertEquals(true, drop?.interruptedByFocusOrCall)
+        assertEquals("DROPPED", diagnostics.last().second)
+        assertEquals("interrupted_by_focus", diagnostics.last().third["reason"])
+
+        // 7. Stale pin generation on releaseIfGeneration
+        router.releaseIfGeneration(999L)
+        assertEquals("IGNORED", diagnostics.last().second)
+        assertEquals("stale_pin_generation", diagnostics.last().third["reason"])
     }
 }

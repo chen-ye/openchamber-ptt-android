@@ -70,10 +70,12 @@ Distinct sound cues (`studio` earcons, `CC0-1.0`) let you tell apart arming, rec
 - **Search by name or path:** Filter across session titles, IDs, and project directories—parents automatically expand when a nested subagent matches your query.
 - **Read-state preservation:** Top-level sessions with unseen replies (including failed unseen turns) display an unread dot and work with the **Unread** filter. Selecting or listening to a session here **does not** mark it read in OpenChamber desktop or web.
 
-### Floating Bubble & headset mic routing
+### Floating Bubble, headset mic & hands-free stop controls
 
 - **Floating Bubble:** Enable Bubbles via **Settings** → **Bubble Settings** to keep a compact PTT overlay floating over other apps.
-- **`Headset mic` toggle:** Leaves playback on high-quality A2DP media audio by default (using the phone mic). Toggle **Headset mic** on when you want Bluetooth HFP/SCO to capture through your headset microphone instead.
+- **`Headset mic` toggle:** Leaves spoken replies on stereo A2DP media audio at all times. Toggle **Headset mic** on when you want Bluetooth HFP/SCO to open your headset microphone strictly while recording.
+- **Smartwatch recording control:** While recording, a silent companion notification with a **Stop recording** action mirrors to Garmin and Wear OS watches (enabled by default under **Settings** → **Hardware Controls & Wearables**; enable OpenChamber PTT in Garmin Connect notifications and grant Android 13+ Notifications permission).
+- **Screen-off phone Volume-key stop & Headset call mode (opt-in):** For Bluetooth headsets like Shokz OpenRun Pro 2 that suppress AVRCP media taps while their HFP microphone is open, enable **Volume button stops recording (screen off)** to stop capture with a physical phone volume press, or enable **Headset call mode during recording** (`core-telecom`) so the headset's multifunction call-hangup button ends capture directly.
 
 ---
 
@@ -85,7 +87,10 @@ Tap the voice chip (for example `Gemini · Kore`) for quick voice selection, or 
   - **Spoken:** Rewrites technical markdown, code, and file paths into natural spoken prose at **Essentials**, **Balanced**, or **Detailed** depth, with a collapsible **Spoken summary** readout under the reply.
   - **Sanitized:** Strips markdown, code blocks, and URLs.
   - **Raw:** Speaks the exact reply text (also used automatically for staged draft readback).
+- **Audio Cues (`Hybrid` / `Vocal cues` / `Studio tones`):** Default **Hybrid** pairs crisp studio earcons for button taps and live-mic boundaries with short pre-cached spoken cues for latency bridges, blind spots, and errors—or switch to full **Vocal cues** or **Studio tones** in **Settings**.
+- **Voice Roles (`Main Agent`, `Operator`, `Vocal Cues`):** Customize distinct voices—and optionally pin a preferred engine—per role in **Voices** or **Settings** → **Voice Roles** with one-tap audio preview, or leave **Operator** and **Vocal Cues** on **Auto** for collision-free distinct defaults.
 - **Text-to-Speech Order:** Toggle and reorder **Gemini Bridge**, **Local Kokoro**, **ML Kit GenAI TTS**, **Android System TTS**, and **OpenAI Cloud**—the app automatically falls back down your enabled list.
+- **Client-side TTS & summary caching:** Spoken translations and synthesized audio clips (including warmed vocal cues and previews) are cached locally on device for instant offline re-reads and can be inspected or cleared under **Settings** → **TTS Cache**.
 - **Speech-to-Text:** Choose **OpenChamber Parakeet** (host transcription + cleanup) or on-device **ML Kit GenAI** (Advanced or Basic) with optional automatic fallback to Parakeet.
 - **Tool permission alerts:** When an agent waits on a tool approval, alerts hold for 4 seconds before announcing so server-side auto-approvers can handle routine approvals silently.
 
@@ -103,7 +108,8 @@ Tap the voice chip (for example `Gemini · Kore`) for quick voice selection, or 
 - **Headset button stops responding with screen off:** Open **Settings** → **Battery** (or tap **Battery Exempt** during initial setup) to exempt OpenChamber PTT from background battery restrictions, and make sure the app is **Armed** (not Disarmed).
 - **Audio sounds muffled when armed:** Turn **Headset mic** off to return Bluetooth output to A2DP media audio and use the phone microphone.
 - **ML Kit GenAI shows `Unavailable`:** Use **OpenChamber Parakeet** for STT and **Gemini Bridge**, **Local Kokoro**, **Android System TTS**, or **OpenAI Cloud** for TTS—or tap **Copy ML Kit diagnostics** in **Settings** to inspect device service availability.
-- **Telemetry export:** Open **Settings** → **View Voice UX Telemetry Log** to inspect or copy local timing and UX logs (`JSONL`) for debugging latency or headset tap detection.
+- **Headset button cannot stop recording while `Headset mic` is on:** Many Bluetooth headsets switch their multifunction button out of AVRCP media mode during active HFP mic capture. Under **Settings** → **Hardware Controls & Wearables**, use smartwatch **Stop recording** mirroring, enable **Volume button stops recording (screen off)**, or enable **Headset call mode during recording** (`core-telecom`), and use **Open Live Audio & BT Debug** to inspect live button, SCO, Telecom, and focus events on device.
+- **Telemetry & live audio diagnostics:** Open **Settings** → **Open Live Audio & BT Debug** for a live ring buffer of accepted and ignored button, route, Bluetooth, Telecom, and focus events, or **View Voice UX Telemetry Log** to copy local timing logs (`JSONL`).
 
 ---
 
@@ -141,4 +147,4 @@ bun scripts/capture-pixel10-pro-screenshot.mjs
 - [CI workflow](.github/workflows/ci.yml) runs unit tests, `lintDebug`, and `assembleDebug` on every pull request and push to `main`.
 - [Release workflow](.github/workflows/release.yml) builds and verifies a signed release APK on every `push` to `main` (updating the rolling `prerelease` tag and `openchamber-ptt-prerelease.apk`) and on `v*` tag pushes or manual `workflow_dispatch` runs (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`).
 
-Contributors and coding agents should also read [engineering invariants](AGENTS.md) and [design system tokens](DESIGN.md) before modifying lifecycle, audio, protocol, or UI code.
+Contributors and coding agents should also read [engineering invariants](AGENTS.md), [domain glossary](GLOSSARY.md), and [design system tokens](DESIGN.md) before modifying lifecycle, audio, protocol, or UI code.

@@ -757,6 +757,27 @@ class TokenStore(
             overrideUpdate = { it.copy(audioCueMode = mode) },
         )
 
+    fun getVolumeKeyStopRecording(): Boolean = prefs.getBoolean(KEY_VOLUME_KEY_STOP_RECORDING, false)
+
+    fun setVolumeKeyStopRecording(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_VOLUME_KEY_STOP_RECORDING, enabled).apply()
+        notifyChanged()
+    }
+
+    fun getTelecomCallForRecording(): Boolean = prefs.getBoolean(KEY_TELECOM_CALL_FOR_RECORDING, false)
+
+    fun setTelecomCallForRecording(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_TELECOM_CALL_FOR_RECORDING, enabled).apply()
+        notifyChanged()
+    }
+
+    fun getMirrorRecordingNotification(): Boolean = prefs.getBoolean(KEY_MIRROR_RECORDING_NOTIFICATION, true)
+
+    fun setMirrorRecordingNotification(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_MIRROR_RECORDING_NOTIFICATION, enabled).apply()
+        notifyChanged()
+    }
+
     fun getOrCreateInstallId(): String {
         val existing = prefs.getString(KEY_INSTALL_ID, null)?.takeIf { it.isNotBlank() }
         if (existing != null) return existing
@@ -954,6 +975,9 @@ class TokenStore(
         private const val KEY_QUICK_TURN_DIRECT_ANSWER = "quick_turn_direct_answer"
         private const val KEY_QUICK_TRANSCRIPT_CLEANUP = "quick_transcript_cleanup"
         private const val KEY_AUDIO_CUE_MODE = "audio_cue_mode"
+        private const val KEY_VOLUME_KEY_STOP_RECORDING = "volume_key_stop_recording"
+        private const val KEY_TELECOM_CALL_FOR_RECORDING = "telecom_call_for_recording"
+        private const val KEY_MIRROR_RECORDING_NOTIFICATION = "mirror_recording_notification"
         private const val KEY_ROLE_VOICE_PROFILES = "role_voice_profiles_v1"
         const val DEFAULT_TTS_VOICE = "Kore"
         private const val KEY_INSTALL_ID = "install_id"

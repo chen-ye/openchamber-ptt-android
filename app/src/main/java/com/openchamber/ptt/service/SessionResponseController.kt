@@ -1,5 +1,6 @@
 package com.openchamber.ptt.service
 
+import android.os.SystemClock
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.SessionReplyCursor
 import com.openchamber.ptt.storage.TokenStore
@@ -42,6 +43,32 @@ internal data class BoundServerSession(
     val sessionKey: String = TokenStore.sessionKeyFor(serverId, pinnedSession),
 )
 
+internal sealed interface AutoSpeakWatermark {
+    val armEpoch: Long
+
+    data class Uninitialized(
+        override val armEpoch: Long,
+        val liveCompletionCount: Int = 0,
+        val liveCompletionSeq: Long = 0L,
+        val minFloorMessageId: String? = null,
+        val minFloorCreatedAtMs: Long = 0L,
+        val inCompletedStreak: Boolean = false,
+    ) : AutoSpeakWatermark
+
+    data class Established(
+        override val armEpoch: Long,
+        val anchorMessageId: String,
+        val anchorCreatedAtMs: Long,
+    ) : AutoSpeakWatermark
+}
+
+internal sealed interface PromptTurnSettlement {
+    data object ReadyToSpeak : PromptTurnSettlement
+    data object SettledNoSpeech : PromptTurnSettlement
+    data object TurnStillRunning : PromptTurnSettlement
+    data object FlushLagRetryNeeded : PromptTurnSettlement
+}
+
 internal class SessionResponseController(
     private val scope: CoroutineScope,
     private val tokenStore: TokenStore,
@@ -54,7 +81,22 @@ internal class SessionResponseController(
     private val wallClockMs: () -> Long = { System.currentTimeMillis() },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val lookupCachedSpokenSummary: ((String) -> String?)? = null,
+    private val clockElapsedMs: () -> Long = { defaultElapsedMs() },
 ) {
+    private sealed interface ActiveSpeechProgress {
+        val messageId: String
+
+        data class Preparing(
+            override val messageId: String,
+        ) : ActiveSpeechProgress
+
+        data class Audible(
+            override val messageId: String,
+            val startedAtElapsedMs: Long,
+            val estimatedDurationMs: Long?,
+        ) : ActiveSpeechProgress
+    }
+
     private val stateLock = Any()
     private val syncMutex = Mutex()
     private val _feedState = MutableStateFlow(ResponseFeedState())
@@ -69,9 +111,9 @@ internal class SessionResponseController(
     private var armed: Boolean = false
     private var activePromptTurn: Boolean = false
 
-    private var autoSpeakAnchorId: String? = null
-    private var autoSpeakAnchorCreatedAtMs: Long = 0L
-    private var needsArmedAnchorCapture: Boolean = false
+    private var armEpochCounter: Long = 0L
+    private var watermark: AutoSpeakWatermark? = null
+    private var activeSpeechProgress: ActiveSpeechProgress? = null
     private var lastInterruptedMessageId: String? = null
     private var userNavigatedFocus: Boolean = false
     private var initialSyncDoneForSession: Boolean = false
@@ -84,7 +126,6 @@ internal class SessionResponseController(
     private var activeSyncLoopToken: Any? = null
     private var resyncRequested: Boolean = false
     private var pendingTriggerAutoSpeak: Boolean = false
-    private var pendingCaptureAutoSpeakAnchor: Boolean = false
     private var pendingForceFocusLatest: Boolean = false
     private var pendingReason: String? = null
     private val pendingWaiters = mutableListOf<CompletableDeferred<Result<ResponseFeedState>>>()
@@ -116,15 +157,19 @@ internal class SessionResponseController(
                 val prev = boundSession
                 if (prev?.sessionKey == session.sessionKey) {
                     boundSession = session
-                    if (armed &&
-                        (streamServerUrl != session.serverUrl ||
+                    if (armed) {
+                        if (watermark == null) {
+                            watermark = createUninitializedWatermarkLocked(session)
+                        }
+                        if (streamServerUrl != session.serverUrl ||
                             streamSessionId != session.pinnedSession.sessionId ||
-                            armedStreamJob?.isActive != true)
-                    ) {
-                        val cancelled = detachArmedStreamLocked()
-                        oldStreamJob = cancelled.first
-                        oldReadySignal = cancelled.second
-                        newStreamJob = prepareArmedStreamLocked(session, sessionGeneration)
+                            armedStreamJob?.isActive != true
+                        ) {
+                            val cancelled = detachArmedStreamLocked()
+                            oldStreamJob = cancelled.first
+                            oldReadySignal = cancelled.second
+                            newStreamJob = prepareArmedStreamLocked(session, sessionGeneration)
+                        }
                     }
                 } else {
                     boundSession = session
@@ -144,6 +189,7 @@ internal class SessionResponseController(
                             cursor = cursor,
                             previousState = ResponseFeedState(),
                             forceFocusLatest = false,
+                            reachedHistoryStart = cached.reachedHistoryStart,
                         )
                         seenCompletedIds.addAll(
                             cached.turns.asSequence()
@@ -160,11 +206,7 @@ internal class SessionResponseController(
                     notifyFeed = nextFeed
 
                     if (armed) {
-                        if (cached != null && autoSpeakAnchorId == null) {
-                            setAutoSpeakAnchorFromWindowLocked(cached)
-                        } else if (autoSpeakAnchorId == null) {
-                            needsArmedAnchorCapture = true
-                        }
+                        watermark = createUninitializedWatermarkLocked(session)
                         newStreamJob = prepareArmedStreamLocked(session, sessionGeneration)
                     }
                 }
@@ -186,12 +228,12 @@ internal class SessionResponseController(
         var notifyFeed: ResponseFeedState? = null
 
         synchronized(stateLock) {
+            val wasArmed = this.armed
             this.armed = armed
             if (!armed) {
                 activePromptTurn = false
-                autoSpeakAnchorId = null
-                autoSpeakAnchorCreatedAtMs = 0L
-                needsArmedAnchorCapture = false
+                watermark = null
+                activeSpeechProgress = null
                 val cancelled = detachArmedStreamLocked()
                 oldStreamJob = cancelled.first
                 oldReadySignal = cancelled.second
@@ -204,13 +246,8 @@ internal class SessionResponseController(
             } else {
                 val session = boundSession
                 if (session != null) {
-                    if (autoSpeakAnchorId == null) {
-                        val cached = windowCache[session.sessionKey]
-                        if (cached != null) {
-                            setAutoSpeakAnchorFromWindowLocked(cached)
-                        } else {
-                            needsArmedAnchorCapture = true
-                        }
+                    if (!wasArmed || watermark == null) {
+                        watermark = createUninitializedWatermarkLocked(session)
                     }
                     val alreadyStreamingSameTarget = armedStreamJob?.isActive == true &&
                         streamServerUrl == session.serverUrl &&
@@ -282,24 +319,31 @@ internal class SessionResponseController(
         }
     }
 
-    fun ensureAutoSpeakAnchorBeforeTurn(baselineMessageId: String?) {
+    fun ensureAutoSpeakAnchorBeforeTurn(
+        baselineMessageId: String?,
+        baselineCreatedAtMs: Long = 0L,
+    ) {
         synchronized(stateLock) {
-            if (autoSpeakAnchorId != null) {
-                needsArmedAnchorCapture = false
+            if (watermark is AutoSpeakWatermark.Established) {
                 return
             }
             val cleaned = baselineMessageId?.trim()?.takeIf { it.isNotEmpty() }
-            if (cleaned == null || cleaned == SessionTurnProjection.SESSION_START_BASELINE) {
-                autoSpeakAnchorId = SessionTurnProjection.SESSION_START_BASELINE
-                autoSpeakAnchorCreatedAtMs = 0L
+            val anchorId = cleaned ?: SessionTurnProjection.SESSION_START_BASELINE
+            val anchorTs = if (anchorId == SessionTurnProjection.SESSION_START_BASELINE) {
+                0L
+            } else if (baselineCreatedAtMs > 0L) {
+                baselineCreatedAtMs
             } else {
-                autoSpeakAnchorId = cleaned
-                val sessionKey = boundSession?.sessionKey
-                autoSpeakAnchorCreatedAtMs = sessionKey
-                    ?.let { windowCache[it]?.records?.firstOrNull { rec -> rec.id == cleaned }?.createdAtMs }
+                boundSession?.sessionKey
+                    ?.let { windowCache[it]?.records?.firstOrNull { rec -> rec.id == anchorId }?.createdAtMs }
                     ?: 0L
             }
-            needsArmedAnchorCapture = false
+            val epoch = (watermark as? AutoSpeakWatermark.Uninitialized)?.armEpoch ?: ++armEpochCounter
+            watermark = AutoSpeakWatermark.Established(
+                armEpoch = epoch,
+                anchorMessageId = anchorId,
+                anchorCreatedAtMs = anchorTs,
+            )
         }
     }
 
@@ -331,7 +375,6 @@ internal class SessionResponseController(
     fun requestBackgroundSync(
         reason: String,
         triggerAutoSpeak: Boolean = false,
-        captureAutoSpeakAnchor: Boolean = false,
         forceFocusLatest: Boolean = false,
     ) {
         val loopTokenToStart: Any?
@@ -340,7 +383,6 @@ internal class SessionResponseController(
             enqueueSyncRequestLocked(
                 reason = reason,
                 triggerAutoSpeak = triggerAutoSpeak,
-                captureAutoSpeakAnchor = captureAutoSpeakAnchor,
                 forceFocusLatest = forceFocusLatest,
                 waiter = null,
             )
@@ -358,7 +400,6 @@ internal class SessionResponseController(
     suspend fun syncSessionTurns(
         reason: String,
         triggerAutoSpeak: Boolean = false,
-        captureAutoSpeakAnchor: Boolean = false,
         forceFocusLatest: Boolean = false,
         throwOnError: Boolean = false,
     ): ResponseFeedState {
@@ -371,7 +412,6 @@ internal class SessionResponseController(
             enqueueSyncRequestLocked(
                 reason = reason,
                 triggerAutoSpeak = triggerAutoSpeak,
-                captureAutoSpeakAnchor = captureAutoSpeakAnchor,
                 forceFocusLatest = forceFocusLatest,
                 waiter = waiter,
             )
@@ -389,6 +429,27 @@ internal class SessionResponseController(
             if (err is CancellationException) throw err
             if (throwOnError) throw err
             _feedState.value
+        }
+    }
+
+    suspend fun syncForPromptTurnCompletion(
+        sentUserMessageId: String?,
+        preSendLatestRecordId: String?,
+    ): PromptTurnSettlement {
+        syncSessionTurns(
+            reason = "turn_completed",
+            triggerAutoSpeak = false,
+            throwOnError = true,
+        )
+        return synchronized(stateLock) {
+            val session = boundSession ?: return@synchronized PromptTurnSettlement.SettledNoSpeech
+            val window = windowCache[session.sessionKey] ?: return@synchronized PromptTurnSettlement.SettledNoSpeech
+            classifyPromptTurnSettlementLocked(
+                window = window,
+                feed = _feedState.value,
+                sentUserMessageId = sentUserMessageId,
+                preSendLatestRecordId = preSendLatestRecordId,
+            )
         }
     }
 
@@ -439,6 +500,9 @@ internal class SessionResponseController(
             if (clearInterrupted) {
                 lastInterruptedMessageId = null
             }
+            if (activeSpeechProgress?.messageId == item.messageId) {
+                activeSpeechProgress = null
+            }
             val changed = markItemHeardLocked(session, item)
             if (changed) {
                 val reprojected = reprojectCurrentFeedLocked(forceFocusLatest = false)
@@ -455,6 +519,7 @@ internal class SessionResponseController(
             val session = boundSession ?: return
             val cur = _feedState.value
             lastInterruptedMessageId = null
+            activeSpeechProgress = null
             val latestCompleted = cur.allResponses.lastOrNull { it.isCompleted }
                 ?: cur.inspectableResponses.lastOrNull { it.isCompleted }
             if (latestCompleted != null) {
@@ -474,18 +539,56 @@ internal class SessionResponseController(
         notifyFeed?.let(onFeedUpdated)
     }
 
-    fun onUserBargeIn() {
+    fun notifySpeechPlaybackStarted(
+        messageId: String?,
+        estimatedDurationMs: Long?,
+    ) {
+        val cleanedId = messageId?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        val sanitizedDuration = estimatedDurationMs?.takeIf { it > 0L }
+        val startedAt = clockElapsedMs()
+        synchronized(stateLock) {
+            if (_feedState.value.speakingMessageId != cleanedId) {
+                return
+            }
+            activeSpeechProgress = ActiveSpeechProgress.Audible(
+                messageId = cleanedId,
+                startedAtElapsedMs = startedAt,
+                estimatedDurationMs = sanitizedDuration,
+            )
+        }
+    }
+
+    fun resetSpeechProgressToPreparing(messageId: String?) {
+        val cleanedId = messageId?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        synchronized(stateLock) {
+            if (_feedState.value.speakingMessageId == cleanedId) {
+                activeSpeechProgress = ActiveSpeechProgress.Preparing(cleanedId)
+            }
+        }
+    }
+
+    fun onUserBargeIn(nowElapsedMs: Long = clockElapsedMs()) {
         var notifyFeed: ResponseFeedState? = null
         synchronized(stateLock) {
             val session = boundSession
             val cur = _feedState.value
             val speakingId = cur.speakingMessageId
+            val progress = activeSpeechProgress
+            activeSpeechProgress = null
             if (speakingId != null) {
                 lastInterruptedMessageId = speakingId
-                val item = cur.allResponses.firstOrNull { it.messageId == speakingId }
-                    ?: cur.unreadQueue.firstOrNull { it.messageId == speakingId }
-                if (session != null && item != null) {
-                    markItemHeardLocked(session, item)
+                val shouldCommitHeard = progress is ActiveSpeechProgress.Audible &&
+                    progress.messageId == speakingId &&
+                    isAudibleCommitThresholdReached(
+                        audibleMs = (nowElapsedMs - progress.startedAtElapsedMs).coerceAtLeast(0L),
+                        estimatedDurationMs = progress.estimatedDurationMs,
+                    )
+                if (shouldCommitHeard && session != null) {
+                    val item = cur.allResponses.firstOrNull { it.messageId == speakingId }
+                        ?: cur.unreadQueue.firstOrNull { it.messageId == speakingId }
+                    if (item != null) {
+                        markItemHeardLocked(session, item)
+                    }
                 }
                 val reprojected = reprojectCurrentFeedLocked(forceFocusLatest = false)
                 val updated = reprojected.copy(
@@ -507,26 +610,56 @@ internal class SessionResponseController(
         notifyFeed?.let(onFeedUpdated)
     }
 
+    fun onSpeechInterruptedByTransport() {
+        var notifyFeed: ResponseFeedState? = null
+        synchronized(stateLock) {
+            activeSpeechProgress = null
+            val cur = _feedState.value
+            val speakingId = cur.speakingMessageId
+            if (speakingId != null) {
+                lastInterruptedMessageId = speakingId
+            }
+            if (speakingId != null || !cur.autoSpeakPaused) {
+                val updated = cur.copy(
+                    focusedMessageId = speakingId ?: cur.focusedMessageId,
+                    speakingMessageId = null,
+                    autoSpeakPaused = true,
+                )
+                _feedState.value = updated
+                notifyFeed = updated
+            }
+        }
+        notifyFeed?.let(onFeedUpdated)
+    }
+
     fun setSpeakingMessage(messageId: String?) {
         var notifyFeed: ResponseFeedState? = null
         synchronized(stateLock) {
+            val cleanedId = messageId?.trim()?.takeIf { it.isNotEmpty() }
             val cur = _feedState.value
-            if (messageId != null && messageId != lastInterruptedMessageId) {
-                lastInterruptedMessageId = null
+            if (cleanedId == null) {
+                activeSpeechProgress = null
+            } else {
+                if (cleanedId != lastInterruptedMessageId) {
+                    lastInterruptedMessageId = null
+                }
+                if (activeSpeechProgress?.messageId != cleanedId) {
+                    activeSpeechProgress = ActiveSpeechProgress.Preparing(cleanedId)
+                }
             }
-            val nextFocusedId = if (messageId != null &&
-                cur.inspectableResponses.any { it.messageId == messageId }
+            val nextFocusedId = if (cleanedId != null &&
+                cur.inspectableResponses.any { it.messageId == cleanedId }
             ) {
-                messageId
+                cleanedId
             } else {
                 cur.focusedMessageId
             }
-            if (messageId != null && nextFocusedId == cur.inspectableResponses.lastOrNull()?.messageId) {
+            if (cleanedId != null && nextFocusedId == cur.inspectableResponses.lastOrNull()?.messageId) {
                 userNavigatedFocus = false
             }
             val updated = cur.copy(
                 focusedMessageId = nextFocusedId,
-                speakingMessageId = messageId,
+                speakingMessageId = cleanedId,
             )
             if (updated != cur) {
                 _feedState.value = updated
@@ -725,10 +858,11 @@ internal class SessionResponseController(
                     val targetSession: BoundServerSession?
                     val targetGen: Long
                     val doAutoSpeak: Boolean
-                    val doCaptureAnchor: Boolean
                     val doForceFocus: Boolean
                     val iterationWaiters: List<CompletableDeferred<Result<ResponseFeedState>>>
                     val cursorBeforeFetch: SessionReplyCursor?
+                    val fetchArmEpoch: Long?
+                    val fetchLiveSeq: Long
                     @Suppress("UNUSED_VARIABLE")
                     val reason: String
 
@@ -741,11 +875,9 @@ internal class SessionResponseController(
                         }
                         resyncRequested = false
                         doAutoSpeak = pendingTriggerAutoSpeak
-                        doCaptureAnchor = pendingCaptureAutoSpeakAnchor
                         doForceFocus = pendingForceFocusLatest
                         reason = pendingReason ?: initialReason
                         pendingTriggerAutoSpeak = false
-                        pendingCaptureAutoSpeakAnchor = false
                         pendingForceFocusLatest = false
                         pendingReason = null
                         iterationWaiters = pendingWaiters.toList()
@@ -753,6 +885,9 @@ internal class SessionResponseController(
                         targetSession = boundSession
                         targetGen = sessionGeneration
                         cursorBeforeFetch = targetSession?.let { tokenStore.getReplyCursor(it.sessionKey) }
+                        val watermarkSnapshot = watermark
+                        fetchArmEpoch = watermarkSnapshot?.armEpoch
+                        fetchLiveSeq = (watermarkSnapshot as? AutoSpeakWatermark.Uninitialized)?.liveCompletionSeq ?: 0L
                     }
                     activeWaiters = iterationWaiters
 
@@ -806,7 +941,8 @@ internal class SessionResponseController(
                             val result = applyWindowLocked(
                                 session = targetSession,
                                 window = window,
-                                captureAutoSpeakAnchor = doCaptureAnchor,
+                                fetchArmEpoch = fetchArmEpoch,
+                                fetchLiveSeq = fetchLiveSeq,
                                 forceFocusLatest = doForceFocus,
                                 triggerAutoSpeak = doAutoSpeak,
                             )
@@ -842,7 +978,6 @@ internal class SessionResponseController(
                 activeSyncLoopToken = null
                 resyncRequested = false
                 pendingTriggerAutoSpeak = false
-                pendingCaptureAutoSpeakAnchor = false
                 pendingForceFocusLatest = false
                 pendingReason = null
                 orphanedWaiters = pendingWaiters.toList()
@@ -857,14 +992,83 @@ internal class SessionResponseController(
     private fun applyWindowLocked(
         session: BoundServerSession,
         window: TurnsWindow,
-        captureAutoSpeakAnchor: Boolean,
+        fetchArmEpoch: Long?,
+        fetchLiveSeq: Long,
         forceFocusLatest: Boolean,
         triggerAutoSpeak: Boolean,
     ): Pair<ResponseFeedState, Boolean> {
         cacheWindowLocked(session.sessionKey, window)
 
+        val curWatermark = watermark
+        val waitingForNewerResync = curWatermark is AutoSpeakWatermark.Uninitialized &&
+            !activePromptTurn &&
+            resyncRequested &&
+            (fetchArmEpoch != curWatermark.armEpoch || fetchLiveSeq < curWatermark.liveCompletionSeq)
+
+        if (waitingForNewerResync) {
+            val existingCursor = tokenStore.getReplyCursor(session.sessionKey)
+            val projected = hydrateFocusedSpokenSummaryLocked(
+                SessionTurnProjection.projectResponseFeed(
+                    chronologicalRecords = window.records,
+                    turns = window.turns,
+                    cursor = existingCursor,
+                    previousState = _feedState.value,
+                    forceFocusLatest = false,
+                    reachedHistoryStart = window.reachedHistoryStart,
+                ),
+            )
+            _feedState.value = projected
+            return projected to false
+        }
+
         var cursor = tokenStore.getReplyCursor(session.sessionKey)
-        if (cursor == null) {
+        if (curWatermark is AutoSpeakWatermark.Uninitialized && !activePromptTurn) {
+            val cursorHeardId = cursor?.lastHeardMessageId?.trim()?.takeIf { it.isNotEmpty() }
+            val cursorHeardTs = if (cursorHeardId != null) cursor.lastHeardCreatedAtMs.coerceAtLeast(0L) else 0L
+            val (effectiveFloorId, effectiveFloorTs) = SessionTurnProjection.resolveHigherFloor(
+                records = window.records,
+                firstId = curWatermark.minFloorMessageId,
+                firstCreatedAtMs = curWatermark.minFloorCreatedAtMs,
+                secondId = cursorHeardId,
+                secondCreatedAtMs = cursorHeardTs,
+            )
+            val (anchorId, anchorTs) = if (curWatermark.liveCompletionCount > 0) {
+                SessionTurnProjection.computeRolledBackSettledAnchor(
+                    turns = window.turns,
+                    records = window.records,
+                    settledTurnsToStepBack = curWatermark.liveCompletionCount,
+                    minFloorMessageId = effectiveFloorId,
+                    minFloorCreatedAtMs = effectiveFloorTs,
+                )
+            } else {
+                val rawId = window.latestSettledMessageId ?: SessionTurnProjection.SESSION_START_BASELINE
+                val rawTs = if (rawId == SessionTurnProjection.SESSION_START_BASELINE) {
+                    0L
+                } else {
+                    window.records.firstOrNull { it.id == rawId }?.createdAtMs ?: 0L
+                }
+                SessionTurnProjection.clampAnchorToFloor(
+                    candidateId = rawId,
+                    candidateCreatedAtMs = rawTs,
+                    records = window.records,
+                    minFloorMessageId = effectiveFloorId,
+                    minFloorCreatedAtMs = effectiveFloorTs,
+                )
+            }
+            watermark = AutoSpeakWatermark.Established(
+                armEpoch = curWatermark.armEpoch,
+                anchorMessageId = anchorId,
+                anchorCreatedAtMs = anchorTs,
+            )
+            if (cursor == null) {
+                cursor = SessionReplyCursor(
+                    armedBaselineMessageId = anchorId,
+                    armedBaselineCreatedAtMs = anchorTs,
+                    updatedAtMs = wallClockMs(),
+                )
+                tokenStore.saveReplyCursor(session.sessionKey, cursor)
+            }
+        } else if (cursor == null && curWatermark !is AutoSpeakWatermark.Uninitialized) {
             val baselineId = window.latestSettledMessageId ?: SessionTurnProjection.SESSION_START_BASELINE
             val baselineCreatedAt = if (baselineId == SessionTurnProjection.SESSION_START_BASELINE) {
                 0L
@@ -877,10 +1081,6 @@ internal class SessionResponseController(
                 updatedAtMs = wallClockMs(),
             )
             tokenStore.saveReplyCursor(session.sessionKey, cursor)
-        }
-
-        if ((captureAutoSpeakAnchor || needsArmedAnchorCapture) && !activePromptTurn) {
-            setAutoSpeakAnchorFromWindowLocked(window)
         }
 
         val allCompleted = window.turns
@@ -943,6 +1143,7 @@ internal class SessionResponseController(
                     directAnswer = if (newTurnOrResponseArrived) null else prevFeed.directAnswer,
                 ),
                 forceFocusLatest = effectiveForceFocusLatest,
+                reachedHistoryStart = window.reachedHistoryStart,
             ),
         )
 
@@ -955,6 +1156,7 @@ internal class SessionResponseController(
         val state = currentState()
         val shouldTrigger = triggerAutoSpeak &&
             armed &&
+            !activePromptTurn &&
             (state == PttState.ARMED_IDLE || state == PttState.STAGED_DRAFT) &&
             !projected.autoSpeakPaused &&
             !playbackBusy &&
@@ -1009,6 +1211,7 @@ internal class SessionResponseController(
                 cursor = cursor,
                 previousState = cur,
                 forceFocusLatest = forceFocusLatest,
+                reachedHistoryStart = cached?.reachedHistoryStart ?: false,
             ),
         )
         if (projected.focusedMessageId == projected.inspectableResponses.lastOrNull()?.messageId) {
@@ -1031,6 +1234,7 @@ internal class SessionResponseController(
                 cursor = cursor,
                 previousState = cur,
                 forceFocusLatest = false,
+                reachedHistoryStart = cached.reachedHistoryStart,
             ),
         )
         _feedState.value = projected
@@ -1069,33 +1273,126 @@ internal class SessionResponseController(
         records: List<ParsedSessionRecord>,
         reachedHistoryStart: Boolean,
     ): Boolean {
-        val anchorId = autoSpeakAnchorId ?: return !(armed && needsArmedAnchorCapture)
-        if (anchorId == SessionTurnProjection.SESSION_START_BASELINE) return true
-        if (records.isNotEmpty()) {
-            val anchorIdx = records.indexOfFirst { it.id == anchorId }
-            val itemIdx = records.indexOfFirst { it.id == item.messageId }
-            if (anchorIdx >= 0 && itemIdx >= 0) {
-                return itemIdx > anchorIdx
-            }
-            if (anchorIdx < 0 && !reachedHistoryStart && autoSpeakAnchorCreatedAtMs <= 0L) {
-                return true
+        return when (val w = watermark) {
+            null -> !armed
+            is AutoSpeakWatermark.Uninitialized -> false
+            is AutoSpeakWatermark.Established -> {
+                val anchorId = w.anchorMessageId
+                if (anchorId == SessionTurnProjection.SESSION_START_BASELINE) return true
+                if (records.isNotEmpty()) {
+                    val anchorIdx = records.indexOfFirst { it.id == anchorId }
+                    val itemIdx = records.indexOfFirst { it.id == item.messageId }
+                    if (anchorIdx >= 0 && itemIdx >= 0) {
+                        return itemIdx > anchorIdx
+                    }
+                    if (anchorIdx < 0 && !reachedHistoryStart && w.anchorCreatedAtMs <= 0L) {
+                        return true
+                    }
+                }
+                if (w.anchorCreatedAtMs > 0L) {
+                    return item.createdAtMs > w.anchorCreatedAtMs
+                }
+                false
             }
         }
-        if (autoSpeakAnchorCreatedAtMs > 0L) {
-            return item.createdAtMs > autoSpeakAnchorCreatedAtMs
-        }
-        return false
     }
 
-    private fun setAutoSpeakAnchorFromWindowLocked(window: TurnsWindow) {
-        val anchorId = window.latestSettledMessageId ?: SessionTurnProjection.SESSION_START_BASELINE
-        autoSpeakAnchorId = anchorId
-        autoSpeakAnchorCreatedAtMs = if (anchorId == SessionTurnProjection.SESSION_START_BASELINE) {
-            0L
+    private fun createUninitializedWatermarkLocked(session: BoundServerSession): AutoSpeakWatermark.Uninitialized {
+        val persistedCursor = tokenStore.getReplyCursor(session.sessionKey)
+        val minFloorId = persistedCursor?.lastHeardMessageId?.trim()?.takeIf { it.isNotEmpty() }
+        val minFloorTs = if (minFloorId != null) {
+            persistedCursor.lastHeardCreatedAtMs.coerceAtLeast(0L)
         } else {
-            window.records.firstOrNull { it.id == anchorId }?.createdAtMs ?: 0L
+            0L
         }
-        needsArmedAnchorCapture = false
+        armEpochCounter += 1L
+        return AutoSpeakWatermark.Uninitialized(
+            armEpoch = armEpochCounter,
+            liveCompletionCount = 0,
+            liveCompletionSeq = 0L,
+            minFloorMessageId = minFloorId,
+            minFloorCreatedAtMs = minFloorTs,
+        )
+    }
+
+    private fun classifyPromptTurnSettlementLocked(
+        window: TurnsWindow,
+        feed: ResponseFeedState,
+        sentUserMessageId: String?,
+        preSendLatestRecordId: String?,
+    ): PromptTurnSettlement {
+        val cleanSentUserId = sentUserMessageId?.trim()?.takeIf { it.isNotEmpty() }
+        val cleanPreSendId = preSendLatestRecordId?.trim()?.takeIf { it.isNotEmpty() }
+        val records = window.records
+        val latestRecordId = records.lastOrNull()?.id
+
+        val sentUserIdx = cleanSentUserId?.let { id -> records.indexOfFirst { it.id == id } } ?: -1
+        if (cleanSentUserId != null && sentUserIdx < 0) {
+            return PromptTurnSettlement.TurnStillRunning
+        }
+
+        val preSendIdx = cleanPreSendId?.let { id -> records.indexOfFirst { it.id == id } } ?: -1
+        val postSendStartIdx = when {
+            sentUserIdx >= 0 -> sentUserIdx
+            cleanPreSendId != null && preSendIdx >= 0 -> preSendIdx + 1
+            cleanPreSendId != null && cleanPreSendId == latestRecordId -> records.size
+            else -> 0
+        }
+
+        val hasIncompletePostSendAssistant = postSendStartIdx < records.size &&
+            SessionTurnProjection.hasIncompleteAssistantFrom(records, postSendStartIdx)
+        if (hasIncompletePostSendAssistant) {
+            return PromptTurnSettlement.FlushLagRetryNeeded
+        }
+
+        if (postSendStartIdx >= records.size) {
+            return PromptTurnSettlement.FlushLagRetryNeeded
+        }
+
+        val lastTurn = window.turns.lastOrNull()
+        val promptTurnSettled = if (sentUserIdx >= 0) {
+            val postUserRecords = records.subList(sentUserIdx, records.size)
+            val postUserAssistants = postUserRecords.filterIsInstance<ParsedSessionRecord.AssistantRecord>()
+            val hasIdleAfterSent = postUserRecords.any { it is ParsedSessionRecord.IdleRecord }
+            val trailingAssistant = postUserAssistants.lastOrNull()
+            (lastTurn?.isIdle == true) ||
+                hasIdleAfterSent ||
+                (trailingAssistant != null && trailingAssistant.finish != "tool-calls")
+        } else {
+            true
+        }
+        if (!promptTurnSettled) {
+            return PromptTurnSettlement.TurnStillRunning
+        }
+
+        val nextSpeakItem = nextItemToAutoSpeakLocked(feed, window)
+        if (nextSpeakItem != null) {
+            return PromptTurnSettlement.ReadyToSpeak
+        }
+
+        if (lastTurn != null && !lastTurn.isIdle) {
+            val lastTurnStartIdx = records.indexOfFirst { it.id == lastTurn.turnId }.coerceAtLeast(postSendStartIdx)
+            val lastTurnRecords = records.subList(lastTurnStartIdx, records.size)
+            val hasNonToolCallCompletedAssistant = lastTurnRecords.any { rec ->
+                rec is ParsedSessionRecord.AssistantRecord && rec.finish != "tool-calls"
+            }
+            val lastTurnHasCompletedResponses = lastTurn.responses.any { it.isCompleted }
+            if (!lastTurnHasCompletedResponses && !hasNonToolCallCompletedAssistant) {
+                return PromptTurnSettlement.TurnStillRunning
+            }
+        }
+
+        return PromptTurnSettlement.SettledNoSpeech
+    }
+
+    private fun isAudibleCommitThresholdReached(
+        audibleMs: Long,
+        estimatedDurationMs: Long?,
+    ): Boolean {
+        if (audibleMs >= MIN_AUDIBLE_COMMIT_MS) return true
+        return estimatedDurationMs != null &&
+            estimatedDurationMs < SHORT_CLIP_THRESHOLD_MS &&
+            audibleMs >= estimatedDurationMs / 2L
     }
 
     private fun prepareArmedStreamLocked(
@@ -1113,27 +1410,61 @@ internal class SessionResponseController(
                     targetSessionId = session.pinnedSession.sessionId,
                     onReady = { readySignal.complete(Unit) },
                 ).collect { event ->
-                    val (isCurrentGen, shouldSync) = synchronized(stateLock) {
+                    var emitEvent = false
+                    var loopTokenToStart: Any? = null
+                    var syncReason: String? = null
+                    synchronized(stateLock) {
                         val currentGen = armed &&
                             boundSession?.sessionKey == session.sessionKey &&
                             sessionGeneration == targetGen
-                        val sync = currentGen &&
-                            !activePromptTurn &&
-                            (event is TurnEvent.Completed || event is TurnEvent.SyntheticArrived)
-                        currentGen to sync
-                    }
-                    if (!isCurrentGen) return@collect
-                    activeTurnEvents.tryEmit(event)
-                    if (shouldSync) {
-                        val syncReason = when (event) {
-                            TurnEvent.Completed -> "ws_completed"
-                            is TurnEvent.SyntheticArrived -> "ws_synthetic_${event.source ?: "unknown"}"
-                            else -> "ws_event"
+                        if (currentGen) {
+                            emitEvent = true
+                            val curWatermark = watermark
+                            if (curWatermark is AutoSpeakWatermark.Uninitialized) {
+                                when (event) {
+                                    TurnEvent.Completed -> {
+                                        watermark = curWatermark.copy(
+                                            liveCompletionCount = if (curWatermark.inCompletedStreak) {
+                                                curWatermark.liveCompletionCount
+                                            } else {
+                                                curWatermark.liveCompletionCount + 1
+                                            },
+                                            liveCompletionSeq = curWatermark.liveCompletionSeq + 1L,
+                                            inCompletedStreak = true,
+                                        )
+                                    }
+                                    is TurnEvent.SyntheticArrived -> {
+                                        if (curWatermark.inCompletedStreak) {
+                                            watermark = curWatermark.copy(inCompletedStreak = false)
+                                        }
+                                    }
+                                    else -> Unit
+                                }
+                            }
+                            if (event is TurnEvent.Completed || event is TurnEvent.SyntheticArrived) {
+                                val reason = when (event) {
+                                    TurnEvent.Completed -> "ws_completed"
+                                    is TurnEvent.SyntheticArrived -> "ws_synthetic_${event.source ?: "unknown"}"
+                                }
+                                syncReason = reason
+                                enqueueSyncRequestLocked(
+                                    reason = reason,
+                                    triggerAutoSpeak = true,
+                                    forceFocusLatest = false,
+                                    waiter = null,
+                                )
+                                if (activeSyncLoopToken == null) {
+                                    loopTokenToStart = Any().also { activeSyncLoopToken = it }
+                                }
+                            }
                         }
-                        requestBackgroundSync(
-                            reason = syncReason,
-                            triggerAutoSpeak = true,
-                        )
+                    }
+                    if (!emitEvent) return@collect
+                    activeTurnEvents.tryEmit(event)
+                    val token = loopTokenToStart
+                    val reason = syncReason
+                    if (token != null && reason != null) {
+                        launchSyncLoop(token, reason)
                     }
                 }
             } finally {
@@ -1155,9 +1486,8 @@ internal class SessionResponseController(
     }
 
     private fun clearSessionScopedStateLocked() {
-        autoSpeakAnchorId = null
-        autoSpeakAnchorCreatedAtMs = 0L
-        needsArmedAnchorCapture = false
+        watermark = null
+        activeSpeechProgress = null
         lastInterruptedMessageId = null
         userNavigatedFocus = false
         seenCompletedIds.clear()
@@ -1168,13 +1498,11 @@ internal class SessionResponseController(
     private fun enqueueSyncRequestLocked(
         reason: String,
         triggerAutoSpeak: Boolean,
-        captureAutoSpeakAnchor: Boolean,
         forceFocusLatest: Boolean,
         waiter: CompletableDeferred<Result<ResponseFeedState>>?,
     ) {
         resyncRequested = true
         pendingTriggerAutoSpeak = pendingTriggerAutoSpeak || triggerAutoSpeak
-        pendingCaptureAutoSpeakAnchor = pendingCaptureAutoSpeakAnchor || captureAutoSpeakAnchor
         pendingForceFocusLatest = pendingForceFocusLatest || forceFocusLatest
         pendingReason = reason
         if (waiter != null) {
@@ -1185,7 +1513,6 @@ internal class SessionResponseController(
     private fun clearPendingSyncOnSessionSwitchLocked(): List<CompletableDeferred<Result<ResponseFeedState>>> {
         resyncRequested = false
         pendingTriggerAutoSpeak = false
-        pendingCaptureAutoSpeakAnchor = false
         pendingForceFocusLatest = false
         pendingReason = null
         val waiters = pendingWaiters.toList()
@@ -1244,5 +1571,13 @@ internal class SessionResponseController(
 
     companion object {
         private const val MAX_CACHED_WINDOWS = 32
+        internal const val MIN_AUDIBLE_COMMIT_MS = 1_500L
+        internal const val SHORT_CLIP_THRESHOLD_MS = 3_000L
+
+        private fun defaultElapsedMs(): Long = try {
+            SystemClock.elapsedRealtime()
+        } catch (_: Throwable) {
+            System.nanoTime() / 1_000_000L
+        }
     }
 }

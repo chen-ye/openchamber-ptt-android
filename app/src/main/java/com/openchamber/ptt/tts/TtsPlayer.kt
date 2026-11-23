@@ -14,6 +14,8 @@ import com.openchamber.ptt.audio.AudioPreroll
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
@@ -24,14 +26,23 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+
+enum class TtsPlaybackResult {
+    COMPLETED,
+    ABORTED,
+}
 
 internal interface PcmTrackPlayer {
     suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean = false)
@@ -53,6 +64,15 @@ internal interface SystemTtsSpeaker {
         preferredVoiceName: String? = null,
         useCommunicationUsage: Boolean = false,
     )
+    suspend fun speak(
+        text: String,
+        preferredVoiceName: String? = null,
+        useCommunicationUsage: Boolean = false,
+        onPlaybackStarted: (() -> Unit)?,
+    ) {
+        onPlaybackStarted?.invoke()
+        speak(text, preferredVoiceName, useCommunicationUsage)
+    }
     fun stop()
     fun shutdown()
 }
@@ -99,6 +119,7 @@ class TtsPlayer internal constructor(
     private val onLatencyBridgeNeeded: ((kind: String) -> Unit)? = null,
     private val latencyBridgeDelayMs: Long = DEFAULT_LATENCY_BRIDGE_DELAY_MS,
     private val keepAliveSinkPlayer: (suspend (WavAudio, Boolean) -> Unit)? = null,
+    private val onSpokenTextSynthesizedForMessage: ((String?, String) -> Unit)? = null,
 ) {
     constructor(
         context: Context,
@@ -115,6 +136,7 @@ class TtsPlayer internal constructor(
         onSpeakStats: ((TtsSpeakStats) -> Unit)? = null,
         onLatencyBridgeNeeded: ((kind: String) -> Unit)? = null,
         latencyBridgeDelayMs: Long = DEFAULT_LATENCY_BRIDGE_DELAY_MS,
+        onSpokenTextSynthesizedForMessage: ((String?, String) -> Unit)? = null,
     ) : this(
         ttsClient = ttsClient,
         pcmPlayerFactory = { AndroidAudioTrackPlayer() },
@@ -136,17 +158,25 @@ class TtsPlayer internal constructor(
         onLatencyBridgeNeeded = onLatencyBridgeNeeded,
         latencyBridgeDelayMs = latencyBridgeDelayMs,
         keepAliveSinkPlayer = null,
+        onSpokenTextSynthesizedForMessage = onSpokenTextSynthesizedForMessage,
     )
 
     private val lock = Any()
-    private var activeJob: Job? = null
+    private val playbackMutex = Mutex()
+    private val abortEpoch = AtomicLong(0L)
+    private val busyFlag = AtomicBoolean(false)
+    private val audibleOutputFlag = AtomicBoolean(false)
+    private var activeInnerJob: Job? = null
     private var activeTrackPlayer: PcmTrackPlayer? = null
     private var activeKeepAlivePlayer: PcmTrackPlayer? = null
     private var playbackGeneration: Long = 0L
     private var released: Boolean = false
 
     val isSpeaking: Boolean
-        get() = synchronized(lock) { activeJob?.isActive == true }
+        get() = busyFlag.get()
+
+    val isAudibleOutputActive: Boolean
+        get() = audibleOutputFlag.get()
 
     suspend fun speak(
         serverUrl: String,
@@ -157,14 +187,44 @@ class TtsPlayer internal constructor(
         kind: String = "reply",
         notifySpokenSummary: Boolean = true,
         isManualRead: Boolean = false,
+        messageId: String? = null,
+        onAudibleStart: ((messageId: String?, estimatedDurationMs: Long?) -> Unit)? = null,
+        onAudibleReset: ((messageId: String?) -> Unit)? = null,
     ) {
-        val rawTrimmed = text.trim()
-        if (rawTrimmed.isEmpty()) return
+        speakWithResult(
+            serverUrl = serverUrl,
+            text = text,
+            role = role,
+            sessionLabel = sessionLabel,
+            inputModeOverride = inputModeOverride,
+            kind = kind,
+            notifySpokenSummary = notifySpokenSummary,
+            isManualRead = isManualRead,
+            messageId = messageId,
+            onAudibleStart = onAudibleStart,
+            onAudibleReset = onAudibleReset,
+        )
+    }
 
-        val myGeneration = beginPlaybackSession()
-        var bridgeJob: Job? = null
-        try {
-            coroutineScope {
+    suspend fun speakWithResult(
+        serverUrl: String,
+        text: String,
+        role: VoiceRole = VoiceRole.AGENT,
+        sessionLabel: String? = null,
+        inputModeOverride: TtsInputMode? = null,
+        kind: String = "reply",
+        notifySpokenSummary: Boolean = true,
+        isManualRead: Boolean = false,
+        messageId: String? = null,
+        onAudibleStart: ((messageId: String?, estimatedDurationMs: Long?) -> Unit)? = null,
+        onAudibleReset: ((messageId: String?) -> Unit)? = null,
+    ): TtsPlaybackResult {
+        val rawTrimmed = text.trim()
+        if (rawTrimmed.isEmpty()) return TtsPlaybackResult.COMPLETED
+
+        return runSerializedPlaybackSession(onAborted = { TtsPlaybackResult.ABORTED }) { myGeneration ->
+            var bridgeJob: Job? = null
+            try {
                 val bridgeEligible = kind == KIND_REPLY || kind == BRIDGE_KIND_MANUAL_REPLY || isManualRead
                 val bridgeKind = if (isManualRead || kind == BRIDGE_KIND_MANUAL_REPLY) {
                     BRIDGE_KIND_MANUAL_REPLY
@@ -265,6 +325,7 @@ class TtsPlayer internal constructor(
                         availableMlKitVoices = mlKitVoicePool,
                         availableSystemVoices = systemVoicePool,
                     )
+                    var audibleStartedForAttempt = false
                     val success = try {
                         when (engine) {
                             TtsEngine.MLKIT_GENAI -> {
@@ -276,7 +337,11 @@ class TtsPlayer internal constructor(
                                 ensureGenerationActive(myGeneration)
                                 val routeLabel = if (useComm) "SCO" else "Media"
                                 onStatusEvent("ML Kit GenAI TTS ($routeLabel)")
-                                if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
+                                if (notifySpokenSummary) {
+                                    onSpokenTextSynthesized?.invoke(spokenText)
+                                    onSpokenTextSynthesizedForMessage?.invoke(messageId, spokenText)
+                                }
+                                val estimatedMs = (spokenText.length * 65L).coerceAtLeast(600L)
                                 var playbackStarted = false
                                 try {
                                     audioOutputCoordinator?.onSpeechPlaybackStarted()
@@ -294,8 +359,15 @@ class TtsPlayer internal constructor(
                                         text = spokenText,
                                         preferredVoiceName = resolvedVoice.voiceId,
                                         useCommunicationUsage = useComm,
+                                        onPlaybackStarted = {
+                                            if (tryMarkAudibleOutputStarted(myGeneration)) {
+                                                audibleStartedForAttempt = true
+                                                onAudibleStart?.invoke(messageId, estimatedMs)
+                                            }
+                                        },
                                     )
                                 } finally {
+                                    audibleOutputFlag.set(false)
                                     if (playbackStarted) {
                                         audioOutputCoordinator?.onSpeechPlaybackFinished()
                                     }
@@ -312,7 +384,11 @@ class TtsPlayer internal constructor(
                                 ensureGenerationActive(myGeneration)
                                 val routeLabel = if (useComm) "SCO" else "Media"
                                 onStatusEvent("Android System TTS ($routeLabel)")
-                                if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
+                                if (notifySpokenSummary) {
+                                    onSpokenTextSynthesized?.invoke(spokenText)
+                                    onSpokenTextSynthesizedForMessage?.invoke(messageId, spokenText)
+                                }
+                                val estimatedMs = (spokenText.length * 65L).coerceAtLeast(600L)
                                 var playbackStarted = false
                                 try {
                                     audioOutputCoordinator?.onSpeechPlaybackStarted()
@@ -330,8 +406,15 @@ class TtsPlayer internal constructor(
                                         text = spokenText,
                                         preferredVoiceName = resolvedVoice.voiceId,
                                         useCommunicationUsage = useComm,
+                                        onPlaybackStarted = {
+                                            if (tryMarkAudibleOutputStarted(myGeneration)) {
+                                                audibleStartedForAttempt = true
+                                                onAudibleStart?.invoke(messageId, estimatedMs)
+                                            }
+                                        },
                                     )
                                 } finally {
+                                    audibleOutputFlag.set(false)
                                     if (playbackStarted) {
                                         audioOutputCoordinator?.onSpeechPlaybackFinished()
                                     }
@@ -368,10 +451,20 @@ class TtsPlayer internal constructor(
                                 }
                                 ensureGenerationActive(myGeneration)
                                 finishSynthesisBridge()
+                                val bytesPerSample = (wav.bitsPerSample / 8).coerceAtLeast(1)
+                                val frameBytes = (wav.channels * bytesPerSample).coerceAtLeast(1)
+                                val speechDurationMs = if (wav.sampleRate > 0) {
+                                    (((wav.pcmData.size / frameBytes).toLong() * 1000L) / wav.sampleRate.toLong()).coerceAtLeast(1L)
+                                } else {
+                                    1L
+                                }
                                 val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
                                 ensureGenerationActive(myGeneration)
                                 val playableWav = AudioPreroll.prependDitheredPreroll(wav, prerollMs)
-                                if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
+                                if (notifySpokenSummary) {
+                                    onSpokenTextSynthesized?.invoke(spokenText)
+                                    onSpokenTextSynthesizedForMessage?.invoke(messageId, spokenText)
+                                }
                                 val routeLabel = if (useComm) "SCO" else "Media"
                                 val durSec = if (wav.sampleRate > 0 && wav.channels > 0 && wav.bitsPerSample > 0) {
                                     wav.pcmData.size.toDouble() / (wav.sampleRate * wav.channels * (wav.bitsPerSample / 8))
@@ -383,8 +476,14 @@ class TtsPlayer internal constructor(
                                 try {
                                     audioOutputCoordinator?.onSpeechPlaybackStarted()
                                     playbackStarted = true
+                                    if (!tryMarkAudibleOutputStarted(myGeneration)) {
+                                        throw CancellationException("TTS stopped")
+                                    }
+                                    audibleStartedForAttempt = true
+                                    onAudibleStart?.invoke(messageId, speechDurationMs)
                                     playParsedWav(playableWav, myGeneration, useComm)
                                 } finally {
+                                    audibleOutputFlag.set(false)
                                     if (playbackStarted) {
                                         audioOutputCoordinator?.onSpeechPlaybackFinished()
                                     }
@@ -398,6 +497,9 @@ class TtsPlayer internal constructor(
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (t: Throwable) {
+                        if (audibleStartedForAttempt) {
+                            onAudibleReset?.invoke(messageId)
+                        }
                         val code = (t as? TtsException)?.statusCode
                         if (code == 401 || lastStatusCode == null) {
                             lastStatusCode = code ?: lastStatusCode
@@ -414,6 +516,7 @@ class TtsPlayer internal constructor(
                     }
                 }
 
+                ensureGenerationActive(myGeneration)
                 finishSynthesisBridge()
 
                 if (!played) {
@@ -439,42 +542,214 @@ class TtsPlayer internal constructor(
                         ),
                     )
                 }
+                TtsPlaybackResult.COMPLETED
+            } finally {
+                cancelBridgeJob(bridgeJob)
             }
-        } finally {
-            cancelBridgeJob(bridgeJob)
-            endPlaybackSession(myGeneration)
+        }
+    }
+
+    suspend fun speakPreview(
+        serverUrl: String,
+        text: String,
+        engine: TtsEngine,
+        voiceId: String? = null,
+        kokoroSpeakerId: Int = TtsClient.DEFAULT_KOKORO_SPEAKER_ID,
+        role: VoiceRole = VoiceRole.AGENT,
+    ) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+
+        runSerializedPlaybackSession(onAborted = {}) { myGeneration ->
+            val useComm = useCommunicationUsage()
+            var usedVoiceId: String? = voiceId?.trim()?.takeIf { it.isNotEmpty() }
+            var usedPrerollMs = 0
+            var usedAudioCacheHit = false
+
+            try {
+                when (engine) {
+                    TtsEngine.MLKIT_GENAI -> {
+                        val speaker = mlKitTtsSpeaker
+                            ?: throw TtsException(message = "ML Kit GenAI TTS speaker not configured")
+                        ensureGenerationActive(myGeneration)
+                        val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
+                        ensureGenerationActive(myGeneration)
+                        var playbackStarted = false
+                        try {
+                            audioOutputCoordinator?.onSpeechPlaybackStarted()
+                            playbackStarted = true
+                            if (prerollMs > 0) {
+                                val wakeupWav = AudioPreroll.createDitheredSilenceWav(
+                                    durationMs = prerollMs,
+                                    sampleRate = ON_DEVICE_PREROLL_SAMPLE_RATE_HZ,
+                                    channels = 1,
+                                )
+                                playParsedWav(wakeupWav, myGeneration, useComm)
+                                ensureGenerationActive(myGeneration)
+                            }
+                            speaker.speak(
+                                text = trimmed,
+                                preferredVoiceName = usedVoiceId,
+                                useCommunicationUsage = useComm,
+                                onPlaybackStarted = {
+                                    tryMarkAudibleOutputStarted(myGeneration)
+                                },
+                            )
+                        } finally {
+                            audibleOutputFlag.set(false)
+                            if (playbackStarted) {
+                                audioOutputCoordinator?.onSpeechPlaybackFinished()
+                            }
+                        }
+                        usedPrerollMs = prerollMs
+                    }
+
+                    TtsEngine.ANDROID_SYSTEM -> {
+                        ensureGenerationActive(myGeneration)
+                        val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
+                        ensureGenerationActive(myGeneration)
+                        var playbackStarted = false
+                        try {
+                            audioOutputCoordinator?.onSpeechPlaybackStarted()
+                            playbackStarted = true
+                            if (prerollMs > 0) {
+                                val wakeupWav = AudioPreroll.createDitheredSilenceWav(
+                                    durationMs = prerollMs,
+                                    sampleRate = ON_DEVICE_PREROLL_SAMPLE_RATE_HZ,
+                                    channels = 1,
+                                )
+                                playParsedWav(wakeupWav, myGeneration, useComm)
+                                ensureGenerationActive(myGeneration)
+                            }
+                            systemTtsSpeaker.speak(
+                                text = trimmed,
+                                preferredVoiceName = usedVoiceId,
+                                useCommunicationUsage = useComm,
+                                onPlaybackStarted = {
+                                    tryMarkAudibleOutputStarted(myGeneration)
+                                },
+                            )
+                        } finally {
+                            audibleOutputFlag.set(false)
+                            if (playbackStarted) {
+                                audioOutputCoordinator?.onSpeechPlaybackFinished()
+                            }
+                        }
+                        usedPrerollMs = prerollMs
+                    }
+
+                    TtsEngine.GEMINI_BRIDGE,
+                    TtsEngine.LOCAL_KOKORO,
+                    TtsEngine.OPENAI_CLOUD,
+                    -> {
+                        if (serverUrl.isBlank()) {
+                            throw TtsException(message = "Connect to an OpenChamber server to preview ${engine.title}")
+                        }
+                        val engineVoice = usedVoiceId ?: when (engine) {
+                            TtsEngine.OPENAI_CLOUD -> VoicePipelineDefaults.DEFAULT_OPENAI_VOICE
+                            else -> TtsClient.DEFAULT_TTS_VOICE
+                        }
+                        val synthesized = ttsClient.synthesizeWithEngineDetailed(
+                            serverUrl = serverUrl,
+                            text = trimmed,
+                            voice = engineVoice,
+                            engine = engine,
+                            kokoroSpeakerId = kokoroSpeakerId,
+                        )
+                        val audio = synthesized.audio
+                        ensureGenerationActive(myGeneration)
+                        val wav = if (isRiffWav(audio.bytes)) {
+                            WavParser.parse(audio.bytes)
+                        } else {
+                            withContext(ioDispatcher) {
+                                ensureGenerationActive(myGeneration)
+                                encodedAudioDecoder(audio.bytes, audio.contentType)
+                            }
+                        }
+                        ensureGenerationActive(myGeneration)
+                        val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
+                        ensureGenerationActive(myGeneration)
+                        val playableWav = AudioPreroll.prependDitheredPreroll(wav, prerollMs)
+                        var playbackStarted = false
+                        try {
+                            audioOutputCoordinator?.onSpeechPlaybackStarted()
+                            playbackStarted = true
+                            if (!tryMarkAudibleOutputStarted(myGeneration)) {
+                                throw CancellationException("TTS stopped")
+                            }
+                            playParsedWav(playableWav, myGeneration, useComm)
+                        } finally {
+                            audibleOutputFlag.set(false)
+                            if (playbackStarted) {
+                                audioOutputCoordinator?.onSpeechPlaybackFinished()
+                            }
+                        }
+                        usedVoiceId = if (engine == TtsEngine.LOCAL_KOKORO) null else engineVoice
+                        usedPrerollMs = prerollMs
+                        usedAudioCacheHit = synthesized.cacheHit
+                    }
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                ensureGenerationActive(myGeneration)
+                throw t
+            }
+
+            onSpeakStats?.invoke(
+                TtsSpeakStats(
+                    inputMode = TtsInputMode.RAW,
+                    prepareMs = 0L,
+                    rawChars = trimmed.length,
+                    spokenChars = trimmed.length,
+                    engine = engine,
+                    role = role,
+                    voiceId = usedVoiceId,
+                    kind = KIND_PREVIEW,
+                    prerollMs = usedPrerollMs,
+                    textCacheHit = false,
+                    audioCacheHit = usedAudioCacheHit,
+                ),
+            )
         }
     }
 
     suspend fun playWav(wavBytes: ByteArray) {
         val wav = WavParser.parse(wavBytes)
-        val myGeneration = beginPlaybackSession()
-        var playbackStarted = false
-        try {
-            val useComm = useCommunicationUsage()
-            ensureGenerationActive(myGeneration)
-            val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
-            ensureGenerationActive(myGeneration)
-            val playableWav = AudioPreroll.prependDitheredPreroll(wav, prerollMs)
-            audioOutputCoordinator?.onSpeechPlaybackStarted()
-            playbackStarted = true
-            playParsedWav(playableWav, myGeneration, useComm)
-        } finally {
-            if (playbackStarted) {
-                audioOutputCoordinator?.onSpeechPlaybackFinished()
+        runSerializedPlaybackSession(onAborted = {}) { myGeneration ->
+            var playbackStarted = false
+            try {
+                val useComm = useCommunicationUsage()
+                ensureGenerationActive(myGeneration)
+                val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
+                ensureGenerationActive(myGeneration)
+                val playableWav = AudioPreroll.prependDitheredPreroll(wav, prerollMs)
+                audioOutputCoordinator?.onSpeechPlaybackStarted()
+                playbackStarted = true
+                if (!tryMarkAudibleOutputStarted(myGeneration)) {
+                    throw CancellationException("TTS stopped")
+                }
+                playParsedWav(playableWav, myGeneration, useComm)
+            } finally {
+                audibleOutputFlag.set(false)
+                if (playbackStarted) {
+                    audioOutputCoordinator?.onSpeechPlaybackFinished()
+                }
             }
-            endPlaybackSession(myGeneration)
         }
     }
 
     fun stop() {
-        val jobToCancel: Job?
+        val innerToCancel: Job?
         val trackToStop: PcmTrackPlayer?
         val keepAliveToStop: PcmTrackPlayer?
         synchronized(lock) {
+            abortEpoch.incrementAndGet()
             playbackGeneration += 1L
-            jobToCancel = activeJob
-            activeJob = null
+            busyFlag.set(false)
+            audibleOutputFlag.set(false)
+            innerToCancel = activeInnerJob
+            activeInnerJob = null
             trackToStop = activeTrackPlayer
             activeTrackPlayer = null
             keepAliveToStop = activeKeepAlivePlayer
@@ -484,7 +759,7 @@ class TtsPlayer internal constructor(
         runCatching { trackToStop?.stopNow() }
         runCatching { mlKitTtsSpeaker?.stop() }
         runCatching { systemTtsSpeaker.stop() }
-        jobToCancel?.cancel(CancellationException("TTS stopped by barge-in"))
+        innerToCancel?.cancel(CancellationException("TTS stopped by barge-in"))
     }
 
     fun release() {
@@ -495,6 +770,131 @@ class TtsPlayer internal constructor(
         runCatching { mlKitTtsSpeaker?.shutdown() }
         runCatching { systemTtsSpeaker.shutdown() }
     }
+
+    private suspend fun <T> runSerializedPlaybackSession(
+        onAborted: () -> T,
+        block: suspend CoroutineScope.(myGeneration: Long) -> T,
+    ): T {
+        val entryEpoch = abortEpoch.get()
+        return playbackMutex.withLock {
+            val myGeneration = synchronized(lock) {
+                if (abortEpoch.get() != entryEpoch) {
+                    -1L
+                } else if (released) {
+                    -2L
+                } else {
+                    playbackGeneration += 1L
+                    busyFlag.set(true)
+                    playbackGeneration
+                }
+            }
+            if (myGeneration == -1L) {
+                return@withLock onAborted()
+            }
+            if (myGeneration == -2L) {
+                throw CancellationException("TtsPlayer has been released")
+            }
+
+            val callerJob = currentCoroutineContext().job
+            val callerCancelHandle = callerJob.invokeOnCompletion { cause ->
+                if (cause != null) {
+                    abortGenerationHardwareAndInnerJob(myGeneration)
+                }
+            }
+
+            var innerResult: T? = null
+            var hasResult = false
+            var aborted = false
+
+            try {
+                try {
+                    coroutineScope {
+                        val inner = launch(start = CoroutineStart.LAZY) {
+                            innerResult = block(myGeneration)
+                            hasResult = true
+                        }
+                        val registered = synchronized(lock) {
+                            if (!released &&
+                                playbackGeneration == myGeneration &&
+                                abortEpoch.get() == entryEpoch &&
+                                callerJob.isActive
+                            ) {
+                                activeInnerJob = inner
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        if (!registered) {
+                            inner.cancel(CancellationException("TTS stopped"))
+                            aborted = true
+                        } else {
+                            inner.start()
+                            inner.join()
+                            if (inner.isCancelled) {
+                                aborted = true
+                            }
+                        }
+                    }
+                } catch (ce: CancellationException) {
+                    if (!currentCoroutineContext().isActive) {
+                        abortGenerationHardwareAndInnerJob(myGeneration)
+                        throw ce
+                    }
+                    aborted = true
+                }
+
+                if (!currentCoroutineContext().isActive) {
+                    throw CancellationException("TTS caller cancelled")
+                }
+                if (aborted || !hasResult) {
+                    return@withLock onAborted()
+                }
+                @Suppress("UNCHECKED_CAST")
+                return@withLock innerResult as T
+            } finally {
+                callerCancelHandle.dispose()
+                audibleOutputFlag.set(false)
+                busyFlag.set(false)
+                endPlaybackSession(myGeneration)
+            }
+        }
+    }
+
+    private fun abortGenerationHardwareAndInnerJob(expectedGeneration: Long) {
+        val innerToCancel: Job?
+        val trackToStop: PcmTrackPlayer?
+        val keepAliveToStop: PcmTrackPlayer?
+        synchronized(lock) {
+            if (playbackGeneration != expectedGeneration) {
+                return
+            }
+            playbackGeneration += 1L
+            busyFlag.set(false)
+            audibleOutputFlag.set(false)
+            innerToCancel = activeInnerJob
+            activeInnerJob = null
+            trackToStop = activeTrackPlayer
+            activeTrackPlayer = null
+            keepAliveToStop = activeKeepAlivePlayer
+            activeKeepAlivePlayer = null
+        }
+        runCatching { keepAliveToStop?.stopNow() }
+        runCatching { trackToStop?.stopNow() }
+        runCatching { mlKitTtsSpeaker?.stop() }
+        runCatching { systemTtsSpeaker.stop() }
+        innerToCancel?.cancel(CancellationException("TTS caller cancelled"))
+    }
+
+    private fun tryMarkAudibleOutputStarted(expectedGeneration: Long): Boolean =
+        synchronized(lock) {
+            if (released || playbackGeneration != expectedGeneration) {
+                false
+            } else {
+                audibleOutputFlag.set(true)
+                true
+            }
+        }
 
     private fun cancelBridgeJob(bridgeJob: Job?) {
         val keepAlive = synchronized(lock) {
@@ -525,6 +925,9 @@ class TtsPlayer internal constructor(
             withContext(ioDispatcher) {
                 player.play(wav, false)
             }
+        } catch (ce: CancellationException) {
+            runCatching { player.stopNow() }
+            throw ce
         } finally {
             synchronized(lock) {
                 if (activeKeepAlivePlayer === player) {
@@ -552,6 +955,9 @@ class TtsPlayer internal constructor(
             withContext(ioDispatcher) {
                 player.play(wav, useComm)
             }
+        } catch (ce: CancellationException) {
+            runCatching { player.stopNow() }
+            throw ce
         } finally {
             synchronized(lock) {
                 if (activeTrackPlayer === player) {
@@ -559,33 +965,6 @@ class TtsPlayer internal constructor(
                 }
             }
         }
-    }
-
-    private suspend fun beginPlaybackSession(): Long {
-        val callerJob = currentCoroutineContext().job
-        val previousJob: Job?
-        val previousTrack: PcmTrackPlayer?
-        val previousKeepAlive: PcmTrackPlayer?
-        val myGen: Long
-        synchronized(lock) {
-            if (released) {
-                throw CancellationException("TtsPlayer has been released")
-            }
-            playbackGeneration += 1L
-            myGen = playbackGeneration
-            previousJob = activeJob
-            previousTrack = activeTrackPlayer
-            previousKeepAlive = activeKeepAlivePlayer
-            activeJob = callerJob
-            activeTrackPlayer = null
-            activeKeepAlivePlayer = null
-        }
-        runCatching { previousKeepAlive?.stopNow() }
-        runCatching { previousTrack?.stopNow() }
-        runCatching { mlKitTtsSpeaker?.stop() }
-        runCatching { systemTtsSpeaker.stop() }
-        previousJob?.cancel(CancellationException("Superseded by newer TTS playback"))
-        return myGen
     }
 
     private fun ensureGenerationActive(expectedGeneration: Long) {
@@ -600,8 +979,9 @@ class TtsPlayer internal constructor(
     private fun endPlaybackSession(myGeneration: Long) {
         synchronized(lock) {
             if (playbackGeneration == myGeneration) {
-                activeJob = null
+                activeInnerJob = null
                 activeTrackPlayer = null
+                activeKeepAlivePlayer = null
             }
         }
     }
@@ -610,6 +990,7 @@ class TtsPlayer internal constructor(
         private const val ON_DEVICE_PREROLL_SAMPLE_RATE_HZ = 24_000
         const val DEFAULT_LATENCY_BRIDGE_DELAY_MS = 450L
         const val KIND_REPLY = "reply"
+        const val KIND_PREVIEW = "preview"
         const val BRIDGE_KIND_MANUAL_REPLY = "manual_reply"
         internal const val KEEP_ALIVE_CHUNK_MS = 200L
         internal const val MAX_KEEP_ALIVE_MS = 12_000L
@@ -857,8 +1238,19 @@ private class AndroidAudioTrackPlayer : PcmTrackPlayer {
 private class AndroidTextToSpeechSpeaker(
     private val appContext: Context,
 ) : SystemTtsSpeaker {
+    private class PendingUtterance(
+        val done: CompletableDeferred<Unit>,
+        onStart: (() -> Unit)? = null,
+    ) {
+        private val startCallback = AtomicReference(onStart)
+
+        fun fireOnStartOnce() {
+            startCallback.getAndSet(null)?.invoke()
+        }
+    }
+
     private val lock = Any()
-    private val pendingUtterances = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+    private val pendingUtterances = ConcurrentHashMap<String, PendingUtterance>()
 
     private var tts: TextToSpeech? = null
     private var initDeferred: CompletableDeferred<Boolean>? = null
@@ -876,6 +1268,20 @@ private class AndroidTextToSpeechSpeaker(
         text: String,
         preferredVoiceName: String?,
         useCommunicationUsage: Boolean,
+    ) {
+        speak(
+            text = text,
+            preferredVoiceName = preferredVoiceName,
+            useCommunicationUsage = useCommunicationUsage,
+            onPlaybackStarted = null,
+        )
+    }
+
+    override suspend fun speak(
+        text: String,
+        preferredVoiceName: String?,
+        useCommunicationUsage: Boolean,
+        onPlaybackStarted: (() -> Unit)?,
     ) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
@@ -920,7 +1326,13 @@ private class AndroidTextToSpeechSpeaker(
         for ((index, chunk) in chunks.withIndex()) {
             val utteranceId = UUID.randomUUID().toString()
             val queueMode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-            speakSingleUtterance(engine, chunk, queueMode, utteranceId)
+            speakSingleUtterance(
+                engine = engine,
+                text = chunk,
+                queueMode = queueMode,
+                utteranceId = utteranceId,
+                onStart = if (index == 0) onPlaybackStarted else null,
+            )
         }
     }
 
@@ -930,7 +1342,7 @@ private class AndroidTextToSpeechSpeaker(
         val iterator = pendingUtterances.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
-            entry.value.cancel(CancellationException("Android TTS stopped"))
+            entry.value.done.cancel(CancellationException("Android TTS stopped"))
             iterator.remove()
         }
     }
@@ -981,31 +1393,34 @@ private class AndroidTextToSpeechSpeaker(
 
             createdEngine.setOnUtteranceProgressListener(
                 object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) = Unit
+                    override fun onStart(utteranceId: String?) {
+                        if (utteranceId == null) return
+                        pendingUtterances[utteranceId]?.fireOnStartOnce()
+                    }
 
                     override fun onDone(utteranceId: String?) {
                         if (utteranceId == null) return
-                        pendingUtterances.remove(utteranceId)?.complete(Unit)
+                        pendingUtterances.remove(utteranceId)?.done?.complete(Unit)
                     }
 
                     @Deprecated("Deprecated in Java")
                     override fun onError(utteranceId: String?) {
                         if (utteranceId == null) return
-                        pendingUtterances.remove(utteranceId)?.completeExceptionally(
+                        pendingUtterances.remove(utteranceId)?.done?.completeExceptionally(
                             TtsException(message = "Android TextToSpeech playback error"),
                         )
                     }
 
                     override fun onError(utteranceId: String?, errorCode: Int) {
                         if (utteranceId == null) return
-                        pendingUtterances.remove(utteranceId)?.completeExceptionally(
+                        pendingUtterances.remove(utteranceId)?.done?.completeExceptionally(
                             TtsException(message = "Android TextToSpeech playback error ($errorCode)"),
                         )
                     }
 
                     override fun onStop(utteranceId: String?, interrupted: Boolean) {
                         if (utteranceId == null) return
-                        pendingUtterances.remove(utteranceId)?.cancel(
+                        pendingUtterances.remove(utteranceId)?.done?.cancel(
                             CancellationException("Android TextToSpeech utterance stopped"),
                         )
                     }
@@ -1063,9 +1478,10 @@ private class AndroidTextToSpeechSpeaker(
         text: String,
         queueMode: Int,
         utteranceId: String,
+        onStart: (() -> Unit)? = null,
     ) = suspendCancellableCoroutine { continuation ->
         val deferred = CompletableDeferred<Unit>()
-        pendingUtterances[utteranceId] = deferred
+        pendingUtterances[utteranceId] = PendingUtterance(done = deferred, onStart = onStart)
 
         deferred.invokeOnCompletion { cause ->
             pendingUtterances.remove(utteranceId)

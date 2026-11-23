@@ -65,6 +65,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.autofill.ContentType
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalAutofillManager
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -85,18 +86,26 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.openchamber.ptt.R
+import com.openchamber.ptt.audio.CuePackWarmState
 import com.openchamber.ptt.bubble.BubbleAvailability
 import com.openchamber.ptt.bubble.BubbleHelper
 import com.openchamber.ptt.network.OpenChamberHttp
 import com.openchamber.ptt.storage.ServerProfile
+import com.openchamber.ptt.tts.AudioCueMode
+import com.openchamber.ptt.tts.RoleVoiceProfileMap
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.SttEngine
+import com.openchamber.ptt.tts.TtsCacheStats
 import com.openchamber.ptt.tts.TtsEngine
 import com.openchamber.ptt.tts.TtsEngineOption
 import com.openchamber.ptt.tts.TtsInputMode
+import com.openchamber.ptt.tts.VoicePipelineDefaults
+import com.openchamber.ptt.tts.VoiceRole
+import com.openchamber.ptt.tts.VoiceRoleResolver
 import com.openchamber.ptt.voice.MlKitAvailability
 import com.openchamber.ptt.voice.MlKitStatusReport
 import com.openchamber.ptt.voice.MlKitSttClient
+import java.util.Locale
 
 internal data class PermissionStatusSnapshot(
     val hasRecordAudio: Boolean,
@@ -326,10 +335,19 @@ internal fun SettingsBottomSheet(
     onSelectTtsInputMode: (TtsInputMode) -> Unit,
     spokenDetailLevel: SpokenDetailLevel,
     onSelectSpokenDetailLevel: (SpokenDetailLevel) -> Unit,
+    audioCueMode: AudioCueMode,
+    onSelectAudioCueMode: (AudioCueMode) -> Unit,
+    cuePackWarmState: CuePackWarmState,
+    roleVoiceProfiles: RoleVoiceProfileMap,
+    availableGeminiVoiceIds: List<String>,
+    availableMlKitVoiceNames: List<String>,
+    systemVoiceLabels: Map<String, String>,
+    ttsCacheStats: TtsCacheStats,
+    onClearTtsCache: () -> Unit,
     selectedGeminiVoice: String,
     selectedOpenAiVoice: String,
     selectedSystemVoiceLabel: String?,
-    onOpenVoicePickerFor: (TtsEngine) -> Unit,
+    onOpenVoicePickerFor: (TtsEngine, VoiceRole) -> Unit,
     sttEngine: SttEngine,
     onSelectSttEngine: (SttEngine) -> Unit,
     sttFallbackToParakeet: Boolean,
@@ -350,6 +368,14 @@ internal fun SettingsBottomSheet(
     onRequestBatteryExemption: () -> Unit,
     onOpenBubbleSettings: () -> Unit,
     onOpenTelemetryLog: () -> Unit,
+    onOpenAudioDebug: () -> Unit = {},
+    pinBluetoothSco: Boolean = false,
+    volumeKeyStopRecording: Boolean = false,
+    onToggleVolumeKeyStopRecording: (Boolean) -> Unit = {},
+    telecomCallForRecording: Boolean = false,
+    onToggleTelecomCallForRecording: (Boolean) -> Unit = {},
+    mirrorRecordingNotification: Boolean = true,
+    onToggleMirrorRecordingNotification: (Boolean) -> Unit = {},
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onDismiss: () -> Unit,
@@ -468,6 +494,220 @@ internal fun SettingsBottomSheet(
 
             HorizontalDivider()
 
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "Hardware Controls & Wearables",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Text(
+                        text = "Device-global settings shared across all servers.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .heightIn(min = 48.dp)
+                        .toggleable(
+                            value = mirrorRecordingNotification,
+                            role = Role.Switch,
+                            onValueChange = onToggleMirrorRecordingNotification,
+                        ),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Mirror recording control to watch",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                text = "Posts a silent notification with a 'Stop recording' action during capture for Garmin and Wear OS watches.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = mirrorRecordingNotification,
+                            onCheckedChange = null,
+                        )
+                    }
+                }
+
+                if (mirrorRecordingNotification && !snapshot.hasPostNotifications) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_warning_amber),
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text(
+                                text = "Notifications permission is required on Android 13+ for smartwatch apps to see recording controls.",
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(
+                                onClick = onRequestPermissions,
+                                modifier = Modifier.heightIn(min = 48.dp),
+                            ) {
+                                Text(
+                                    text = "Grant",
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .heightIn(min = 48.dp)
+                        .toggleable(
+                            value = volumeKeyStopRecording,
+                            role = Role.Switch,
+                            onValueChange = onToggleVolumeKeyStopRecording,
+                        ),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Volume button stops recording (screen off)",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                text = "Intercepts phone Volume Up/Down only while recording, restoring normal media volume immediately on stop (Android 15+ and standard AOSP; Pixel Android 12–14 ignores remote session volume).",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = volumeKeyStopRecording,
+                            onCheckedChange = null,
+                        )
+                    }
+                }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .heightIn(min = 48.dp)
+                        .toggleable(
+                            value = telecomCallForRecording,
+                            role = Role.Switch,
+                            onValueChange = onToggleTelecomCallForRecording,
+                        ),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Headset call mode during recording (Shokz / HFP)",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                text = "Opens a temporary local Telecom call during capture (when Headset mic is enabled) so headset call-hangup buttons stop recording. Triggers headset call chimes and In-Call UI.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = telecomCallForRecording,
+                            onCheckedChange = null,
+                        )
+                    }
+                }
+
+                if (telecomCallForRecording && !pinBluetoothSco) {
+                    Text(
+                        text = "Turn on 'Headset mic' on the main console to activate Telecom call routing.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 4.dp),
+                    )
+                }
+
+                if (telecomCallForRecording && !snapshot.hasBluetoothConnect) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_warning_amber),
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text(
+                                text = "Bluetooth permission is recommended on Android 12+ to route calls to your headset.",
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(
+                                onClick = onRequestPermissions,
+                                modifier = Modifier.heightIn(min = 48.dp),
+                            ) {
+                                Text(
+                                    text = "Grant",
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalDivider()
+
             if (servers.size > 1 && activeServer != null) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
@@ -484,18 +724,20 @@ internal fun SettingsBottomSheet(
                             selected = !isUsingCustomServerVoice,
                             onClick = { onToggleCustomServerVoice(false) },
                             label = { Text("All servers") },
+                            modifier = Modifier.heightIn(min = 48.dp),
                         )
                         FilterChip(
                             selected = isUsingCustomServerVoice,
                             onClick = { onToggleCustomServerVoice(true) },
                             label = { Text("${activeServer.displayLabel} only") },
+                            modifier = Modifier.heightIn(min = 48.dp),
                         )
                     }
                     Text(
                         text = if (isUsingCustomServerVoice) {
-                            "STT engine, speech input mode, TTS order, and Gemini/OpenAI voices are saved just for ${activeServer.displayLabel}."
+                            "STT engine, speech input mode, audio cues, TTS order, and cloud role voices are saved just for ${activeServer.displayLabel}."
                         } else {
-                            "Using shared global STT/TTS settings. Switch to \"${activeServer.displayLabel} only\" if this server needs its own setup."
+                            "Using shared global STT/TTS, audio cue, and role voice settings. Switch to \"${activeServer.displayLabel} only\" if this server needs its own setup."
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -648,6 +890,7 @@ internal fun SettingsBottomSheet(
                             selected = ttsInputMode == mode,
                             onClick = { onSelectTtsInputMode(mode) },
                             label = { Text(mode.title) },
+                            modifier = Modifier.heightIn(min = 48.dp),
                         )
                     }
                 }
@@ -745,6 +988,133 @@ internal fun SettingsBottomSheet(
 
             HorizontalDivider()
 
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Audio Cues",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AudioCueMode.entries.forEach { mode ->
+                        FilterChip(
+                            selected = audioCueMode == mode,
+                            onClick = { onSelectAudioCueMode(mode) },
+                            label = { Text(mode.title) },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        )
+                    }
+                }
+                Text(
+                    text = audioCueMode.subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (audioCueMode != AudioCueMode.TONES) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainer,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            if (cuePackWarmState.isWarming) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            }
+                            Text(
+                                text = formatCueWarmStatus(cuePackWarmState),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+            }
+
+            HorizontalDivider()
+
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = "Voice Roles",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Text(
+                        text = "Tap a role to customize or preview its voice.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                VoiceRole.entries.forEach { role ->
+                    val roleSummary = VoiceRoleResolver.formatRoleSummaryLabel(
+                        role = role,
+                        basePipeline = ttsPipeline,
+                        profiles = roleVoiceProfiles,
+                        availableGeminiVoices = availableGeminiVoiceIds,
+                        availableMlKitVoices = availableMlKitVoiceNames,
+                        availableSystemVoiceLabels = systemVoiceLabels,
+                    )
+                    val rolePrimaryEngine = VoicePipelineDefaults.primaryEnabledEngine(
+                        VoiceRoleResolver.resolvePipelineForRole(ttsPipeline, roleVoiceProfiles[role]),
+                    ) ?: TtsEngine.GEMINI_BRIDGE
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainer,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .heightIn(min = 52.dp)
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = "Customize ${role.title} voice",
+                                onClick = { onOpenVoicePickerFor(rolePrimaryEngine, role) },
+                            ),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = role.title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    text = roleSummary,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Icon(
+                                painter = painterResource(R.drawable.ic_chevron_right),
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+
+            HorizontalDivider()
+
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -801,7 +1171,7 @@ internal fun SettingsBottomSheet(
                                     Modifier.clickable(
                                         role = Role.Button,
                                         onClickLabel = "Pick voice for ${option.engine.title}",
-                                        onClick = { onOpenVoicePickerFor(option.engine) },
+                                        onClick = { onOpenVoicePickerFor(option.engine, VoiceRole.AGENT) },
                                     )
                                 } else {
                                     Modifier
@@ -910,6 +1280,41 @@ internal fun SettingsBottomSheet(
                             .heightIn(min = 48.dp),
                     ) {
                         Text("Copy ML Kit diagnostics")
+                    }
+                }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 14.dp, end = 10.dp, top = 10.dp, bottom = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "TTS Cache",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = formatTtsCacheStats(ttsCacheStats),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = onClearTtsCache,
+                            enabled = ttsCacheStats.totalEntries > 0,
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) {
+                            Text("Clear")
+                        }
                     }
                 }
             }
@@ -1075,13 +1480,23 @@ internal fun SettingsBottomSheet(
 
             HorizontalDivider()
 
-            OutlinedButton(
-                onClick = onOpenTelemetryLog,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 48.dp),
-            ) {
-                Text("View Voice UX Telemetry Log")
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = onOpenTelemetryLog,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp),
+                ) {
+                    Text("View Voice UX Telemetry Log")
+                }
+                OutlinedButton(
+                    onClick = onOpenAudioDebug,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp),
+                ) {
+                    Text("Open Live Audio & BT Debug")
+                }
             }
         }
     }
@@ -1093,4 +1508,29 @@ internal fun formatMlKitBadge(status: MlKitAvailability?): String = when (status
     MlKitAvailability.DOWNLOADING -> "Downloading"
     MlKitAvailability.UNAVAILABLE -> "Unavailable"
     null -> "Checking…"
+}
+
+internal fun formatCueWarmStatus(state: CuePackWarmState): String = when {
+    state.isWarming -> "Warming vocal cues: ${state.warmedCount}/${state.totalCount}…"
+    state.warmedCount > 0 ->
+        "Vocal cues cached: ${state.warmedCount}/${state.totalCount} (${state.engine?.shortTitle ?: "Ready"} · ${state.voiceId ?: "Auto"})"
+    else -> "Vocal cues warm automatically when armed"
+}
+
+internal fun formatTtsCacheStats(stats: TtsCacheStats): String {
+    if (stats.totalEntries == 0) {
+        return "Empty · summaries and synthesized audio are cached for instant offline re-reads"
+    }
+    val mb = stats.totalBytes / (1024.0 * 1024.0)
+    val summaryLabel = if (stats.textEntries == 1) "summary" else "summaries"
+    val clipLabel = if (stats.audioEntries == 1) "audio clip" else "audio clips"
+    return String.format(
+        Locale.US,
+        "%.1f MB · %d %s · %d %s",
+        mb,
+        stats.textEntries,
+        summaryLabel,
+        stats.audioEntries,
+        clipLabel,
+    )
 }
