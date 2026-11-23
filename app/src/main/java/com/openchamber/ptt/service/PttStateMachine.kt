@@ -41,6 +41,7 @@ sealed interface PttEvent {
     data object DoubleTap : PttEvent
     data object TripleTap : PttEvent
     data object StageCapture : PttEvent
+    data object SendCaptureImmediately : PttEvent
     data object DiscardCapture : PttEvent
     data object CommitDraft : PttEvent
     data object PullBackToDraft : PttEvent
@@ -102,8 +103,14 @@ class PttStateMachine(
     private val _permissionPrompt = MutableStateFlow<String?>(null)
     val permissionPrompt: StateFlow<String?> = _permissionPrompt.asStateFlow()
 
+    private enum class QuickSendMode {
+        WITH_GRACE,
+        IMMEDIATE,
+    }
+
     private var hasDraft: Boolean = false
     private var speechReturnToDisarmed: Boolean = false
+    private var quickSendMode: QuickSendMode = QuickSendMode.WITH_GRACE
 
     val currentState: PttState
         get() = _state.value
@@ -116,6 +123,15 @@ class PttStateMachine(
         synchronized(lock) {
             val previous = _state.value
             val (next, effects) = computeTransition(previous, event)
+
+            if (event == PttEvent.SendCaptureImmediately &&
+                previous == PttState.RECORDING &&
+                next == PttState.TRANSCRIBING_SEND
+            ) {
+                quickSendMode = QuickSendMode.IMMEDIATE
+            } else if (next != PttState.TRANSCRIBING_SEND) {
+                quickSendMode = QuickSendMode.WITH_GRACE
+            }
 
             when (event) {
                 is PttEvent.Error -> {
@@ -399,6 +415,23 @@ class PttStateMachine(
             else -> current to emptyList()
         }
 
+        PttEvent.SendCaptureImmediately -> when (current) {
+            PttState.RECORDING -> if (hasDraft) {
+                PttState.TRANSCRIBING_STAGE to listOf(
+                    PttEffect.StopRecording,
+                    PttEffect.ReleaseCaptureAudio,
+                    PttEffect.PlayCue(CueEvent.STAGE_APPENDING),
+                )
+            } else {
+                PttState.TRANSCRIBING_SEND to listOf(
+                    PttEffect.StopRecording,
+                    PttEffect.ReleaseCaptureAudio,
+                    PttEffect.PlayCue(CueEvent.QUICK_STOP_ACK),
+                )
+            }
+            else -> current to emptyList()
+        }
+
         PttEvent.CommitDraft -> when (current) {
             PttState.STAGED_DRAFT -> PttState.WAITING_AGENT to listOf(
                 PttEffect.AcquireWakeAndWifiLocks,
@@ -464,6 +497,12 @@ class PttStateMachine(
                     idleState() to listOf(
                         PttEffect.ReleaseWakeAndWifiLocks,
                         PttEffect.PlayCue(CueEvent.EMPTY_SPEECH),
+                    )
+                } else if (quickSendMode == QuickSendMode.IMMEDIATE) {
+                    PttState.WAITING_AGENT to listOf(
+                        PttEffect.AcquireWakeAndWifiLocks,
+                        PttEffect.PlayCue(CueEvent.PROMPT_SENT),
+                        PttEffect.DispatchPrompt(fromStagedDraft = false),
                     )
                 } else {
                     PttState.SEND_GRACE to listOf(

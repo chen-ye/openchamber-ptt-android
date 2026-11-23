@@ -72,10 +72,13 @@ Distinct sound cues (`studio` earcons, `CC0-1.0`) let you tell apart arming, rec
 
 ### Floating Bubble, headset mic & hands-free stop controls
 
-- **Floating Bubble:** Enable Bubbles via **Settings** → **Bubble Settings** to keep a compact PTT overlay floating over other apps.
-- **`Headset mic` toggle:** Leaves spoken replies on stereo A2DP media audio at all times. Toggle **Headset mic** on when you want Bluetooth HFP/SCO to open your headset microphone strictly while recording.
-- **Smartwatch recording control:** While recording, a silent companion notification with a **Stop recording** action mirrors to Garmin and Wear OS watches (enabled by default under **Settings** → **Hardware Controls & Wearables**; enable OpenChamber PTT in Garmin Connect notifications and grant Android 13+ Notifications permission).
-- **Screen-off phone Volume-key stop & Headset call mode (opt-in):** For Bluetooth headsets like Shokz OpenRun Pro 2 that suppress AVRCP media taps while their HFP microphone is open, enable **Volume button stops recording (screen off)** to stop capture with a physical phone volume press, or enable **Headset call mode during recording** (`core-telecom`) so the headset's multifunction call-hangup button ends capture directly.
+- **Floating Bubble:** Enable Bubbles via **Settings** → **System** → **Bubble Settings** to keep a compact PTT overlay floating over other apps.
+- **`Headset mic` toggle:** Leaves spoken replies on stereo A2DP media audio at all times. Toggle **Headset mic** on (persisted across restarts) when you want Bluetooth HFP/SCO or Call mode to open your headset microphone strictly while recording.
+- **Smartwatch recording control:** While recording, a silent companion notification with a **Stop recording** action mirrors to Garmin and Wear OS watches (enabled by default under **Settings** → **Controls** → **Smartwatch**; enable OpenChamber PTT in Garmin Connect notifications and grant Android 13+ Notifications permission).
+- **Presets, screen-off Volume-key controls & Shokz / Call mode (`Settings` → `Controls`):** Pick **Standard** or **Shokz / Single-Tap** (or tune individual options while previewing the live **Active Gesture Map**):
+  - **Call mode (HFP):** Opens a transient Telecom call during recording so headset call-hangup ends capture into **Quick send** (2.5s undo), **Send now** (immediate send), or **Stage draft**.
+  - **Single-tap only & AVRCP toggle:** Remove the 350ms double-tap delay and disable `Next`/`Previous` shortcuts on headsets that swallow multi-taps or emit spurious track skips.
+  - **Screen-off phone Volume keys:** Active strictly when the screen is off (screen-on presses keep normal volume). Supports stopping recording (`Any → Quick send`, `Any → Stage draft`, or `Up Send · Down Stage`) and controlling staged drafts (`Up Send · Down Discard` or `Up Send only`).
 
 ---
 
@@ -83,15 +86,15 @@ Distinct sound cues (`studio` earcons, `CC0-1.0`) let you tell apart arming, rec
 
 Tap the voice chip (for example `Gemini · Kore`) for quick voice selection, or open **Settings** to customize the full pipeline globally or per server:
 
-- **Speech Input Mode:**
+- **Reply Readback & Routing (`Settings` → `Voice`):**
   - **Spoken:** Rewrites technical markdown, code, and file paths into natural spoken prose at **Essentials**, **Balanced**, or **Detailed** depth, with a collapsible **Spoken summary** readout under the reply.
   - **Sanitized:** Strips markdown, code blocks, and URLs.
   - **Raw:** Speaks the exact reply text (also used automatically for staged draft readback).
-- **Audio Cues (`Hybrid` / `Vocal cues` / `Studio tones`):** Default **Hybrid** pairs crisp studio earcons for button taps and live-mic boundaries with short pre-cached spoken cues for latency bridges, blind spots, and errors—or switch to full **Vocal cues** or **Studio tones** in **Settings**.
-- **Voice Roles (`Main Agent`, `Operator`, `Vocal Cues`):** Customize distinct voices—and optionally pin a preferred engine—per role in **Voices** or **Settings** → **Voice Roles** with one-tap audio preview, or leave **Operator** and **Vocal Cues** on **Auto** for collision-free distinct defaults.
-- **Text-to-Speech Order:** Toggle and reorder **Gemini Bridge**, **Local Kokoro**, **ML Kit GenAI TTS**, **Android System TTS**, and **OpenAI Cloud**—the app automatically falls back down your enabled list.
-- **Client-side TTS & summary caching:** Spoken translations and synthesized audio clips (including warmed vocal cues and previews) are cached locally on device for instant offline re-reads and can be inspected or cleared under **Settings** → **TTS Cache**.
-- **Speech-to-Text:** Choose **OpenChamber Parakeet** (host transcription + cleanup) or on-device **ML Kit GenAI** (Advanced or Basic) with optional automatic fallback to Parakeet.
+- **Audio Cues (`Hybrid` / `Vocal cues` / `Studio tones`):** Default **Hybrid** pairs crisp studio earcons for button taps and live-mic boundaries with short pre-cached spoken cues for latency bridges, blind spots, and errors—or switch to full **Vocal cues** or **Studio tones** in **Settings** → **Voice**.
+- **Voice Roles (`Main Agent`, `Operator`, `Vocal Cues`):** Select any provider (`TTS Order`, **Gemini**, **Kokoro**, **ML Kit**, **System**, or **OpenAI**) and voice directly per role in **Voices** or **Settings** → **Voice** → **Voice Roles** with one-tap audio preview—without needing to change the global fallback provider first—or leave **Operator** and **Vocal Cues** on **Auto** for collision-free distinct defaults.
+- **Text-to-Speech Fallback Order:** Toggle and reorder **Gemini Bridge**, **Local Kokoro**, **ML Kit GenAI TTS**, **Android System TTS**, and **OpenAI Cloud**—tried top-to-bottom when a role follows TTS Order or its chosen provider fails.
+- **Client-side TTS & summary caching:** Spoken translations and synthesized audio clips (including warmed vocal cues and previews) are cached locally on device for instant offline re-reads and can be inspected or cleared under **Settings** → **Voice** → **TTS Cache**.
+- **Dictation & Input:** Choose **OpenChamber Parakeet** (host transcription + cleanup) or on-device **ML Kit GenAI** (Advanced or Basic) with optional automatic fallback to Parakeet and **Quick-mode transcript cleanup**.
 - **Tool permission alerts:** When an agent waits on a tool approval, alerts hold for 4 seconds before announcing so server-side auto-approvers can handle routine approvals silently.
 
 ### Optional server extensions & device requirements
@@ -105,11 +108,11 @@ Tap the voice chip (for example `Gemini · Kore`) for quick voice selection, or 
 
 ## Troubleshooting
 
-- **Headset button stops responding with screen off:** Open **Settings** → **Battery** (or tap **Battery Exempt** during initial setup) to exempt OpenChamber PTT from background battery restrictions, and make sure the app is **Armed** (not Disarmed).
+- **Headset button stops responding with screen off:** Open **Settings** → **System** → **Battery** (or tap **Battery Exempt** during initial setup) to exempt OpenChamber PTT from background battery restrictions, and make sure the app is **Armed** (not Disarmed).
 - **Audio sounds muffled when armed:** Turn **Headset mic** off to return Bluetooth output to A2DP media audio and use the phone microphone.
-- **ML Kit GenAI shows `Unavailable`:** Use **OpenChamber Parakeet** for STT and **Gemini Bridge**, **Local Kokoro**, **Android System TTS**, or **OpenAI Cloud** for TTS—or tap **Copy ML Kit diagnostics** in **Settings** to inspect device service availability.
-- **Headset button cannot stop recording while `Headset mic` is on:** Many Bluetooth headsets switch their multifunction button out of AVRCP media mode during active HFP mic capture. Under **Settings** → **Hardware Controls & Wearables**, use smartwatch **Stop recording** mirroring, enable **Volume button stops recording (screen off)**, or enable **Headset call mode during recording** (`core-telecom`), and use **Open Live Audio & BT Debug** to inspect live button, SCO, Telecom, and focus events on device.
-- **Telemetry & live audio diagnostics:** Open **Settings** → **Open Live Audio & BT Debug** for a live ring buffer of accepted and ignored button, route, Bluetooth, Telecom, and focus events, or **View Voice UX Telemetry Log** to copy local timing logs (`JSONL`).
+- **ML Kit GenAI shows `Unavailable`:** Use **OpenChamber Parakeet** for STT and **Gemini Bridge**, **Local Kokoro**, **Android System TTS**, or **OpenAI Cloud** for TTS—or tap **Copy ML Kit diagnostics** in **Settings** → **Voice** to inspect device service availability.
+- **Headset button cannot stop recording while `Headset mic` is on:** Many Bluetooth headsets switch their multifunction button out of AVRCP media mode during active HFP mic capture. Under **Settings** → **Controls**, pick **Shokz / Single-Tap** (or configure **Bluetooth capture mode** = **Call mode (HFP)**, **Single-tap only**, screen-off **Phone Volume Keys**, and **Mirror recording control to watch**), and use **Settings** → **System** → **Live Audio & BT Debug** to inspect live button, SCO, Telecom, and focus events on device.
+- **Telemetry & live audio diagnostics:** Open **Settings** → **System** → **Live Audio & BT Debug** for a live ring buffer of accepted and ignored button, route, Bluetooth, Telecom, and focus events, or **Voice UX Telemetry Log** to copy local timing logs (`JSONL`).
 
 ---
 

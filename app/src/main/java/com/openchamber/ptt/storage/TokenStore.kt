@@ -4,7 +4,14 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import com.openchamber.ptt.audio.TelecomHangupAction
 import com.openchamber.ptt.network.OpenChamberHttp
+import com.openchamber.ptt.service.BluetoothCaptureMode
+import com.openchamber.ptt.service.ControlPreset
+import com.openchamber.ptt.service.ControlSchemeConfig
+import com.openchamber.ptt.service.HeadsetTapMode
+import com.openchamber.ptt.service.VolumeKeyDraftMode
+import com.openchamber.ptt.service.VolumeKeyRecordingMode
 import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.RoleVoiceAssignment
 import com.openchamber.ptt.tts.RoleVoiceProfileMap
@@ -757,17 +764,103 @@ class TokenStore(
             overrideUpdate = { it.copy(audioCueMode = mode) },
         )
 
-    fun getVolumeKeyStopRecording(): Boolean = prefs.getBoolean(KEY_VOLUME_KEY_STOP_RECORDING, false)
+    fun getPinBluetoothSco(): Boolean = prefs.getBoolean(KEY_PIN_BLUETOOTH_SCO, false)
 
-    fun setVolumeKeyStopRecording(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_VOLUME_KEY_STOP_RECORDING, enabled).apply()
+    fun setPinBluetoothSco(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_PIN_BLUETOOTH_SCO, enabled).apply()
         notifyChanged()
     }
 
-    fun getTelecomCallForRecording(): Boolean = prefs.getBoolean(KEY_TELECOM_CALL_FOR_RECORDING, false)
+    fun getBluetoothCaptureMode(): BluetoothCaptureMode {
+        val raw = prefs.getString(KEY_BLUETOOTH_CAPTURE_MODE, null)
+        if (!raw.isNullOrBlank()) {
+            return BluetoothCaptureMode.fromStorageValue(raw)
+        }
+        return if (prefs.getBoolean(KEY_TELECOM_CALL_FOR_RECORDING, false)) {
+            BluetoothCaptureMode.TELECOM_HFP
+        } else {
+            BluetoothCaptureMode.CLASSIC_SCO
+        }
+    }
+
+    fun setBluetoothCaptureMode(mode: BluetoothCaptureMode) {
+        prefs.edit()
+            .putString(KEY_BLUETOOTH_CAPTURE_MODE, mode.storageValue)
+            .putBoolean(KEY_TELECOM_CALL_FOR_RECORDING, mode == BluetoothCaptureMode.TELECOM_HFP)
+            .apply()
+        notifyChanged()
+    }
+
+    fun getHeadsetTapMode(): HeadsetTapMode =
+        HeadsetTapMode.fromStorageValue(prefs.getString(KEY_HEADSET_TAP_MODE, null))
+
+    fun setHeadsetTapMode(mode: HeadsetTapMode) {
+        prefs.edit().putString(KEY_HEADSET_TAP_MODE, mode.storageValue).apply()
+        notifyChanged()
+    }
+
+    fun getAvrcpTrackControlsEnabled(): Boolean =
+        prefs.getBoolean(KEY_AVRCP_TRACK_CONTROLS_ENABLED, true)
+
+    fun setAvrcpTrackControlsEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_AVRCP_TRACK_CONTROLS_ENABLED, enabled).apply()
+        notifyChanged()
+    }
+
+    fun getVolumeKeyRecordingMode(): VolumeKeyRecordingMode {
+        val raw = prefs.getString(KEY_VOLUME_KEY_RECORDING_MODE, null)
+        if (!raw.isNullOrBlank()) {
+            return VolumeKeyRecordingMode.fromStorageValue(raw)
+        }
+        return if (prefs.getBoolean(KEY_VOLUME_KEY_STOP_RECORDING, false)) {
+            VolumeKeyRecordingMode.ANY_SEND
+        } else {
+            VolumeKeyRecordingMode.OFF
+        }
+    }
+
+    fun setVolumeKeyRecordingMode(mode: VolumeKeyRecordingMode) {
+        prefs.edit()
+            .putString(KEY_VOLUME_KEY_RECORDING_MODE, mode.storageValue)
+            .putBoolean(KEY_VOLUME_KEY_STOP_RECORDING, mode.isEnabled)
+            .apply()
+        notifyChanged()
+    }
+
+    fun getVolumeKeyDraftMode(): VolumeKeyDraftMode =
+        VolumeKeyDraftMode.fromStorageValue(prefs.getString(KEY_VOLUME_KEY_DRAFT_MODE, null))
+
+    fun setVolumeKeyDraftMode(mode: VolumeKeyDraftMode) {
+        prefs.edit().putString(KEY_VOLUME_KEY_DRAFT_MODE, mode.storageValue).apply()
+        notifyChanged()
+    }
+
+    fun getVolumeKeyStopRecording(): Boolean = getVolumeKeyRecordingMode().isEnabled
+
+    fun setVolumeKeyStopRecording(enabled: Boolean) {
+        val nextMode = if (enabled) {
+            val current = getVolumeKeyRecordingMode()
+            if (current.isEnabled) current else VolumeKeyRecordingMode.ANY_SEND
+        } else {
+            VolumeKeyRecordingMode.OFF
+        }
+        setVolumeKeyRecordingMode(nextMode)
+    }
+
+    fun getTelecomCallForRecording(): Boolean =
+        getBluetoothCaptureMode() == BluetoothCaptureMode.TELECOM_HFP
 
     fun setTelecomCallForRecording(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_TELECOM_CALL_FOR_RECORDING, enabled).apply()
+        setBluetoothCaptureMode(
+            if (enabled) BluetoothCaptureMode.TELECOM_HFP else BluetoothCaptureMode.CLASSIC_SCO,
+        )
+    }
+
+    fun getTelecomHangupAction(): TelecomHangupAction =
+        TelecomHangupAction.fromStorageValue(prefs.getString(KEY_TELECOM_HANGUP_ACTION, null))
+
+    fun setTelecomHangupAction(action: TelecomHangupAction) {
+        prefs.edit().putString(KEY_TELECOM_HANGUP_ACTION, action.storageValue).apply()
         notifyChanged()
     }
 
@@ -775,6 +868,33 @@ class TokenStore(
 
     fun setMirrorRecordingNotification(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_MIRROR_RECORDING_NOTIFICATION, enabled).apply()
+        notifyChanged()
+    }
+
+    fun getControlSchemeConfig(): ControlSchemeConfig = ControlSchemeConfig(
+        pinBluetoothSco = getPinBluetoothSco(),
+        bluetoothCaptureMode = getBluetoothCaptureMode(),
+        telecomHangupAction = getTelecomHangupAction(),
+        headsetTapMode = getHeadsetTapMode(),
+        avrcpTrackControlsEnabled = getAvrcpTrackControlsEnabled(),
+        volumeKeyRecordingMode = getVolumeKeyRecordingMode(),
+        volumeKeyDraftMode = getVolumeKeyDraftMode(),
+        mirrorRecordingNotification = getMirrorRecordingNotification(),
+    )
+
+    fun applyControlPreset(preset: ControlPreset) {
+        if (preset == ControlPreset.CUSTOM) return
+        val next = getControlSchemeConfig().applyingPreset(preset)
+        prefs.edit()
+            .putString(KEY_BLUETOOTH_CAPTURE_MODE, next.bluetoothCaptureMode.storageValue)
+            .putBoolean(KEY_TELECOM_CALL_FOR_RECORDING, next.isTelecomCallEnabled)
+            .putString(KEY_TELECOM_HANGUP_ACTION, next.telecomHangupAction.storageValue)
+            .putString(KEY_HEADSET_TAP_MODE, next.headsetTapMode.storageValue)
+            .putBoolean(KEY_AVRCP_TRACK_CONTROLS_ENABLED, next.avrcpTrackControlsEnabled)
+            .putString(KEY_VOLUME_KEY_RECORDING_MODE, next.volumeKeyRecordingMode.storageValue)
+            .putBoolean(KEY_VOLUME_KEY_STOP_RECORDING, next.volumeKeyRecordingMode.isEnabled)
+            .putString(KEY_VOLUME_KEY_DRAFT_MODE, next.volumeKeyDraftMode.storageValue)
+            .apply()
         notifyChanged()
     }
 
@@ -975,8 +1095,15 @@ class TokenStore(
         private const val KEY_QUICK_TURN_DIRECT_ANSWER = "quick_turn_direct_answer"
         private const val KEY_QUICK_TRANSCRIPT_CLEANUP = "quick_transcript_cleanup"
         private const val KEY_AUDIO_CUE_MODE = "audio_cue_mode"
+        private const val KEY_PIN_BLUETOOTH_SCO = "pin_bluetooth_sco"
+        private const val KEY_BLUETOOTH_CAPTURE_MODE = "bluetooth_capture_mode"
+        private const val KEY_HEADSET_TAP_MODE = "headset_tap_mode"
+        private const val KEY_AVRCP_TRACK_CONTROLS_ENABLED = "avrcp_track_controls_enabled"
+        private const val KEY_VOLUME_KEY_RECORDING_MODE = "volume_key_recording_mode"
+        private const val KEY_VOLUME_KEY_DRAFT_MODE = "volume_key_draft_mode"
         private const val KEY_VOLUME_KEY_STOP_RECORDING = "volume_key_stop_recording"
         private const val KEY_TELECOM_CALL_FOR_RECORDING = "telecom_call_for_recording"
+        private const val KEY_TELECOM_HANGUP_ACTION = "telecom_hangup_action"
         private const val KEY_MIRROR_RECORDING_NOTIFICATION = "mirror_recording_notification"
         private const val KEY_ROLE_VOICE_PROFILES = "role_voice_profiles_v1"
         const val DEFAULT_TTS_VOICE = "Kore"

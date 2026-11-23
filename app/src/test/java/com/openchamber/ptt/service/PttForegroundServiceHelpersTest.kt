@@ -2,8 +2,11 @@ package com.openchamber.ptt.service
 
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.support.v4.media.session.PlaybackStateCompat
 import com.openchamber.ptt.audio.ScoDropEvent
 import com.openchamber.ptt.audio.ScoDropSource
+import com.openchamber.ptt.audio.TelecomHangupAction
+import com.openchamber.ptt.audio.VolumeKeyEpisode
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.tts.VoiceRole
 import org.junit.Assert.assertEquals
@@ -280,6 +283,55 @@ class PttForegroundServiceHelpersTest {
         assertEquals(
             PttForegroundService.ScoDropAction.IGNORE,
             PttForegroundService.resolveScoDropAction(PttState.ARMED_IDLE, focusInterrupted),
+        )
+    }
+
+    @Test
+    fun `eventForTelecomHangupAction maps QUICK_SEND, SEND_IMMEDIATELY, and STAGE_DRAFT cleanly`() {
+        assertEquals(
+            PttEvent.SingleTap,
+            PttForegroundService.eventForTelecomHangupAction(TelecomHangupAction.QUICK_SEND),
+        )
+        assertEquals(
+            PttEvent.SendCaptureImmediately,
+            PttForegroundService.eventForTelecomHangupAction(TelecomHangupAction.SEND_IMMEDIATELY),
+        )
+        assertEquals(
+            PttEvent.StageCapture,
+            PttForegroundService.eventForTelecomHangupAction(TelecomHangupAction.STAGE_DRAFT),
+        )
+    }
+
+    @Test
+    fun `volumeEpisodeForState and resolveMediaSessionPlaybackState enforce screen-off draft routing`() {
+        assertEquals(VolumeKeyEpisode.RECORDING, PttForegroundService.volumeEpisodeForState(PttState.RECORDING))
+        assertEquals(VolumeKeyEpisode.DRAFT, PttForegroundService.volumeEpisodeForState(PttState.STAGED_DRAFT))
+        assertEquals(VolumeKeyEpisode.DRAFT, PttForegroundService.volumeEpisodeForState(PttState.STAGED_DRAFT_SPEAKING))
+        assertEquals(VolumeKeyEpisode.NONE, PttForegroundService.volumeEpisodeForState(PttState.ARMED_IDLE))
+
+        assertEquals(
+            PlaybackStateCompat.STATE_PAUSED,
+            PttForegroundService.resolveMediaSessionPlaybackState(
+                pttState = PttState.STAGED_DRAFT,
+                isScreenOff = false,
+                draftVolumeEnabled = true,
+            ),
+        )
+        assertEquals(
+            PlaybackStateCompat.STATE_PAUSED,
+            PttForegroundService.resolveMediaSessionPlaybackState(
+                pttState = PttState.STAGED_DRAFT,
+                isScreenOff = true,
+                draftVolumeEnabled = false,
+            ),
+        )
+        assertEquals(
+            PlaybackStateCompat.STATE_PLAYING,
+            PttForegroundService.resolveMediaSessionPlaybackState(
+                pttState = PttState.STAGED_DRAFT,
+                isScreenOff = true,
+                draftVolumeEnabled = true,
+            ),
         )
     }
 }

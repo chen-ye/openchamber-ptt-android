@@ -38,6 +38,40 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
+enum class TelecomHangupAction(
+    val storageValue: String,
+    val shortLabel: String,
+    val description: String,
+) {
+    QUICK_SEND(
+        storageValue = "quick_send",
+        shortLabel = "Quick send",
+        description = "Enters the 2.5s undo grace window before sending (or appends if a draft is open).",
+    ),
+    SEND_IMMEDIATELY(
+        storageValue = "send_immediately",
+        shortLabel = "Send now",
+        description = "Skips the 2.5s undo window and sends immediately after transcription (or appends if a draft is open).",
+    ),
+    STAGE_DRAFT(
+        storageValue = "stage_draft",
+        shortLabel = "Stage draft",
+        description = "Organizes the utterance into a durable staged draft and reads back the preview.",
+    ),
+    ;
+
+    companion object {
+        val DEFAULT: TelecomHangupAction = QUICK_SEND
+
+        fun fromStorageValue(raw: String?): TelecomHangupAction {
+            val cleaned = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return DEFAULT
+            return entries.firstOrNull { it.storageValue.equals(cleaned, ignoreCase = true) }
+                ?: entries.firstOrNull { it.name.equals(cleaned, ignoreCase = true) }
+                ?: DEFAULT
+        }
+    }
+}
+
 enum class TelecomEndpointType {
     EARPIECE,
     BLUETOOTH,

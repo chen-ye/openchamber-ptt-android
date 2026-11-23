@@ -111,4 +111,22 @@ class MediaButtonGestureDetectorTest {
             emitted,
         )
     }
+
+    @Test
+    fun `SINGLE_ONLY headset tap mode forces IMMEDIATE_SINGLE across all states`() {
+        for (state in PttState.entries) {
+            assertEquals(
+                TapGroupingMode.IMMEDIATE_SINGLE,
+                MediaButtonGestureDetector.groupingModeFor(state, HeadsetTapMode.SINGLE_ONLY),
+            )
+        }
+        assertEquals(
+            TapGroupingMode.DOUBLE_ONLY,
+            MediaButtonGestureDetector.groupingModeFor(PttState.ARMED_IDLE, HeadsetTapMode.MULTI_TAP),
+        )
+        assertEquals(
+            TapGroupingMode.DOUBLE_AND_TRIPLE,
+            MediaButtonGestureDetector.groupingModeFor(PttState.RECORDING, HeadsetTapMode.MULTI_TAP),
+        )
+    }
 }

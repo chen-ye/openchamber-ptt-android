@@ -207,21 +207,29 @@ class MediaButtonGestureDetector(
         const val DEFAULT_DOUBLE_TAP_WINDOW_MS = 350L
         const val DEFAULT_TRIPLE_TAP_WINDOW_MS = 240L
 
-        fun groupingModeFor(state: PttState): TapGroupingMode = when (state) {
-            PttState.ARMED_IDLE -> TapGroupingMode.DOUBLE_ONLY
-            PttState.RECORDING,
-            PttState.STAGED_DRAFT,
-            PttState.STAGED_DRAFT_SPEAKING,
-            -> TapGroupingMode.DOUBLE_AND_TRIPLE
-            PttState.DISARMED,
-            PttState.TRANSCRIBING_SEND,
-            PttState.TRANSCRIBING_STAGE,
-            PttState.SEND_GRACE,
-            PttState.WAITING_AGENT,
-            PttState.SPEAKING_TTS,
-            PttState.PERMISSION_BLOCKED,
-            PttState.ERROR,
-            -> TapGroupingMode.IMMEDIATE_SINGLE
+        fun groupingModeFor(
+            state: PttState,
+            tapMode: HeadsetTapMode = HeadsetTapMode.MULTI_TAP,
+        ): TapGroupingMode {
+            if (tapMode == HeadsetTapMode.SINGLE_ONLY) {
+                return TapGroupingMode.IMMEDIATE_SINGLE
+            }
+            return when (state) {
+                PttState.ARMED_IDLE -> TapGroupingMode.DOUBLE_ONLY
+                PttState.RECORDING,
+                PttState.STAGED_DRAFT,
+                PttState.STAGED_DRAFT_SPEAKING,
+                -> TapGroupingMode.DOUBLE_AND_TRIPLE
+                PttState.DISARMED,
+                PttState.TRANSCRIBING_SEND,
+                PttState.TRANSCRIBING_STAGE,
+                PttState.SEND_GRACE,
+                PttState.WAITING_AGENT,
+                PttState.SPEAKING_TTS,
+                PttState.PERMISSION_BLOCKED,
+                PttState.ERROR,
+                -> TapGroupingMode.IMMEDIATE_SINGLE
+            }
         }
     }
 }

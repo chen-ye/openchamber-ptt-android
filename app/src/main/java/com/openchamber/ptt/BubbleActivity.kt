@@ -46,6 +46,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.openchamber.ptt.network.OpenChamberHttp
+import com.openchamber.ptt.service.BluetoothCaptureMode
 import com.openchamber.ptt.service.PttForegroundService
 import com.openchamber.ptt.service.PttState
 import com.openchamber.ptt.session.SessionRepository
@@ -107,6 +108,13 @@ class BubbleActivity : ComponentActivity() {
                             }
                             startActivity(launchIntent)
                         },
+                        onOpenFullAppSettings = {
+                            val launchIntent = Intent(this, MainActivity::class.java).apply {
+                                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                                putExtra(MainActivity.EXTRA_OPEN_SETTINGS_SECTION, "VOICE")
+                            }
+                            startActivity(launchIntent)
+                        },
                     )
                 }
             }
@@ -137,6 +145,7 @@ private fun BubbleCockpitScreen(
     ttsClient: TtsClient,
     boundService: PttForegroundService?,
     onOpenFullApp: () -> Unit,
+    onOpenFullAppSettings: () -> Unit,
 ) {
     val cockpit = rememberVoiceCockpitState(
         tokenStore = tokenStore,
@@ -254,6 +263,8 @@ private fun BubbleCockpitScreen(
                 onPullBackToDraft = { cockpit.pullBackToDraft() },
                 sendGraceRemainingMs = cockpit.sendGraceRemainingMs,
                 pendingQuickTranscript = cockpit.pendingQuickTranscript,
+                controlScheme = cockpit.controlSchemeConfig,
+                hasDraft = cockpit.activeDraft != null,
             )
 
             FlowRow(
@@ -261,10 +272,17 @@ private fun BubbleCockpitScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                val headsetMicLabel = if (cockpit.pinSco &&
+                    cockpit.bluetoothCaptureMode == BluetoothCaptureMode.TELECOM_HFP
+                ) {
+                    "Headset mic · Call"
+                } else {
+                    "Headset mic"
+                }
                 FilterChip(
                     selected = cockpit.pinSco,
                     onClick = { cockpit.togglePinSco() },
-                    label = { Text("Headset mic") },
+                    label = { Text(headsetMicLabel) },
                     leadingIcon = {
                         Icon(
                             painter = painterResource(R.drawable.ic_bluetooth_audio),
@@ -343,6 +361,6 @@ private fun BubbleCockpitScreen(
         state = cockpit,
         onSignInServer = { onOpenFullApp() },
         onAddServer = onOpenFullApp,
-        onOpenSettings = onOpenFullApp,
+        onOpenSettings = onOpenFullAppSettings,
     )
 }

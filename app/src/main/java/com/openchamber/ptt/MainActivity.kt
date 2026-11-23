@@ -55,7 +55,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,6 +73,7 @@ import com.openchamber.ptt.bubble.BubbleAvailability
 import com.openchamber.ptt.bubble.BubbleHelper
 import com.openchamber.ptt.logging.VoiceUxLogger
 import com.openchamber.ptt.network.OpenChamberHttp
+import com.openchamber.ptt.service.BluetoothCaptureMode
 import com.openchamber.ptt.service.PttForegroundService
 import com.openchamber.ptt.service.PttState
 import com.openchamber.ptt.session.SessionRepository
@@ -78,19 +81,22 @@ import com.openchamber.ptt.storage.TokenStore
 import com.openchamber.ptt.tts.SttEngine
 import com.openchamber.ptt.tts.TtsClient
 import com.openchamber.ptt.tts.TtsInputMode
+import com.openchamber.ptt.tts.VoiceRole
 import com.openchamber.ptt.ui.HeroPttControl
 import com.openchamber.ptt.ui.PermissionCheckRow
 import com.openchamber.ptt.ui.PermissionStatusSnapshot
 import com.openchamber.ptt.ui.PermissionWarningBanner
 import com.openchamber.ptt.ui.ServerConnectionFields
 import com.openchamber.ptt.ui.SessionPill
-import com.openchamber.ptt.ui.SettingsBottomSheet
+import com.openchamber.ptt.ui.SettingsScreen
+import com.openchamber.ptt.ui.SettingsSection
 import com.openchamber.ptt.ui.SpokenDetailSlider
 import com.openchamber.ptt.ui.StagedDraftCard
 import com.openchamber.ptt.ui.StatusPill
 import com.openchamber.ptt.ui.TurnTranscriptPanel
 import com.openchamber.ptt.ui.VoiceCockpitSheets
-import com.openchamber.ptt.ui.VoiceUxLogSheet
+import com.openchamber.ptt.ui.VoicePickerScreen
+import com.openchamber.ptt.ui.VoiceUxLogScreen
 import com.openchamber.ptt.ui.launchBatteryOptimizationSettings
 import com.openchamber.ptt.ui.rememberVoiceCockpitState
 import com.openchamber.ptt.ui.theme.OpenChamberPttTheme
@@ -105,6 +111,7 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
     private var boundService by mutableStateOf<PttForegroundService?>(null)
     private var isServiceBound = false
+    private var pendingSettingsSection by mutableStateOf<SettingsSection?>(null)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -120,6 +127,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        consumeIntentExtras(intent)
 
         val appContext = applicationContext
         val tokenStore = TokenStore(appContext)
@@ -142,10 +150,26 @@ class MainActivity : ComponentActivity() {
                         sessionRepository = sessionRepository,
                         ttsClient = ttsClient,
                         boundService = boundService,
+                        pendingSettingsSection = pendingSettingsSection,
+                        onConsumePendingSettingsSection = { pendingSettingsSection = null },
                     )
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeIntentExtras(intent)
+    }
+
+    private fun consumeIntentExtras(intent: Intent?) {
+        val raw = intent?.getStringExtra(EXTRA_OPEN_SETTINGS_SECTION)?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return
+        val section = runCatching { SettingsSection.valueOf(raw) }.getOrNull() ?: SettingsSection.CONTROLS
+        pendingSettingsSection = section
+        intent.removeExtra(EXTRA_OPEN_SETTINGS_SECTION)
     }
 
     override fun onStart() {
@@ -165,8 +189,50 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val DEFAULT_SERVER_URL = ""
+        const val EXTRA_OPEN_SETTINGS_SECTION = "com.openchamber.ptt.extra.OPEN_SETTINGS_SECTION"
     }
 }
+
+private sealed interface MainRoute {
+    data object Cockpit : MainRoute
+    data object Settings : MainRoute
+    data class VoicePicker(
+        val initialRole: VoiceRole = VoiceRole.AGENT,
+        val openedFromSettings: Boolean = false,
+    ) : MainRoute
+    data object VoiceUxLog : MainRoute
+}
+
+private val mainRouteStackSaver = listSaver<List<MainRoute>, String>(
+    save = { stack ->
+        stack.map { route ->
+            when (route) {
+                MainRoute.Cockpit -> "cockpit"
+                MainRoute.Settings -> "settings"
+                is MainRoute.VoicePicker -> "voice:${route.initialRole.name}:${if (route.openedFromSettings) 1 else 0}"
+                MainRoute.VoiceUxLog -> "telemetry"
+            }
+        }
+    },
+    restore = { encoded ->
+        encoded.mapNotNull { item ->
+            when {
+                item == "cockpit" -> MainRoute.Cockpit
+                item == "settings" -> MainRoute.Settings
+                item == "telemetry" -> MainRoute.VoiceUxLog
+                item.startsWith("voice:") -> {
+                    val parts = item.split(":")
+                    val role = parts.getOrNull(1)?.let { r ->
+                        runCatching { VoiceRole.valueOf(r) }.getOrNull()
+                    } ?: VoiceRole.AGENT
+                    val fromSettings = parts.getOrNull(2) == "1"
+                    MainRoute.VoicePicker(initialRole = role, openedFromSettings = fromSettings)
+                }
+                else -> null
+            }
+        }.ifEmpty { listOf(MainRoute.Cockpit) }
+    },
+)
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -176,6 +242,8 @@ private fun OpenChamberPttScreen(
     sessionRepository: SessionRepository,
     ttsClient: TtsClient,
     boundService: PttForegroundService?,
+    pendingSettingsSection: SettingsSection? = null,
+    onConsumePendingSettingsSection: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -206,9 +274,52 @@ private fun OpenChamberPttScreen(
     var showPassword by rememberSaveable { mutableStateOf(false) }
     var isAuthenticating by remember { mutableStateOf(false) }
 
-    var showSettingsSheet by rememberSaveable { mutableStateOf(false) }
+    var routeStack by rememberSaveable(stateSaver = mainRouteStackSaver) {
+        mutableStateOf(listOf(MainRoute.Cockpit))
+    }
     var openAddServerInSettings by rememberSaveable { mutableStateOf(false) }
-    var showTelemetrySheet by rememberSaveable { mutableStateOf(false) }
+    var settingsSection by rememberSaveable { mutableStateOf(SettingsSection.CONTROLS) }
+    val routeStateHolder = rememberSaveableStateHolder()
+    val currentRoute = routeStack.lastOrNull() ?: MainRoute.Cockpit
+
+    fun openSettingsRoute(section: SettingsSection, addServerOpen: Boolean = false) {
+        settingsSection = section
+        openAddServerInSettings = addServerOpen
+        val base = routeStack.filterNot { it is MainRoute.Settings }
+        routeStack = base + MainRoute.Settings
+    }
+
+    fun pushRoute(route: MainRoute) {
+        if (routeStack.lastOrNull() != route) {
+            routeStack = routeStack + route
+        }
+    }
+
+    fun popRoute() {
+        val top = routeStack.lastOrNull()
+        if (top is MainRoute.VoicePicker) {
+            cockpit.stopVoicePreview()
+        }
+        if (top is MainRoute.Settings) {
+            openAddServerInSettings = false
+        }
+        if (routeStack.size > 1) {
+            routeStack = routeStack.dropLast(1)
+        }
+    }
+
+    fun popToCockpit() {
+        cockpit.stopVoicePreview()
+        openAddServerInSettings = false
+        routeStack = listOf(MainRoute.Cockpit)
+    }
+
+    LaunchedEffect(pendingSettingsSection) {
+        val target = pendingSettingsSection ?: return@LaunchedEffect
+        openSettingsRoute(target, addServerOpen = false)
+        onConsumePendingSettingsSection()
+    }
+
     val fallbackUxLogger = remember(context) { VoiceUxLogger(context) }
     DisposableEffect(fallbackUxLogger) {
         onDispose { fallbackUxLogger.close() }
@@ -244,19 +355,28 @@ private fun OpenChamberPttScreen(
         }
     }
 
-    LaunchedEffect(showSettingsSheet) {
-        if (showSettingsSheet) {
-            refreshMlKitSttStatuses()
-            cockpit.refreshMlKitTtsStatus()
-            cockpit.refreshTtsCacheStats()
-            if (cockpit.systemVoices.isEmpty()) {
-                cockpit.refreshSystemVoices()
+    LaunchedEffect(currentRoute) {
+        when (currentRoute) {
+            MainRoute.Settings -> {
+                refreshMlKitSttStatuses()
+                cockpit.refreshMlKitTtsStatus()
+                cockpit.refreshTtsCacheStats()
+                if (cockpit.systemVoices.isEmpty()) {
+                    cockpit.refreshSystemVoices()
+                }
             }
+            is MainRoute.VoicePicker -> {
+                cockpit.ensureVoiceCatalogLoaded()
+            }
+            MainRoute.VoiceUxLog -> {
+                refreshTelemetrySummary()
+            }
+            MainRoute.Cockpit -> Unit
         }
     }
 
-    LaunchedEffect(showSettingsSheet, cockpit.cuePackWarmState.warmedCount, cockpit.cuePackWarmState.isWarming) {
-        if (showSettingsSheet) {
+    LaunchedEffect(currentRoute, cockpit.cuePackWarmState.warmedCount, cockpit.cuePackWarmState.isWarming) {
+        if (currentRoute == MainRoute.Settings) {
             cockpit.refreshTtsCacheStats()
         }
     }
@@ -397,289 +517,580 @@ private fun OpenChamberPttScreen(
 
     val isOperateReady = cockpit.isOperateReady
 
-    Scaffold(
-        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
-        topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        text = "OpenChamber PTT",
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                },
-                actions = {
-                    if (isOperateReady) {
-                        IconButton(onClick = { launchBubble() }) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_chat_bubble),
-                                contentDescription = "Float voice bubble",
-                            )
-                        }
-                    }
-                    IconButton(onClick = { showSettingsSheet = true }) {
-                        Box {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_settings),
-                                contentDescription = if (cockpit.permissionSnapshot.needsAttention) {
-                                    "Settings, permissions or sign-in attention needed"
-                                } else {
-                                    "Settings"
-                                },
-                            )
-                            if (cockpit.permissionSnapshot.needsAttention) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(8.dp)
-                                        .align(Alignment.TopEnd)
-                                        .background(
-                                            color = MaterialTheme.colorScheme.error,
-                                            shape = CircleShape,
-                                        ),
-                                )
-                            }
-                        }
-                    }
-                },
-            )
-        },
-    ) { innerPadding ->
-        BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .imePadding(),
-        ) {
-            val isWideLayout = (maxWidth >= 600.dp || (maxWidth >= 540.dp && maxWidth > maxHeight)) &&
-                isOperateReady
+    val routeKey = when (currentRoute) {
+        MainRoute.Cockpit -> "cockpit"
+        MainRoute.Settings -> "settings"
+        is MainRoute.VoicePicker -> "voice_${currentRoute.initialRole.name}_${currentRoute.openedFromSettings}"
+        MainRoute.VoiceUxLog -> "telemetry"
+    }
 
-            @Composable
-            fun renderPrimaryControls() {
-                SessionPill(
-                    pinnedSession = cockpit.pinnedSession,
-                    isConnected = cockpit.isConnected,
-                    isLoading = cockpit.isLoadingSessions,
-                    serverLabel = cockpit.activeServer?.displayLabel,
-                    showServerLabel = cockpit.servers.size > 1,
-                    onClick = { cockpit.openSessionPicker() },
-                )
-
-                if (!cockpit.sessionsError.isNullOrBlank()) {
-                    Text(
-                        text = cockpit.sessionsError.orEmpty(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-
-                if (cockpit.pttState == PttState.PERMISSION_BLOCKED) {
-                    PermissionWarningBanner(
-                        toolName = cockpit.permissionPrompt ?: "tool",
-                        canReArm = cockpit.canArm,
-                        onOpenOpenChamber = {
-                            cockpit.openInOfficialApp(fallbackServerUrl = serverUrl)
-                        },
-                        onReArm = { cockpit.armPtt() },
-                    )
-                }
-
-                Box(
-                    modifier = Modifier.fillMaxWidth(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    StatusPill(pttState = cockpit.pttState)
-                }
-
-                HeroPttControl(
-                    pttState = cockpit.pttState,
-                    statusText = cockpit.statusText,
-                    recordingStartedAtElapsedMs = cockpit.recordingStartedAt,
-                    canArm = cockpit.canArm,
-                    compact = isWideLayout,
-                    onArm = { cockpit.armPtt() },
-                    onTapPtt = { cockpit.tapPtt() },
-                    onStageCapture = { cockpit.stageCurrentRecording() },
-                    onDiscard = { cockpit.discardCurrent() },
-                    onPullBackToDraft = { cockpit.pullBackToDraft() },
-                    sendGraceRemainingMs = cockpit.sendGraceRemainingMs,
-                    pendingQuickTranscript = cockpit.pendingQuickTranscript,
-                )
-
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    FilterChip(
-                        selected = cockpit.pinSco,
-                        onClick = { cockpit.togglePinSco() },
-                        label = { Text("Headset mic") },
-                        leadingIcon = {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_bluetooth_audio),
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp),
-                            )
-                        },
-                    )
-
-                    AssistChip(
-                        onClick = { cockpit.openVoicePicker() },
-                        label = {
-                            Text(
-                                text = cockpit.activeVoiceChipLabel,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        },
-                        leadingIcon = {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_graphic_eq),
-                                contentDescription = "Voice",
-                                modifier = Modifier.size(18.dp),
-                            )
-                        },
-                    )
-
-                    if (cockpit.pttState != PttState.DISARMED) {
-                        AssistChip(
-                            onClick = { cockpit.disarmPtt() },
-                            label = { Text("Disarm") },
-                            leadingIcon = {
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_power),
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp),
+    routeStateHolder.SaveableStateProvider(key = routeKey) {
+        when (currentRoute) {
+            MainRoute.Cockpit -> {
+                Scaffold(
+                    snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+                    topBar = {
+                        TopAppBar(
+                            title = {
+                                Text(
+                                    text = "OpenChamber PTT",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             },
+                            actions = {
+                                if (isOperateReady) {
+                                    IconButton(onClick = { launchBubble() }) {
+                                        Icon(
+                                            painter = painterResource(R.drawable.ic_chat_bubble),
+                                            contentDescription = "Float voice bubble",
+                                        )
+                                    }
+                                }
+                                IconButton(
+                                    onClick = {
+                                        openSettingsRoute(SettingsSection.CONTROLS, addServerOpen = false)
+                                    },
+                                ) {
+                                    Box {
+                                        Icon(
+                                            painter = painterResource(R.drawable.ic_settings),
+                                            contentDescription = if (cockpit.permissionSnapshot.needsAttention) {
+                                                "Settings, permissions or sign-in attention needed"
+                                            } else {
+                                                "Settings"
+                                            },
+                                        )
+                                        if (cockpit.permissionSnapshot.needsAttention) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(8.dp)
+                                                    .align(Alignment.TopEnd)
+                                                    .background(
+                                                        color = MaterialTheme.colorScheme.error,
+                                                        shape = CircleShape,
+                                                    ),
+                                            )
+                                        }
+                                    }
+                                }
+                            },
                         )
+                    },
+                ) { innerPadding ->
+                    BoxWithConstraints(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                            .imePadding(),
+                    ) {
+                        val isWideLayout = (maxWidth >= 600.dp || (maxWidth >= 540.dp && maxWidth > maxHeight)) &&
+                            isOperateReady
+
+                        @Composable
+                        fun renderPrimaryControls() {
+                            SessionPill(
+                                pinnedSession = cockpit.pinnedSession,
+                                isConnected = cockpit.isConnected,
+                                isLoading = cockpit.isLoadingSessions,
+                                serverLabel = cockpit.activeServer?.displayLabel,
+                                showServerLabel = cockpit.servers.size > 1,
+                                onClick = { cockpit.openSessionPicker() },
+                            )
+
+                            if (!cockpit.sessionsError.isNullOrBlank()) {
+                                Text(
+                                    text = cockpit.sessionsError.orEmpty(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+
+                            if (cockpit.pttState == PttState.PERMISSION_BLOCKED) {
+                                PermissionWarningBanner(
+                                    toolName = cockpit.permissionPrompt ?: "tool",
+                                    canReArm = cockpit.canArm,
+                                    onOpenOpenChamber = {
+                                        cockpit.openInOfficialApp(fallbackServerUrl = serverUrl)
+                                    },
+                                    onReArm = { cockpit.armPtt() },
+                                )
+                            }
+
+                            Box(
+                                modifier = Modifier.fillMaxWidth(),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                StatusPill(pttState = cockpit.pttState)
+                            }
+
+                            HeroPttControl(
+                                pttState = cockpit.pttState,
+                                statusText = cockpit.statusText,
+                                recordingStartedAtElapsedMs = cockpit.recordingStartedAt,
+                                canArm = cockpit.canArm,
+                                compact = isWideLayout,
+                                onArm = { cockpit.armPtt() },
+                                onTapPtt = { cockpit.tapPtt() },
+                                onStageCapture = { cockpit.stageCurrentRecording() },
+                                onDiscard = { cockpit.discardCurrent() },
+                                onPullBackToDraft = { cockpit.pullBackToDraft() },
+                                sendGraceRemainingMs = cockpit.sendGraceRemainingMs,
+                                pendingQuickTranscript = cockpit.pendingQuickTranscript,
+                                controlScheme = cockpit.controlSchemeConfig,
+                                hasDraft = cockpit.activeDraft != null,
+                            )
+
+                            FlowRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                val headsetMicLabel = if (cockpit.pinSco &&
+                                    cockpit.bluetoothCaptureMode == BluetoothCaptureMode.TELECOM_HFP
+                                ) {
+                                    "Headset mic · Call"
+                                } else {
+                                    "Headset mic"
+                                }
+                                FilterChip(
+                                    selected = cockpit.pinSco,
+                                    onClick = { cockpit.togglePinSco() },
+                                    label = { Text(headsetMicLabel) },
+                                    leadingIcon = {
+                                        Icon(
+                                            painter = painterResource(R.drawable.ic_bluetooth_audio),
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    },
+                                )
+
+                                AssistChip(
+                                    onClick = {
+                                        pushRoute(
+                                            MainRoute.VoicePicker(
+                                                initialRole = VoiceRole.AGENT,
+                                                openedFromSettings = false,
+                                            ),
+                                        )
+                                    },
+                                    label = {
+                                        Text(
+                                            text = cockpit.activeVoiceChipLabel,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            painter = painterResource(R.drawable.ic_graphic_eq),
+                                            contentDescription = "Voice",
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    },
+                                )
+
+                                if (cockpit.pttState != PttState.DISARMED) {
+                                    AssistChip(
+                                        onClick = { cockpit.disarmPtt() },
+                                        label = { Text("Disarm") },
+                                        leadingIcon = {
+                                            Icon(
+                                                painter = painterResource(R.drawable.ic_power),
+                                                contentDescription = null,
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        @Composable
+                        fun renderSecondaryContent() {
+                            if (cockpit.ttsInputMode == TtsInputMode.SUMMARIZED) {
+                                SpokenDetailSlider(
+                                    detailLevel = cockpit.spokenDetailLevel,
+                                    onSelectLevel = { cockpit.selectSpokenDetailLevel(it) },
+                                )
+                            }
+
+                            val activeDraft = cockpit.activeDraft
+                            if (activeDraft != null && cockpit.pttState != PttState.WAITING_AGENT) {
+                                StagedDraftCard(
+                                    draft = activeDraft,
+                                    pttState = cockpit.pttState,
+                                    isOrganizing = cockpit.isOrganizingDraft,
+                                    onUpdateDraftText = { cockpit.updateDraftText(it) },
+                                    onCommitDraft = { cockpit.commitStagedDraft() },
+                                    onReorganizeDraft = { cockpit.reorganizeCurrentDraft() },
+                                    onRevertDraft = { cockpit.revertDraftToPrevious() },
+                                    onDiscardDraft = { cockpit.discardStagedDraft(activeDraft) },
+                                )
+                            }
+
+                            TurnTranscriptPanel(
+                                lastTranscript = cockpit.lastTranscript,
+                                lastReply = cockpit.lastReply,
+                                lastSpokenSummary = cockpit.lastSpokenSummary,
+                                lastTtsInfo = cockpit.lastTtsInfo,
+                                serviceError = cockpit.serviceError,
+                                pttState = cockpit.pttState,
+                                responseFeed = cockpit.responseFeed,
+                                showQueueStrip = true,
+                                isSpeaking = cockpit.pttState == PttState.SPEAKING_TTS,
+                                canReadAloud = cockpit.canReadAloud,
+                                onReadAloudClick = { cockpit.readPreviousMessage() },
+                                onStepResponse = { delta -> cockpit.stepResponse(delta) },
+                                onSelectResponse = { messageId -> cockpit.selectResponse(messageId) },
+                                onMarkAllRead = { cockpit.markAllResponsesRead() },
+                                onDismissDirectAnswer = { cockpit.dismissDirectAnswer() },
+                                onOpenInOpenChamber = if (cockpit.pinnedSession != null || serverUrl.isNotBlank()) {
+                                    { cockpit.openInOfficialApp(fallbackServerUrl = serverUrl) }
+                                } else {
+                                    null
+                                },
+                            )
+                        }
+
+                        if (!isOperateReady) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                            ) {
+                                SetupFlowContent(
+                                    snapshot = cockpit.permissionSnapshot,
+                                    serverUrl = serverUrl,
+                                    onServerUrlChange = { serverUrl = it },
+                                    password = password,
+                                    onPasswordChange = { password = it },
+                                    showPassword = showPassword,
+                                    onToggleShowPassword = { showPassword = !showPassword },
+                                    isConnected = cockpit.isConnected,
+                                    isAuthenticating = isAuthenticating,
+                                    authError = authError,
+                                    onRequestPermissions = {
+                                        val missing = cockpit.permissionSnapshot.missingPermissions
+                                        if (missing.isNotEmpty()) {
+                                            permissionLauncher.launch(missing.toTypedArray())
+                                        }
+                                    },
+                                    onRequestBatteryExemption = {
+                                        launchBatteryOptimizationSettings(context)
+                                    },
+                                    onConnect = { performConnect() },
+                                )
+                            }
+                        } else if (isWideLayout) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(0.95f)
+                                        .fillMaxHeight()
+                                        .verticalScroll(rememberScrollState()),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    renderPrimaryControls()
+                                }
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1.05f)
+                                        .fillMaxHeight()
+                                        .verticalScroll(rememberScrollState()),
+                                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                                ) {
+                                    renderSecondaryContent()
+                                }
+                            }
+                        } else {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(12.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .widthIn(max = 560.dp)
+                                        .fillMaxWidth(),
+                                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                                ) {
+                                    renderPrimaryControls()
+                                    renderSecondaryContent()
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            @Composable
-            fun renderSecondaryContent() {
-                if (cockpit.ttsInputMode == TtsInputMode.SUMMARIZED) {
-                    SpokenDetailSlider(
-                        detailLevel = cockpit.spokenDetailLevel,
-                        onSelectLevel = { cockpit.selectSpokenDetailLevel(it) },
-                    )
-                }
-
-                val activeDraft = cockpit.activeDraft
-                if (activeDraft != null && cockpit.pttState != PttState.WAITING_AGENT) {
-                    StagedDraftCard(
-                        draft = activeDraft,
-                        pttState = cockpit.pttState,
-                        isOrganizing = cockpit.isOrganizingDraft,
-                        onUpdateDraftText = { cockpit.updateDraftText(it) },
-                        onCommitDraft = { cockpit.commitStagedDraft() },
-                        onReorganizeDraft = { cockpit.reorganizeCurrentDraft() },
-                        onRevertDraft = { cockpit.revertDraftToPrevious() },
-                        onDiscardDraft = { cockpit.discardStagedDraft(activeDraft) },
-                    )
-                }
-
-                TurnTranscriptPanel(
-                    lastTranscript = cockpit.lastTranscript,
-                    lastReply = cockpit.lastReply,
-                    lastSpokenSummary = cockpit.lastSpokenSummary,
-                    lastTtsInfo = cockpit.lastTtsInfo,
-                    serviceError = cockpit.serviceError,
-                    pttState = cockpit.pttState,
-                    responseFeed = cockpit.responseFeed,
-                    showQueueStrip = true,
-                    isSpeaking = cockpit.pttState == PttState.SPEAKING_TTS,
-                    canReadAloud = cockpit.canReadAloud,
-                    onReadAloudClick = { cockpit.readPreviousMessage() },
-                    onStepResponse = { delta -> cockpit.stepResponse(delta) },
-                    onSelectResponse = { messageId -> cockpit.selectResponse(messageId) },
-                    onMarkAllRead = { cockpit.markAllResponsesRead() },
-                    onDismissDirectAnswer = { cockpit.dismissDirectAnswer() },
-                    onOpenInOpenChamber = if (cockpit.pinnedSession != null || serverUrl.isNotBlank()) {
-                        { cockpit.openInOfficialApp(fallbackServerUrl = serverUrl) }
-                    } else {
-                        null
+            MainRoute.Settings -> {
+                SettingsScreen(
+                    activeSection = settingsSection,
+                    onSelectSection = { settingsSection = it },
+                    snapshot = cockpit.permissionSnapshot,
+                    servers = cockpit.servers,
+                    activeServer = cockpit.activeServer,
+                    serverUrl = serverUrl,
+                    onServerUrlChange = { serverUrl = it },
+                    serverLabel = serverLabelInput,
+                    onServerLabelChange = { serverLabelInput = it },
+                    password = password,
+                    onPasswordChange = { password = it },
+                    showPassword = showPassword,
+                    onToggleShowPassword = { showPassword = !showPassword },
+                    isConnected = cockpit.isConnected,
+                    isAuthenticating = isAuthenticating,
+                    authError = authError,
+                    startWithAddServerOpen = openAddServerInSettings,
+                    onSelectServer = { targetServer ->
+                        if (targetServer.isSignedIn) {
+                            cockpit.switchToSignedInServer(targetServer)
+                            serverUrl = targetServer.serverUrl
+                        } else {
+                            serverUrl = targetServer.serverUrl
+                            serverLabelInput = targetServer.label
+                            password = ""
+                            authError = null
+                        }
                     },
+                    onRemoveServer = { targetServer ->
+                        cockpit.removeServer(targetServer)
+                    },
+                    isUsingCustomServerVoice = cockpit.customServerId != null,
+                    onToggleCustomServerVoice = { useCustom ->
+                        cockpit.toggleCustomServerVoice(useCustom)
+                    },
+                    ttsPipeline = cockpit.ttsPipeline,
+                    onUpdateTtsPipeline = { updated ->
+                        cockpit.updateTtsPipeline(updated)
+                    },
+                    ttsInputMode = cockpit.ttsInputMode,
+                    onSelectTtsInputMode = { mode ->
+                        cockpit.selectTtsInputMode(mode)
+                    },
+                    spokenDetailLevel = cockpit.spokenDetailLevel,
+                    onSelectSpokenDetailLevel = { level ->
+                        cockpit.selectSpokenDetailLevel(level)
+                    },
+                    audioCueMode = cockpit.audioCueMode,
+                    onSelectAudioCueMode = { mode ->
+                        cockpit.selectAudioCueMode(mode)
+                    },
+                    cuePackWarmState = cockpit.cuePackWarmState,
+                    roleVoiceProfiles = cockpit.roleVoiceProfiles,
+                    availableGeminiVoiceIds = cockpit.availableGeminiVoiceIds,
+                    availableMlKitVoiceNames = cockpit.availableMlKitVoiceNames,
+                    systemVoiceLabels = cockpit.systemVoiceLabels,
+                    ttsCacheStats = cockpit.ttsCacheStats,
+                    onClearTtsCache = {
+                        cockpit.clearTtsCache()
+                    },
+                    selectedGeminiVoice = cockpit.selectedVoice,
+                    selectedOpenAiVoice = cockpit.selectedOpenAiVoice,
+                    selectedSystemVoiceLabel = cockpit.selectedSystemVoiceLabel,
+                    onOpenVoicePickerForRole = { targetRole ->
+                        pushRoute(
+                            MainRoute.VoicePicker(
+                                initialRole = targetRole,
+                                openedFromSettings = true,
+                            ),
+                        )
+                    },
+                    sttEngine = cockpit.sttEngine,
+                    onSelectSttEngine = { engine ->
+                        cockpit.selectSttEngine(engine)
+                    },
+                    sttFallbackToParakeet = cockpit.sttFallbackToParakeet,
+                    onToggleSttFallback = { enabled ->
+                        cockpit.toggleSttFallback(enabled)
+                    },
+                    quickTurnDirectAnswer = cockpit.quickTurnDirectAnswer,
+                    onToggleQuickTurnDirectAnswer = { enabled ->
+                        cockpit.toggleQuickTurnDirectAnswer(enabled)
+                    },
+                    quickTranscriptCleanup = cockpit.quickTranscriptCleanup,
+                    onToggleQuickTranscriptCleanup = { enabled ->
+                        cockpit.toggleQuickTranscriptCleanup(enabled)
+                    },
+                    mlKitAdvancedStatus = mlKitAdvancedStatus,
+                    mlKitBasicStatus = mlKitBasicStatus,
+                    mlKitDownloadStatus = mlKitDownloadStatus,
+                    isDownloadingMlKit = isDownloadingMlKit,
+                    mlKitTtsStatus = cockpit.mlKitTtsStatus,
+                    mlKitTtsVoicesCount = cockpit.mlKitTtsVoices.size,
+                    selectedMlKitTtsVoice = cockpit.selectedMlKitTtsVoice,
+                    onDownloadMlKitModel = { targetEngine ->
+                        scope.launch {
+                            isDownloadingMlKit = true
+                            mlKitDownloadStatus = "Starting download…"
+                            try {
+                                mlKitClient.downloadModel(targetEngine).collect { ev ->
+                                    when (ev) {
+                                        is MlKitDownloadEvent.Progress -> {
+                                            val mb = ev.bytesDownloaded / (1024.0 * 1024.0)
+                                            mlKitDownloadStatus = "Downloading %.1f MB…".format(mb)
+                                        }
+                                        MlKitDownloadEvent.Completed -> {
+                                            mlKitDownloadStatus = "Model downloaded"
+                                            refreshMlKitSttStatuses()
+                                            cockpit.refreshMlKitTtsStatus()
+                                        }
+                                        is MlKitDownloadEvent.Failed -> {
+                                            mlKitDownloadStatus = "Download failed: ${ev.message}"
+                                        }
+                                    }
+                                }
+                            } catch (ce: CancellationException) {
+                                throw ce
+                            } catch (t: Throwable) {
+                                mlKitDownloadStatus = "Download failed: ${t.message}"
+                            } finally {
+                                isDownloadingMlKit = false
+                            }
+                        }
+                    },
+                    onRequestPermissions = {
+                        val missing = cockpit.permissionSnapshot.missingPermissions
+                        if (missing.isNotEmpty()) {
+                            permissionLauncher.launch(missing.toTypedArray())
+                        }
+                    },
+                    onRequestBatteryExemption = {
+                        launchBatteryOptimizationSettings(context)
+                    },
+                    onOpenBubbleSettings = {
+                        BubbleHelper.openBubbleSettings(context)
+                    },
+                    onOpenTelemetryLog = {
+                        refreshTelemetrySummary()
+                        pushRoute(MainRoute.VoiceUxLog)
+                    },
+                    onOpenAudioDebug = {
+                        context.startActivity(Intent(context, AudioDebugActivity::class.java))
+                    },
+                    controlScheme = cockpit.controlSchemeConfig,
+                    onApplyControlPreset = { preset ->
+                        cockpit.applyControlPreset(preset)
+                    },
+                    onTogglePinBluetoothSco = { enabled ->
+                        cockpit.setPinSco(enabled)
+                    },
+                    onSelectBluetoothCaptureMode = { mode ->
+                        cockpit.selectBluetoothCaptureMode(mode)
+                    },
+                    onSelectTelecomHangupAction = { action ->
+                        cockpit.selectTelecomHangupAction(action)
+                    },
+                    onSelectHeadsetTapMode = { mode ->
+                        cockpit.selectHeadsetTapMode(mode)
+                    },
+                    onToggleAvrcpTrackControls = { enabled ->
+                        cockpit.toggleAvrcpTrackControls(enabled)
+                    },
+                    onSelectVolumeKeyRecordingMode = { mode ->
+                        cockpit.selectVolumeKeyRecordingMode(mode)
+                    },
+                    onSelectVolumeKeyDraftMode = { mode ->
+                        cockpit.selectVolumeKeyDraftMode(mode)
+                    },
+                    onToggleMirrorRecordingNotification = { enabled ->
+                        cockpit.setMirrorRecordingNotif(enabled)
+                    },
+                    onConnect = { performConnect() },
+                    onDisconnect = {
+                        performDisconnectActiveServer()
+                        if (!cockpit.isConnected) {
+                            popToCockpit()
+                        }
+                    },
+                    onNavigateBack = { popRoute() },
                 )
             }
 
-            if (!isOperateReady) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    SetupFlowContent(
-                        snapshot = cockpit.permissionSnapshot,
-                        serverUrl = serverUrl,
-                        onServerUrlChange = { serverUrl = it },
-                        password = password,
-                        onPasswordChange = { password = it },
-                        showPassword = showPassword,
-                        onToggleShowPassword = { showPassword = !showPassword },
-                        isConnected = cockpit.isConnected,
-                        isAuthenticating = isAuthenticating,
-                        authError = authError,
-                        onRequestPermissions = {
-                            val missing = cockpit.permissionSnapshot.missingPermissions
-                            if (missing.isNotEmpty()) {
-                                permissionLauncher.launch(missing.toTypedArray())
+            is MainRoute.VoicePicker -> {
+                VoicePickerScreen(
+                    ttsPipeline = cockpit.ttsPipeline,
+                    roleProfiles = cockpit.roleVoiceProfiles,
+                    initialRole = currentRoute.initialRole,
+                    geminiVoices = cockpit.voices,
+                    isLoadingGemini = cockpit.isLoadingVoices,
+                    geminiError = cockpit.voicesError,
+                    onRefreshGemini = { cockpit.refreshVoices() },
+                    onSelectGeminiVoice = { role, voiceId -> cockpit.selectRoleGeminiVoice(role, voiceId) },
+                    mlKitStatus = cockpit.mlKitTtsStatus,
+                    mlKitVoices = cockpit.mlKitTtsVoices,
+                    mlKitDownloadStatus = cockpit.mlKitTtsDownloadStatus,
+                    isDownloadingMlKit = cockpit.isDownloadingMlKitTts,
+                    onRefreshMlKit = { cockpit.refreshMlKitTtsStatus() },
+                    onSelectMlKitVoice = { role, voiceName -> cockpit.selectRoleMlKitVoice(role, voiceName) },
+                    onDownloadMlKitVoice = { voiceName ->
+                        cockpit.downloadMlKitTtsVoice(voiceName ?: cockpit.selectedMlKitTtsVoice)
+                    },
+                    onSelectOpenAiVoice = { role, voiceId -> cockpit.selectRoleOpenAiVoice(role, voiceId) },
+                    systemVoices = cockpit.systemVoices,
+                    isLoadingSystemVoices = cockpit.isLoadingSystemVoices,
+                    onRefreshSystemVoices = { cockpit.refreshSystemVoices() },
+                    onSelectSystemVoice = { role, voiceName -> cockpit.selectRoleSystemVoice(role, voiceName) },
+                    onSetRolePreferredEngine = { role, engine -> cockpit.setRolePreferredEngine(role, engine) },
+                    onPreviewVoice = { role, engine, voiceId ->
+                        cockpit.previewVoiceSample(
+                            role = role,
+                            engine = engine,
+                            voiceId = voiceId,
+                            kokoroSpeakerId = cockpit.roleVoiceProfiles[role].kokoroSpeakerId
+                                ?: TtsClient.DEFAULT_KOKORO_SPEAKER_ID,
+                        )
+                    },
+                    onOpenTtsSettings = if (!currentRoute.openedFromSettings) {
+                        {
+                            cockpit.stopVoicePreview()
+                            openSettingsRoute(SettingsSection.VOICE, addServerOpen = false)
+                        }
+                    } else {
+                        { popRoute() }
+                    },
+                    onNavigateBack = { popRoute() },
+                )
+            }
+
+            MainRoute.VoiceUxLog -> {
+                @Suppress("DEPRECATION")
+                val clipboardManager = LocalClipboardManager.current
+                VoiceUxLogScreen(
+                    summary = uxSummary,
+                    onRefresh = { refreshTelemetrySummary() },
+                    onCopyJsonl = {
+                        scope.launch(Dispatchers.IO) {
+                            val jsonl = boundService?.exportVoiceUxLog() ?: fallbackUxLogger.exportJsonl()
+                            withContext(Dispatchers.Main) {
+                                clipboardManager.setText(AnnotatedString(jsonl))
+                                Toast.makeText(context, "Copied Voice UX JSONL log", Toast.LENGTH_SHORT).show()
                             }
-                        },
-                        onRequestBatteryExemption = {
-                            launchBatteryOptimizationSettings(context)
-                        },
-                        onConnect = { performConnect() },
-                    )
-                }
-            } else if (isWideLayout) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(0.95f)
-                            .fillMaxHeight()
-                            .verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        renderPrimaryControls()
-                    }
-                    Column(
-                        modifier = Modifier
-                            .weight(1.05f)
-                            .fillMaxHeight()
-                            .verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        renderSecondaryContent()
-                    }
-                }
-            } else {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .widthIn(max = 560.dp)
-                            .fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        renderPrimaryControls()
-                        renderSecondaryContent()
-                    }
-                }
+                        }
+                    },
+                    onClear = {
+                        scope.launch(Dispatchers.IO) {
+                            boundService?.clearVoiceUxLog() ?: fallbackUxLogger.clear()
+                            val next = boundService?.readVoiceUxSummary() ?: fallbackUxLogger.readSummary()
+                            withContext(Dispatchers.Main) {
+                                uxSummary = next
+                            }
+                        }
+                    },
+                    onNavigateBack = { popRoute() },
+                )
             }
         }
     }
@@ -691,221 +1102,20 @@ private fun OpenChamberPttScreen(
             serverLabelInput = targetServer.label
             password = ""
             authError = null
-            openAddServerInSettings = true
-            showSettingsSheet = true
+            openSettingsRoute(SettingsSection.SERVERS, addServerOpen = true)
         },
         onAddServer = {
             serverUrl = ""
             serverLabelInput = ""
             password = ""
             authError = null
-            openAddServerInSettings = true
-            showSettingsSheet = true
+            openSettingsRoute(SettingsSection.SERVERS, addServerOpen = true)
         },
-        onOpenSettings = { showSettingsSheet = true },
+        onOpenSettings = {
+            openSettingsRoute(SettingsSection.VOICE, addServerOpen = false)
+        },
+        includeVoicePickerSheet = false,
     )
-
-    if (showSettingsSheet) {
-        SettingsBottomSheet(
-            snapshot = cockpit.permissionSnapshot,
-            servers = cockpit.servers,
-            activeServer = cockpit.activeServer,
-            serverUrl = serverUrl,
-            onServerUrlChange = { serverUrl = it },
-            serverLabel = serverLabelInput,
-            onServerLabelChange = { serverLabelInput = it },
-            password = password,
-            onPasswordChange = { password = it },
-            showPassword = showPassword,
-            onToggleShowPassword = { showPassword = !showPassword },
-            isConnected = cockpit.isConnected,
-            isAuthenticating = isAuthenticating,
-            authError = authError,
-            startWithAddServerOpen = openAddServerInSettings,
-            onSelectServer = { targetServer ->
-                if (targetServer.isSignedIn) {
-                    cockpit.switchToSignedInServer(targetServer)
-                    serverUrl = targetServer.serverUrl
-                } else {
-                    serverUrl = targetServer.serverUrl
-                    serverLabelInput = targetServer.label
-                    password = ""
-                    authError = null
-                }
-            },
-            onRemoveServer = { targetServer ->
-                cockpit.removeServer(targetServer)
-            },
-            isUsingCustomServerVoice = cockpit.customServerId != null,
-            onToggleCustomServerVoice = { useCustom ->
-                cockpit.toggleCustomServerVoice(useCustom)
-            },
-            ttsPipeline = cockpit.ttsPipeline,
-            onUpdateTtsPipeline = { updated ->
-                cockpit.updateTtsPipeline(updated)
-            },
-            ttsInputMode = cockpit.ttsInputMode,
-            onSelectTtsInputMode = { mode ->
-                cockpit.selectTtsInputMode(mode)
-            },
-            spokenDetailLevel = cockpit.spokenDetailLevel,
-            onSelectSpokenDetailLevel = { level ->
-                cockpit.selectSpokenDetailLevel(level)
-            },
-            audioCueMode = cockpit.audioCueMode,
-            onSelectAudioCueMode = { mode ->
-                cockpit.selectAudioCueMode(mode)
-            },
-            cuePackWarmState = cockpit.cuePackWarmState,
-            roleVoiceProfiles = cockpit.roleVoiceProfiles,
-            availableGeminiVoiceIds = cockpit.availableGeminiVoiceIds,
-            availableMlKitVoiceNames = cockpit.availableMlKitVoiceNames,
-            systemVoiceLabels = cockpit.systemVoiceLabels,
-            ttsCacheStats = cockpit.ttsCacheStats,
-            onClearTtsCache = {
-                cockpit.clearTtsCache()
-            },
-            selectedGeminiVoice = cockpit.selectedVoice,
-            selectedOpenAiVoice = cockpit.selectedOpenAiVoice,
-            selectedSystemVoiceLabel = cockpit.selectedSystemVoiceLabel,
-            onOpenVoicePickerFor = { targetEngine, targetRole ->
-                showSettingsSheet = false
-                cockpit.openVoicePickerFor(targetEngine, targetRole)
-            },
-            sttEngine = cockpit.sttEngine,
-            onSelectSttEngine = { engine ->
-                cockpit.selectSttEngine(engine)
-            },
-            sttFallbackToParakeet = cockpit.sttFallbackToParakeet,
-            onToggleSttFallback = { enabled ->
-                cockpit.toggleSttFallback(enabled)
-            },
-            quickTurnDirectAnswer = cockpit.quickTurnDirectAnswer,
-            onToggleQuickTurnDirectAnswer = { enabled ->
-                cockpit.toggleQuickTurnDirectAnswer(enabled)
-            },
-            quickTranscriptCleanup = cockpit.quickTranscriptCleanup,
-            onToggleQuickTranscriptCleanup = { enabled ->
-                cockpit.toggleQuickTranscriptCleanup(enabled)
-            },
-            mlKitAdvancedStatus = mlKitAdvancedStatus,
-            mlKitBasicStatus = mlKitBasicStatus,
-            mlKitDownloadStatus = mlKitDownloadStatus,
-            isDownloadingMlKit = isDownloadingMlKit,
-            mlKitTtsStatus = cockpit.mlKitTtsStatus,
-            mlKitTtsVoicesCount = cockpit.mlKitTtsVoices.size,
-            selectedMlKitTtsVoice = cockpit.selectedMlKitTtsVoice,
-            onDownloadMlKitModel = { targetEngine ->
-                scope.launch {
-                    isDownloadingMlKit = true
-                    mlKitDownloadStatus = "Starting download…"
-                    try {
-                        mlKitClient.downloadModel(targetEngine).collect { ev ->
-                            when (ev) {
-                                is MlKitDownloadEvent.Progress -> {
-                                    val mb = ev.bytesDownloaded / (1024.0 * 1024.0)
-                                    mlKitDownloadStatus = "Downloading %.1f MB…".format(mb)
-                                }
-                                MlKitDownloadEvent.Completed -> {
-                                    mlKitDownloadStatus = "Model downloaded"
-                                    refreshMlKitSttStatuses()
-                                    cockpit.refreshMlKitTtsStatus()
-                                }
-                                is MlKitDownloadEvent.Failed -> {
-                                    mlKitDownloadStatus = "Download failed: ${ev.message}"
-                                }
-                            }
-                        }
-                    } catch (ce: CancellationException) {
-                        throw ce
-                    } catch (t: Throwable) {
-                        mlKitDownloadStatus = "Download failed: ${t.message}"
-                    } finally {
-                        isDownloadingMlKit = false
-                    }
-                }
-            },
-            onRequestPermissions = {
-                val missing = cockpit.permissionSnapshot.missingPermissions
-                if (missing.isNotEmpty()) {
-                    permissionLauncher.launch(missing.toTypedArray())
-                }
-            },
-            onRequestBatteryExemption = {
-                launchBatteryOptimizationSettings(context)
-            },
-            onOpenBubbleSettings = {
-                BubbleHelper.openBubbleSettings(context)
-            },
-            onOpenTelemetryLog = {
-                showSettingsSheet = false
-                showTelemetrySheet = true
-                refreshTelemetrySummary()
-            },
-            onOpenAudioDebug = {
-                showSettingsSheet = false
-                context.startActivity(Intent(context, AudioDebugActivity::class.java))
-            },
-            pinBluetoothSco = cockpit.pinSco,
-            volumeKeyStopRecording = cockpit.volumeKeyStopRecording,
-            onToggleVolumeKeyStopRecording = { enabled ->
-                cockpit.setVolumeKeyStop(enabled)
-            },
-            telecomCallForRecording = cockpit.telecomCallForRecording,
-            onToggleTelecomCallForRecording = { enabled ->
-                cockpit.setTelecomCallMode(enabled)
-            },
-            mirrorRecordingNotification = cockpit.mirrorRecordingNotification,
-            onToggleMirrorRecordingNotification = { enabled ->
-                cockpit.setMirrorRecordingNotif(enabled)
-            },
-            onConnect = { performConnect() },
-            onDisconnect = {
-                performDisconnectActiveServer()
-                if (!cockpit.isConnected) {
-                    showSettingsSheet = false
-                }
-            },
-            onDismiss = {
-                openAddServerInSettings = false
-                showSettingsSheet = false
-            },
-        )
-    }
-
-    LaunchedEffect(showTelemetrySheet) {
-        if (showTelemetrySheet) {
-            refreshTelemetrySummary()
-        }
-    }
-
-    if (showTelemetrySheet) {
-        @Suppress("DEPRECATION")
-        val clipboardManager = LocalClipboardManager.current
-        VoiceUxLogSheet(
-            summary = uxSummary,
-            onRefresh = { refreshTelemetrySummary() },
-            onCopyJsonl = {
-                scope.launch(Dispatchers.IO) {
-                    val jsonl = boundService?.exportVoiceUxLog() ?: fallbackUxLogger.exportJsonl()
-                    withContext(Dispatchers.Main) {
-                        clipboardManager.setText(AnnotatedString(jsonl))
-                        Toast.makeText(context, "Copied Voice UX JSONL log", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            },
-            onClear = {
-                scope.launch(Dispatchers.IO) {
-                    boundService?.clearVoiceUxLog() ?: fallbackUxLogger.clear()
-                    val next = boundService?.readVoiceUxSummary() ?: fallbackUxLogger.readSummary()
-                    withContext(Dispatchers.Main) {
-                        uxSummary = next
-                    }
-                }
-            },
-            onDismiss = { showTelemetrySheet = false },
-        )
-    }
 }
 
 @OptIn(ExperimentalLayoutApi::class)

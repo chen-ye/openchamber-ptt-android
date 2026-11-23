@@ -1,6 +1,12 @@
 package com.openchamber.ptt.storage
 
 import android.content.SharedPreferences
+import com.openchamber.ptt.audio.TelecomHangupAction
+import com.openchamber.ptt.service.BluetoothCaptureMode
+import com.openchamber.ptt.service.ControlPreset
+import com.openchamber.ptt.service.HeadsetTapMode
+import com.openchamber.ptt.service.VolumeKeyDraftMode
+import com.openchamber.ptt.service.VolumeKeyRecordingMode
 import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.SttEngine
@@ -433,6 +439,7 @@ class TokenStoreTest {
 
         assertFalse(storeA.getVolumeKeyStopRecording())
         assertFalse(storeA.getTelecomCallForRecording())
+        assertEquals(TelecomHangupAction.QUICK_SEND, storeA.getTelecomHangupAction())
         assertTrue(storeA.getMirrorRecordingNotification())
 
         val v0 = storeB.changes.value
@@ -445,10 +452,51 @@ class TokenStoreTest {
         assertTrue(storeB.changes.value > v1)
         assertTrue(storeB.getTelecomCallForRecording())
 
+        val v1b = storeB.changes.value
+        storeA.setTelecomHangupAction(TelecomHangupAction.STAGE_DRAFT)
+        assertTrue(storeB.changes.value > v1b)
+        assertEquals(TelecomHangupAction.STAGE_DRAFT, storeB.getTelecomHangupAction())
+        storeA.setTelecomHangupAction(TelecomHangupAction.SEND_IMMEDIATELY)
+        assertEquals(TelecomHangupAction.SEND_IMMEDIATELY, storeB.getTelecomHangupAction())
+        assertEquals(TelecomHangupAction.QUICK_SEND, TelecomHangupAction.fromStorageValue("unknown_value"))
+
         val v2 = storeB.changes.value
         storeA.setMirrorRecordingNotification(false)
         assertTrue(storeB.changes.value > v2)
         assertFalse(storeB.getMirrorRecordingNotification())
+
+        // Unified control scheme preferences & preset
+        assertFalse(storeA.getPinBluetoothSco())
+        assertEquals(HeadsetTapMode.MULTI_TAP, storeA.getHeadsetTapMode())
+        assertTrue(storeA.getAvrcpTrackControlsEnabled())
+        assertEquals(VolumeKeyRecordingMode.ANY_SEND, storeA.getVolumeKeyRecordingMode())
+        assertEquals(VolumeKeyDraftMode.OFF, storeA.getVolumeKeyDraftMode())
+
+        storeA.setPinBluetoothSco(true)
+        assertTrue(storeB.getPinBluetoothSco())
+
+        storeA.applyControlPreset(ControlPreset.SHOKZ_SINGLE_TAP)
+        val cfg = storeB.getControlSchemeConfig()
+        assertEquals(ControlPreset.SHOKZ_SINGLE_TAP, cfg.resolvedPreset)
+        assertTrue(cfg.pinBluetoothSco)
+        assertEquals(BluetoothCaptureMode.TELECOM_HFP, cfg.bluetoothCaptureMode)
+        assertEquals(TelecomHangupAction.QUICK_SEND, cfg.telecomHangupAction)
+        assertEquals(HeadsetTapMode.SINGLE_ONLY, cfg.headsetTapMode)
+        assertFalse(cfg.avrcpTrackControlsEnabled)
+        assertEquals(VolumeKeyRecordingMode.SPLIT_SEND_STAGE, cfg.volumeKeyRecordingMode)
+        assertEquals(VolumeKeyDraftMode.SEND_AND_DISCARD, cfg.volumeKeyDraftMode)
+        assertTrue(storeB.getVolumeKeyStopRecording())
+        assertTrue(storeB.getTelecomCallForRecording())
+
+        // Legacy migration: existing boolean prefs without new enum keys map accurately
+        val legacyPrefs = InMemorySharedPreferences()
+        legacyPrefs.edit()
+            .putBoolean("volume_key_stop_recording", true)
+            .putBoolean("telecom_call_for_recording", true)
+            .apply()
+        val migratedStore = TokenStore(legacyPrefs)
+        assertEquals(VolumeKeyRecordingMode.ANY_SEND, migratedStore.getVolumeKeyRecordingMode())
+        assertEquals(BluetoothCaptureMode.TELECOM_HFP, migratedStore.getBluetoothCaptureMode())
     }
 
     @Test

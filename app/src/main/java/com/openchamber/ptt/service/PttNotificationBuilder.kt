@@ -86,8 +86,9 @@ internal class PttNotificationBuilder(
     fun buildNotification(
         pttState: PttState,
         promotedForStandaloneTts: Boolean,
+        statusTextOverride: String? = null,
     ): Notification {
-        val status = statusTextForState(pttState)
+        val status = statusTextOverride?.takeIf { it.isNotBlank() } ?: statusTextForState(pttState)
         val builder = NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_ptt_mic)
             .setContentTitle(context.getString(R.string.ptt_notification_title))
@@ -114,10 +115,11 @@ internal class PttNotificationBuilder(
     fun notifyServiceState(
         pttState: PttState,
         promotedForStandaloneTts: Boolean,
+        statusTextOverride: String? = null,
     ) {
         notificationManager.notify(
             NOTIFICATION_ID,
-            buildNotification(pttState, promotedForStandaloneTts),
+            buildNotification(pttState, promotedForStandaloneTts, statusTextOverride),
         )
     }
 

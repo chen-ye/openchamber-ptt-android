@@ -604,6 +604,7 @@ class PttStateMachineTest {
     fun `capture audio effects strictly bracket RECORDING across all exit events`() {
         val recordingExits: List<Pair<PttEvent, PttState>> = listOf(
             PttEvent.SingleTap to PttState.TRANSCRIBING_SEND,
+            PttEvent.SendCaptureImmediately to PttState.TRANSCRIBING_SEND,
             PttEvent.DoubleTap to PttState.TRANSCRIBING_STAGE,
             PttEvent.StageCapture to PttState.TRANSCRIBING_STAGE,
             PttEvent.TripleTap to PttState.ARMED_IDLE,
@@ -768,5 +769,76 @@ class PttStateMachineTest {
             assertEquals(state, result.current)
             assertTrue("Expected empty effects in $state", result.effects.isEmpty())
         }
+    }
+
+    @Test
+    fun `SendCaptureImmediately skips SEND_GRACE when no draft exists, appends when draft exists, and resets mode after exit`() {
+        // 1. Fresh recording -> SendCaptureImmediately -> TranscriptReady dispatches straight to WAITING_AGENT
+        val sm = PttStateMachine()
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        val stopImmediate = sm.dispatch(PttEvent.SendCaptureImmediately)
+        assertEquals(PttState.TRANSCRIBING_SEND, stopImmediate.current)
+        assertEquals(
+            listOf(
+                PttEffect.StopRecording,
+                PttEffect.ReleaseCaptureAudio,
+                PttEffect.PlayCue(CueEvent.QUICK_STOP_ACK),
+            ),
+            stopImmediate.effects,
+        )
+
+        val ready = sm.dispatch(PttEvent.TranscriptReady("Ship the fix"))
+        assertEquals(PttState.WAITING_AGENT, ready.current)
+        assertEquals(
+            listOf(
+                PttEffect.AcquireWakeAndWifiLocks,
+                PttEffect.PlayCue(CueEvent.PROMPT_SENT),
+                PttEffect.DispatchPrompt(fromStagedDraft = false),
+            ),
+            ready.effects,
+        )
+
+        // 2. Subsequent normal SingleTap recording still enters SEND_GRACE (quickSendMode did not leak)
+        sm.dispatch(PttEvent.AgentCompleted(hasTts = false))
+        assertEquals(PttState.ARMED_IDLE, sm.currentState)
+        sm.dispatch(PttEvent.SingleTap)
+        sm.dispatch(PttEvent.SingleTap)
+        val normalReady = sm.dispatch(PttEvent.TranscriptReady("Second prompt"))
+        assertEquals(PttState.SEND_GRACE, normalReady.current)
+        assertTrue(normalReady.effects.contains(PttEffect.StartSendGraceTimer))
+
+        // 3. Empty transcript after SendCaptureImmediately returns to ARMED_IDLE and resets mode
+        val emptySm = PttStateMachine()
+        emptySm.dispatch(PttEvent.Arm())
+        emptySm.dispatch(PttEvent.SingleTap)
+        emptySm.dispatch(PttEvent.SendCaptureImmediately)
+        val emptyReady = emptySm.dispatch(PttEvent.TranscriptReady("   "))
+        assertEquals(PttState.ARMED_IDLE, emptyReady.current)
+        assertEquals(
+            listOf(
+                PttEffect.ReleaseWakeAndWifiLocks,
+                PttEffect.PlayCue(CueEvent.EMPTY_SPEECH),
+            ),
+            emptyReady.effects,
+        )
+        emptySm.dispatch(PttEvent.SingleTap)
+        emptySm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.SEND_GRACE, emptySm.dispatch(PttEvent.TranscriptReady("Normal")).current)
+
+        // 4. Existing draft -> SendCaptureImmediately appends into TRANSCRIBING_STAGE instead of orphaning draft
+        val draftSm = PttStateMachine()
+        draftSm.dispatch(PttEvent.Arm(hasPersistedDraft = true))
+        draftSm.dispatch(PttEvent.SingleTap)
+        val appendStop = draftSm.dispatch(PttEvent.SendCaptureImmediately)
+        assertEquals(PttState.TRANSCRIBING_STAGE, appendStop.current)
+        assertEquals(
+            listOf(
+                PttEffect.StopRecording,
+                PttEffect.ReleaseCaptureAudio,
+                PttEffect.PlayCue(CueEvent.STAGE_APPENDING),
+            ),
+            appendStop.effects,
+        )
     }
 }

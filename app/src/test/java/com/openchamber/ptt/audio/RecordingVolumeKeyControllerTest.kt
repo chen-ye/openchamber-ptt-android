@@ -1,5 +1,7 @@
 package com.openchamber.ptt.audio
 
+import com.openchamber.ptt.service.VolumeKeyDraftMode
+import com.openchamber.ptt.service.VolumeKeyRecordingMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -172,5 +174,113 @@ class RecordingVolumeKeyControllerTest {
         assertFalse(controller.isAttached)
         controller.release()
         assertEquals(3, adapter.restoreCalls)
+    }
+
+    @Test
+    fun `screen-on never intercepts and screen toggle mid-episode preserves trigger capability`() {
+        val adapter = FakeMediaSessionVolumeAdapter()
+        val actions = mutableListOf<Pair<VolumeKeyAction, Int>>()
+        val controller = RecordingVolumeKeyController(
+            adapter = adapter,
+            onVolumeAction = { action, dir -> actions += action to dir },
+        )
+
+        // Screen ON -> stays detached for both RECORDING and DRAFT
+        controller.sync(
+            episode = VolumeKeyEpisode.RECORDING,
+            isScreenOff = false,
+            recordingMode = VolumeKeyRecordingMode.SPLIT_SEND_STAGE,
+            draftMode = VolumeKeyDraftMode.SEND_AND_DISCARD,
+        )
+        assertFalse(controller.isAttached)
+        assertEquals(0, adapter.attachCalls)
+
+        // Turn screen OFF -> attaches for RECORDING
+        controller.sync(
+            episode = VolumeKeyEpisode.RECORDING,
+            isScreenOff = true,
+            recordingMode = VolumeKeyRecordingMode.SPLIT_SEND_STAGE,
+            draftMode = VolumeKeyDraftMode.SEND_AND_DISCARD,
+        )
+        assertTrue(controller.isAttached)
+        assertEquals(1, adapter.attachCalls)
+
+        // Turn screen ON before triggering -> detaches cleanly
+        controller.sync(
+            episode = VolumeKeyEpisode.RECORDING,
+            isScreenOff = false,
+            recordingMode = VolumeKeyRecordingMode.SPLIT_SEND_STAGE,
+            draftMode = VolumeKeyDraftMode.SEND_AND_DISCARD,
+        )
+        assertFalse(controller.isAttached)
+        assertEquals(1, adapter.restoreCalls)
+
+        // Turn screen OFF again -> re-attaches and Volume Down triggers STOP_STAGE_DRAFT
+        controller.sync(
+            episode = VolumeKeyEpisode.RECORDING,
+            isScreenOff = true,
+            recordingMode = VolumeKeyRecordingMode.SPLIT_SEND_STAGE,
+            draftMode = VolumeKeyDraftMode.SEND_AND_DISCARD,
+        )
+        assertTrue(controller.isAttached)
+        adapter.dispatchAdjust(-1)
+        assertEquals(listOf(VolumeKeyAction.STOP_STAGE_DRAFT to -1), actions)
+        assertFalse(controller.isAttached)
+    }
+
+    @Test
+    fun `draft episode supports SEND_AND_DISCARD and SEND_ONLY ignores Volume Down without detaching`() {
+        val adapter = FakeMediaSessionVolumeAdapter()
+        val actions = mutableListOf<Pair<VolumeKeyAction, Int>>()
+        val diagnostics = mutableListOf<Triple<String, String, Map<String, String>>>()
+        val controller = RecordingVolumeKeyController(
+            adapter = adapter,
+            onVolumeAction = { action, dir -> actions += action to dir },
+        )
+        controller.onDiagnosticEvent = { event, outcome, details ->
+            diagnostics += Triple(event, outcome, details)
+        }
+
+        // SEND_ONLY in DRAFT: Volume Down (-1) is ignored without detaching; Volume Up (+1) sends
+        controller.sync(
+            episode = VolumeKeyEpisode.DRAFT,
+            isScreenOff = true,
+            recordingMode = VolumeKeyRecordingMode.OFF,
+            draftMode = VolumeKeyDraftMode.SEND_ONLY,
+        )
+        assertTrue(controller.isAttached)
+
+        adapter.dispatchAdjust(-1)
+        assertTrue(actions.isEmpty())
+        assertTrue(controller.isAttached)
+        assertEquals(0, adapter.restoreCalls)
+        assertEquals("IGNORED", diagnostics.last().second)
+        assertEquals("unmapped_direction", diagnostics.last().third["reason"])
+
+        adapter.dispatchAdjust(+1)
+        assertEquals(listOf(VolumeKeyAction.COMMIT_DRAFT to 1), actions)
+        assertFalse(controller.isAttached)
+        assertEquals(1, adapter.restoreCalls)
+
+        // Fresh DRAFT episode (after exiting to NONE) with SEND_AND_DISCARD triggers DISCARD_DRAFT on -1
+        controller.sync(
+            episode = VolumeKeyEpisode.NONE,
+            isScreenOff = true,
+            recordingMode = VolumeKeyRecordingMode.OFF,
+            draftMode = VolumeKeyDraftMode.SEND_AND_DISCARD,
+        )
+        controller.sync(
+            episode = VolumeKeyEpisode.DRAFT,
+            isScreenOff = true,
+            recordingMode = VolumeKeyRecordingMode.OFF,
+            draftMode = VolumeKeyDraftMode.SEND_AND_DISCARD,
+        )
+        assertTrue(controller.isAttached)
+        adapter.dispatchAdjust(-1)
+        assertEquals(
+            listOf(VolumeKeyAction.COMMIT_DRAFT to 1, VolumeKeyAction.DISCARD_DRAFT to -1),
+            actions,
+        )
+        assertFalse(controller.isAttached)
     }
 }

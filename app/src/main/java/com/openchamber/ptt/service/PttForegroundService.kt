@@ -4,9 +4,11 @@ import android.Manifest
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioDeviceInfo
@@ -39,6 +41,8 @@ import com.openchamber.ptt.audio.ScoDropEvent
 import com.openchamber.ptt.audio.TelecomCallStartResult
 import com.openchamber.ptt.audio.TelecomCaptureCoordinator
 import com.openchamber.ptt.audio.VocalCuePackWarmer
+import com.openchamber.ptt.audio.VolumeKeyAction
+import com.openchamber.ptt.audio.VolumeKeyEpisode
 import com.openchamber.ptt.bubble.BubbleHelper
 import com.openchamber.ptt.diagnostics.AudioDebugCategory
 import com.openchamber.ptt.diagnostics.AudioDebugOutcome
@@ -133,6 +137,9 @@ class PttForegroundService : Service() {
         set(value) {
             if (_pinBluetoothSco.value != value) {
                 _pinBluetoothSco.value = value
+                if (::tokenStore.isInitialized && tokenStore.getPinBluetoothSco() != value) {
+                    tokenStore.setPinBluetoothSco(value)
+                }
                 if (::serviceScope.isInitialized) {
                     updateDiagnosticLiveStatus()
                 }
@@ -151,6 +158,8 @@ class PttForegroundService : Service() {
     private lateinit var gestureDetector: MediaButtonGestureDetector
     private var mediaSession: MediaSessionCompat? = null
     private lateinit var notificationBuilder: PttNotificationBuilder
+    private lateinit var powerManager: PowerManager
+    private var screenStateReceiver: BroadcastReceiver? = null
     private lateinit var wakeLock: PowerManager.WakeLock
     private lateinit var wifiLock: WifiManager.WifiLock
 
@@ -217,8 +226,10 @@ class PttForegroundService : Service() {
             scope = serviceScope,
             onRemoteHangupStop = { gen ->
                 gestureDetector.cancelPending()
+                val hangupAction = tokenStore.getTelecomHangupAction()
+                val stopEvent = eventForTelecomHangupAction(hangupAction)
                 val tr = dispatchInternal(
-                    PttEvent.SingleTap,
+                    stopEvent,
                     requiredStates = setOf(PttState.RECORDING),
                     requiredPinGeneration = null,
                     requiredTelecomGeneration = gen,
@@ -228,14 +239,21 @@ class PttForegroundService : Service() {
                         category = VoiceUxLogger.CAT_GESTURE,
                         event = "telecom_remote_hangup_stop",
                         sessionKey = activeSessionKey(),
-                        metrics = mapOf("gen" to gen, "state" to tr.previous.name),
+                        metrics = mapOf(
+                            "gen" to gen,
+                            "state" to tr.previous.name,
+                            "action" to hangupAction.storageValue,
+                        ),
                     )
                     AudioDebugRegistry.shared.record(
                         category = AudioDebugCategory.TELECOM,
                         event = "REMOTE_HANGUP_STOP",
                         outcome = AudioDebugOutcome.ACCEPTED,
                         pttState = tr.current.name,
-                        details = mapOf("generation" to gen),
+                        details = mapOf(
+                            "generation" to gen.toString(),
+                            "action" to hangupAction.storageValue,
+                        ),
                     )
                 } else {
                     AudioDebugRegistry.shared.record(
@@ -243,7 +261,11 @@ class PttForegroundService : Service() {
                         event = "REMOTE_HANGUP_STOP",
                         outcome = AudioDebugOutcome.IGNORED,
                         pttState = stateMachine.currentState.name,
-                        details = mapOf("generation" to gen, "reason" to "stale_gen_or_not_recording"),
+                        details = mapOf(
+                            "generation" to gen.toString(),
+                            "action" to hangupAction.storageValue,
+                            "reason" to "stale_gen_or_not_recording",
+                        ),
                     )
                 }
             },
@@ -335,6 +357,7 @@ class PttForegroundService : Service() {
         }
 
         tokenStore = TokenStore(applicationContext)
+        _pinBluetoothSco.value = tokenStore.getPinBluetoothSco()
         val httpClient = OpenChamberHttp.createClient(
             tokenForUrlProvider = { url -> tokenStore.getTokenForUrl(url) },
             directoryForUrlProvider = { url -> tokenStore.getDirectoryForUrl(url) },
@@ -503,6 +526,7 @@ class PttForegroundService : Service() {
         var lastEffectiveCueMode = tokenStore.getEffectiveAudioCueMode(lastEffectiveServerId)
         var lastEffectivePipeline = tokenStore.getEffectiveTtsPipeline(lastEffectiveServerId)
         var lastEffectiveRoles = tokenStore.getEffectiveRoleVoiceProfiles(lastEffectiveServerId)
+        var lastControlConfig = tokenStore.getControlSchemeConfig()
         serviceScope.launch {
             tokenStore.changes.collect {
                 val curServerId = tokenStore.getActiveServer()?.id
@@ -511,6 +535,7 @@ class PttForegroundService : Service() {
                 val curCueMode = tokenStore.getEffectiveAudioCueMode(curServerId)
                 val curPipeline = tokenStore.getEffectiveTtsPipeline(curServerId)
                 val curRoles = tokenStore.getEffectiveRoleVoiceProfiles(curServerId)
+                val curControlConfig = tokenStore.getControlSchemeConfig()
                 val serverChanged = curServerId != lastEffectiveServerId
                 val summaryConfigChanged = serverChanged ||
                     curMode != lastEffectiveInputMode ||
@@ -519,6 +544,8 @@ class PttForegroundService : Service() {
                     curCueMode != lastEffectiveCueMode ||
                     curPipeline != lastEffectivePipeline ||
                     curRoles != lastEffectiveRoles
+                val controlConfigChanged = curControlConfig != lastControlConfig
+                val tapModeChanged = curControlConfig.headsetTapMode != lastControlConfig.headsetTapMode
 
                 lastEffectiveServerId = curServerId
                 lastEffectiveInputMode = curMode
@@ -526,25 +553,32 @@ class PttForegroundService : Service() {
                 lastEffectiveCueMode = curCueMode
                 lastEffectivePipeline = curPipeline
                 lastEffectiveRoles = curRoles
+                lastControlConfig = curControlConfig
 
+                if (_pinBluetoothSco.value != curControlConfig.pinBluetoothSco) {
+                    _pinBluetoothSco.value = curControlConfig.pinBluetoothSco
+                }
+                if (tapModeChanged && ::gestureDetector.isInitialized) {
+                    gestureDetector.cancelPending()
+                }
                 if (summaryConfigChanged) {
                     sessionResponseController.refreshFocusedSpokenSummaryFromCache()
                 }
                 if (cueConfigChanged) {
                     vocalCuePackWarmer.ensureWarmedAsync()
                 }
-                if (::recordingVolumeKeyController.isInitialized) {
-                    recordingVolumeKeyController.sync(
-                        isRecording = stateMachine.currentState == PttState.RECORDING,
-                        featureEnabled = tokenStore.getVolumeKeyStopRecording(),
-                    )
+                synchronized(dispatchLock) {
+                    syncMediaSessionAndVolumeControlsLocked(stateMachine.currentState)
                 }
                 if (::recordingMirrorController.isInitialized) {
                     recordingMirrorController.sync(
                         isRecording = stateMachine.currentState == PttState.RECORDING,
-                        featureEnabled = tokenStore.getMirrorRecordingNotification(),
+                        featureEnabled = curControlConfig.mirrorRecordingNotification,
                         sessionTitle = tokenStore.getPinnedSession()?.title,
                     )
+                }
+                if (controlConfigChanged && stateMachine.currentState != PttState.DISARMED) {
+                    updateForegroundNotification(stateMachine.currentState)
                 }
                 updateDiagnosticLiveStatus()
             }
@@ -693,7 +727,7 @@ class PttForegroundService : Service() {
             },
         )
 
-        val powerManager = getSystemService(PowerManager::class.java)
+        powerManager = getSystemService(PowerManager::class.java)
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG).apply {
             setReferenceCounted(false)
         }
@@ -708,45 +742,8 @@ class PttForegroundService : Service() {
         initMediaSession()
         recordingVolumeKeyController = RecordingVolumeKeyController(
             mediaSession = checkNotNull(mediaSession),
-            onVolumeKeyStop = { direction ->
-                gestureDetector.cancelPending()
-                val tr = dispatchInternal(
-                    PttEvent.SingleTap,
-                    requiredStates = setOf(PttState.RECORDING),
-                    requiredPinGeneration = null,
-                )
-                if (tr != null) {
-                    voiceUxLogger.log(
-                        category = VoiceUxLogger.CAT_GESTURE,
-                        event = "volume_key_stop",
-                        sessionKey = activeSessionKey(),
-                        metrics = mapOf(
-                            "direction" to direction,
-                            "state" to tr.previous.name,
-                        ),
-                    )
-                    AudioDebugRegistry.shared.record(
-                        category = AudioDebugCategory.VOLUME_KEY,
-                        event = "VOLUME_KEY_STOP_RECORDING",
-                        outcome = AudioDebugOutcome.ACCEPTED,
-                        pttState = tr.current.name,
-                        details = mapOf(
-                            "direction" to direction,
-                            "previousState" to tr.previous.name,
-                        ),
-                    )
-                } else {
-                    AudioDebugRegistry.shared.record(
-                        category = AudioDebugCategory.VOLUME_KEY,
-                        event = "VOLUME_KEY_STOP_RECORDING",
-                        outcome = AudioDebugOutcome.IGNORED,
-                        pttState = stateMachine.currentState.name,
-                        details = mapOf(
-                            "direction" to direction,
-                            "reason" to "not_recording",
-                        ),
-                    )
-                }
+            onVolumeAction = { action, direction ->
+                handleVolumeKeyAction(action, direction)
             },
         ).apply {
             onDiagnosticEvent = { event, outcome, details ->
@@ -754,6 +751,34 @@ class PttForegroundService : Service() {
                 updateDiagnosticLiveStatus()
             }
         }
+        synchronized(dispatchLock) {
+            syncMediaSessionAndVolumeControlsLocked(stateMachine.currentState)
+        }
+        val screenFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        val screenRx = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val screenOff = isScreenOffNow()
+                AudioDebugRegistry.shared.record(
+                    category = AudioDebugCategory.VOLUME_KEY,
+                    event = if (screenOff) "SCREEN_OFF" else "SCREEN_ON",
+                    outcome = AudioDebugOutcome.STATE_CHANGE,
+                    pttState = stateMachine.currentState.name,
+                    details = mapOf(
+                        "action" to (intent?.action ?: "null"),
+                        "isScreenOff" to screenOff,
+                    ),
+                )
+                synchronized(dispatchLock) {
+                    syncMediaSessionAndVolumeControlsLocked(stateMachine.currentState)
+                }
+                updateDiagnosticLiveStatus()
+            }
+        }
+        ContextCompat.registerReceiver(this, screenRx, screenFilter, ContextCompat.RECEIVER_EXPORTED)
+        screenStateReceiver = screenRx
         audioDiagnosticMonitor = AudioPlatformDiagnosticMonitor(
             context = applicationContext,
             buffer = AudioDebugRegistry.shared,
@@ -775,7 +800,7 @@ class PttForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent != null) {
             if (intent.hasExtra(EXTRA_PIN_SCO)) {
-                pinBluetoothSco = intent.getBooleanExtra(EXTRA_PIN_SCO, false)
+                pinBluetoothSco = intent.getBooleanExtra(EXTRA_PIN_SCO, pinBluetoothSco)
             }
             when (intent.action) {
                 Intent.ACTION_MEDIA_BUTTON -> {
@@ -869,6 +894,10 @@ class PttForegroundService : Service() {
         }
         if (::recordingVolumeKeyController.isInitialized) {
             recordingVolumeKeyController.release()
+        }
+        screenStateReceiver?.let { rx ->
+            runCatching { unregisterReceiver(rx) }
+            screenStateReceiver = null
         }
         if (::audioDiagnosticMonitor.isInitialized) {
             audioDiagnosticMonitor.stop()
@@ -1421,13 +1450,7 @@ class PttForegroundService : Service() {
             val tr = stateMachine.dispatch(event)
             syncStateAndStatus(tr)
             applyEffects(tr)
-            updateMediaSessionPlaybackState(tr.current)
-            if (::recordingVolumeKeyController.isInitialized) {
-                recordingVolumeKeyController.sync(
-                    isRecording = tr.current == PttState.RECORDING,
-                    featureEnabled = tokenStore.getVolumeKeyStopRecording(),
-                )
-            }
+            syncMediaSessionAndVolumeControlsLocked(tr.current)
             if (::recordingMirrorController.isInitialized) {
                 recordingMirrorController.sync(
                     isRecording = tr.current == PttState.RECORDING,
@@ -2244,7 +2267,23 @@ class PttForegroundService : Service() {
                             )
                             return true
                         }
-                        val mode = MediaButtonGestureDetector.groupingModeFor(stateMachine.currentState)
+                        if ((rawInput == RawMediaInput.NEXT || rawInput == RawMediaInput.PREVIOUS) &&
+                            !isAvrcpTrackControlsEnabled()
+                        ) {
+                            AudioDebugRegistry.shared.record(
+                                category = AudioDebugCategory.MEDIA_BUTTON,
+                                event = "onMediaButtonEvent($keyCodeName)",
+                                outcome = AudioDebugOutcome.IGNORED,
+                                pttState = stateMachine.currentState.name,
+                                details = mapOf(
+                                    "reason" to "avrcp_track_controls_disabled",
+                                    "keyCode" to keyCodeName,
+                                    "rawInput" to rawInput.name,
+                                ),
+                            )
+                            return true
+                        }
+                        val mode = currentGroupingMode()
                         AudioDebugRegistry.shared.record(
                             category = AudioDebugCategory.MEDIA_BUTTON,
                             event = "onMediaButtonEvent($keyCodeName)",
@@ -2264,7 +2303,7 @@ class PttForegroundService : Service() {
 
                     override fun onPlay() {
                         if (stateMachine.currentState == PttState.DISARMED) return
-                        val mode = MediaButtonGestureDetector.groupingModeFor(stateMachine.currentState)
+                        val mode = currentGroupingMode()
                         AudioDebugRegistry.shared.record(
                             category = AudioDebugCategory.MEDIA_BUTTON,
                             event = "MediaSession.onPlay",
@@ -2277,7 +2316,7 @@ class PttForegroundService : Service() {
 
                     override fun onPause() {
                         if (stateMachine.currentState == PttState.DISARMED) return
-                        val mode = MediaButtonGestureDetector.groupingModeFor(stateMachine.currentState)
+                        val mode = currentGroupingMode()
                         AudioDebugRegistry.shared.record(
                             category = AudioDebugCategory.MEDIA_BUTTON,
                             event = "MediaSession.onPause",
@@ -2290,7 +2329,20 @@ class PttForegroundService : Service() {
 
                     override fun onSkipToNext() {
                         if (stateMachine.currentState == PttState.DISARMED) return
-                        val mode = MediaButtonGestureDetector.groupingModeFor(stateMachine.currentState)
+                        if (!isAvrcpTrackControlsEnabled()) {
+                            AudioDebugRegistry.shared.record(
+                                category = AudioDebugCategory.MEDIA_BUTTON,
+                                event = "MediaSession.onSkipToNext",
+                                outcome = AudioDebugOutcome.IGNORED,
+                                pttState = stateMachine.currentState.name,
+                                details = mapOf(
+                                    "reason" to "avrcp_track_controls_disabled",
+                                    "rawInput" to RawMediaInput.NEXT.name,
+                                ),
+                            )
+                            return
+                        }
+                        val mode = currentGroupingMode()
                         AudioDebugRegistry.shared.record(
                             category = AudioDebugCategory.MEDIA_BUTTON,
                             event = "MediaSession.onSkipToNext",
@@ -2303,7 +2355,20 @@ class PttForegroundService : Service() {
 
                     override fun onSkipToPrevious() {
                         if (stateMachine.currentState == PttState.DISARMED) return
-                        val mode = MediaButtonGestureDetector.groupingModeFor(stateMachine.currentState)
+                        if (!isAvrcpTrackControlsEnabled()) {
+                            AudioDebugRegistry.shared.record(
+                                category = AudioDebugCategory.MEDIA_BUTTON,
+                                event = "MediaSession.onSkipToPrevious",
+                                outcome = AudioDebugOutcome.IGNORED,
+                                pttState = stateMachine.currentState.name,
+                                details = mapOf(
+                                    "reason" to "avrcp_track_controls_disabled",
+                                    "rawInput" to RawMediaInput.PREVIOUS.name,
+                                ),
+                            )
+                            return
+                        }
+                        val mode = currentGroupingMode()
                         AudioDebugRegistry.shared.record(
                             category = AudioDebugCategory.MEDIA_BUTTON,
                             event = "MediaSession.onSkipToPrevious",
@@ -2316,7 +2381,7 @@ class PttForegroundService : Service() {
 
                     override fun onStop() {
                         if (stateMachine.currentState == PttState.DISARMED) return
-                        val mode = MediaButtonGestureDetector.groupingModeFor(stateMachine.currentState)
+                        val mode = currentGroupingMode()
                         AudioDebugRegistry.shared.record(
                             category = AudioDebugCategory.MEDIA_BUTTON,
                             event = "MediaSession.onStop",
@@ -2330,34 +2395,106 @@ class PttForegroundService : Service() {
             )
         }
         mediaSession = session
-        updateMediaSessionPlaybackState(stateMachine.currentState)
+        updateMediaSessionPlaybackState(stateMachine.currentState, isScreenOff = isScreenOffNow())
     }
 
-    private fun updateMediaSessionPlaybackState(pttState: PttState) {
+    private fun isScreenOffNow(): Boolean =
+        if (::powerManager.isInitialized) !powerManager.isInteractive else false
+
+    private fun currentGroupingMode(): TapGroupingMode =
+        MediaButtonGestureDetector.groupingModeFor(
+            state = stateMachine.currentState,
+            tapMode = if (::tokenStore.isInitialized) tokenStore.getHeadsetTapMode() else HeadsetTapMode.MULTI_TAP,
+        )
+
+    private fun isAvrcpTrackControlsEnabled(): Boolean =
+        !::tokenStore.isInitialized || tokenStore.getAvrcpTrackControlsEnabled()
+
+    private fun syncMediaSessionAndVolumeControlsLocked(pttState: PttState) {
+        val screenOff = isScreenOffNow()
+        updateMediaSessionPlaybackState(pttState, isScreenOff = screenOff)
+        if (::recordingVolumeKeyController.isInitialized && ::tokenStore.isInitialized) {
+            recordingVolumeKeyController.sync(
+                episode = volumeEpisodeForState(pttState),
+                isScreenOff = screenOff,
+                recordingMode = tokenStore.getVolumeKeyRecordingMode(),
+                draftMode = tokenStore.getVolumeKeyDraftMode(),
+            )
+        }
+    }
+
+    private fun handleVolumeKeyAction(
+        action: VolumeKeyAction,
+        direction: Int,
+    ) {
+        gestureDetector.cancelPending()
+        val (event, requiredStates, uxEventName) = when (action) {
+            VolumeKeyAction.STOP_QUICK_SEND ->
+                Triple(PttEvent.SingleTap, setOf(PttState.RECORDING), "volume_key_stop_send")
+            VolumeKeyAction.STOP_STAGE_DRAFT ->
+                Triple(PttEvent.StageCapture, setOf(PttState.RECORDING), "volume_key_stop_stage")
+            VolumeKeyAction.COMMIT_DRAFT ->
+                Triple(PttEvent.CommitDraft, setOf(PttState.STAGED_DRAFT, PttState.STAGED_DRAFT_SPEAKING), "volume_key_draft_send")
+            VolumeKeyAction.DISCARD_DRAFT ->
+                Triple(PttEvent.DiscardCapture, setOf(PttState.STAGED_DRAFT, PttState.STAGED_DRAFT_SPEAKING), "volume_key_draft_discard")
+        }
+        val tr = dispatchInternal(
+            event,
+            requiredStates = requiredStates,
+            requiredPinGeneration = null,
+        )
+        if (tr != null) {
+            voiceUxLogger.log(
+                category = VoiceUxLogger.CAT_GESTURE,
+                event = uxEventName,
+                sessionKey = activeSessionKey(),
+                metrics = mapOf(
+                    "direction" to direction,
+                    "action" to action.name,
+                    "state" to tr.previous.name,
+                ),
+            )
+            AudioDebugRegistry.shared.record(
+                category = AudioDebugCategory.VOLUME_KEY,
+                event = "VOLUME_KEY_${action.name}",
+                outcome = AudioDebugOutcome.ACCEPTED,
+                pttState = tr.current.name,
+                details = mapOf(
+                    "direction" to direction,
+                    "action" to action.name,
+                    "previousState" to tr.previous.name,
+                ),
+            )
+        } else {
+            AudioDebugRegistry.shared.record(
+                category = AudioDebugCategory.VOLUME_KEY,
+                event = "VOLUME_KEY_${action.name}",
+                outcome = AudioDebugOutcome.IGNORED,
+                pttState = stateMachine.currentState.name,
+                details = mapOf(
+                    "direction" to direction,
+                    "action" to action.name,
+                    "reason" to "state_mismatch",
+                ),
+            )
+        }
+    }
+
+    private fun updateMediaSessionPlaybackState(
+        pttState: PttState,
+        isScreenOff: Boolean = isScreenOffNow(),
+    ) {
         val session = mediaSession ?: return
         val shouldBeActive = pttState != PttState.DISARMED
         if (session.isActive != shouldBeActive) {
             session.isActive = shouldBeActive
         }
-        val playbackStateCode = when (pttState) {
-            PttState.RECORDING,
-            PttState.TRANSCRIBING_SEND,
-            PttState.TRANSCRIBING_STAGE,
-            PttState.SEND_GRACE,
-            PttState.WAITING_AGENT,
-            PttState.SPEAKING_TTS,
-            PttState.STAGED_DRAFT_SPEAKING,
-            -> PlaybackStateCompat.STATE_PLAYING
-
-            PttState.ARMED_IDLE,
-            PttState.STAGED_DRAFT,
-            -> PlaybackStateCompat.STATE_PAUSED
-
-            PttState.PERMISSION_BLOCKED,
-            PttState.ERROR,
-            PttState.DISARMED,
-            -> PlaybackStateCompat.STATE_STOPPED
-        }
+        val draftVolumeEnabled = ::tokenStore.isInitialized && tokenStore.getVolumeKeyDraftMode().isEnabled
+        val playbackStateCode = resolveMediaSessionPlaybackState(
+            pttState = pttState,
+            isScreenOff = isScreenOff,
+            draftVolumeEnabled = draftVolumeEnabled,
+        )
         lastMediaSessionPlaybackState = playbackStateCode
         val stateObj = PlaybackStateCompat.Builder()
             .setActions(MEDIA_SESSION_ACTIONS)
@@ -2420,8 +2557,11 @@ class PttForegroundService : Service() {
         }
         val sessionActive = mediaSession?.isActive == true
         val playbackStateLabel = playbackStateName(lastMediaSessionPlaybackState)
+        val screenOff = isScreenOffNow()
         val volMode = if (::recordingVolumeKeyController.isInitialized && recordingVolumeKeyController.isAttached) {
-            "REMOTE (VolumeProviderCompat)"
+            "REMOTE (${recordingVolumeKeyController.activeEpisode.name}, SCREEN_OFF)"
+        } else if (!screenOff) {
+            "LOCAL (SCREEN_ON)"
         } else {
             "LOCAL (STREAM_MUSIC)"
         }
@@ -2446,7 +2586,12 @@ class PttForegroundService : Service() {
         pttState: PttState,
         serviceType: Int = resolveForegroundServiceType(),
     ) {
-        val notification = notificationBuilder.buildNotification(pttState, promotedForStandaloneTts)
+        val statusOverride = if (::tokenStore.isInitialized) {
+            ControlHintFormatter.formatNotificationStatus(tokenStore.getControlSchemeConfig(), pttState)
+        } else {
+            null
+        }
+        val notification = notificationBuilder.buildNotification(pttState, promotedForStandaloneTts, statusOverride)
         ServiceCompat.startForeground(this, PttNotificationBuilder.NOTIFICATION_ID, notification, serviceType)
     }
 
@@ -2454,8 +2599,13 @@ class PttForegroundService : Service() {
         if (pttState == PttState.DISARMED) {
             return
         }
+        val statusOverride = if (::tokenStore.isInitialized) {
+            ControlHintFormatter.formatNotificationStatus(tokenStore.getControlSchemeConfig(), pttState)
+        } else {
+            null
+        }
         if (pttState == PttState.RECORDING && hasRecordAudioPermission()) {
-            val notification = notificationBuilder.buildNotification(pttState, promotedForStandaloneTts)
+            val notification = notificationBuilder.buildNotification(pttState, promotedForStandaloneTts, statusOverride)
             ServiceCompat.startForeground(
                 this,
                 PttNotificationBuilder.NOTIFICATION_ID,
@@ -2463,7 +2613,7 @@ class PttForegroundService : Service() {
                 resolveForegroundServiceType(),
             )
         } else {
-            notificationBuilder.notifyServiceState(pttState, promotedForStandaloneTts)
+            notificationBuilder.notifyServiceState(pttState, promotedForStandaloneTts, statusOverride)
         }
     }
 
@@ -2538,6 +2688,49 @@ class PttForegroundService : Service() {
                     putExtra(EXTRA_PIN_SCO, pinSco)
                 }
             }
+
+        internal fun eventForTelecomHangupAction(action: com.openchamber.ptt.audio.TelecomHangupAction): PttEvent =
+            when (action) {
+                com.openchamber.ptt.audio.TelecomHangupAction.QUICK_SEND -> PttEvent.SingleTap
+                com.openchamber.ptt.audio.TelecomHangupAction.SEND_IMMEDIATELY -> PttEvent.SendCaptureImmediately
+                com.openchamber.ptt.audio.TelecomHangupAction.STAGE_DRAFT -> PttEvent.StageCapture
+            }
+
+        internal fun volumeEpisodeForState(state: PttState): VolumeKeyEpisode = when (state) {
+            PttState.RECORDING -> VolumeKeyEpisode.RECORDING
+            PttState.STAGED_DRAFT,
+            PttState.STAGED_DRAFT_SPEAKING,
+            -> VolumeKeyEpisode.DRAFT
+            else -> VolumeKeyEpisode.NONE
+        }
+
+        internal fun resolveMediaSessionPlaybackState(
+            pttState: PttState,
+            isScreenOff: Boolean,
+            draftVolumeEnabled: Boolean,
+        ): Int = when (pttState) {
+            PttState.RECORDING,
+            PttState.TRANSCRIBING_SEND,
+            PttState.TRANSCRIBING_STAGE,
+            PttState.SEND_GRACE,
+            PttState.WAITING_AGENT,
+            PttState.SPEAKING_TTS,
+            PttState.STAGED_DRAFT_SPEAKING,
+            -> PlaybackStateCompat.STATE_PLAYING
+
+            PttState.STAGED_DRAFT -> if (isScreenOff && draftVolumeEnabled) {
+                PlaybackStateCompat.STATE_PLAYING
+            } else {
+                PlaybackStateCompat.STATE_PAUSED
+            }
+
+            PttState.ARMED_IDLE -> PlaybackStateCompat.STATE_PAUSED
+
+            PttState.PERMISSION_BLOCKED,
+            PttState.ERROR,
+            PttState.DISARMED,
+            -> PlaybackStateCompat.STATE_STOPPED
+        }
 
         internal fun shouldCancelTurnOnIdleReturn(transition: PttTransition): Boolean {
             if (transition.current != PttState.ARMED_IDLE && transition.current != PttState.STAGED_DRAFT) {

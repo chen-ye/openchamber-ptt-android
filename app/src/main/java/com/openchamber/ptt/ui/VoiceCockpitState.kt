@@ -23,10 +23,17 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.openchamber.ptt.audio.CuePackWarmState
+import com.openchamber.ptt.audio.TelecomHangupAction
 import com.openchamber.ptt.network.OpenChamberHttp
 import com.openchamber.ptt.network.OpenChamberLauncher
+import com.openchamber.ptt.service.BluetoothCaptureMode
+import com.openchamber.ptt.service.ControlPreset
+import com.openchamber.ptt.service.ControlSchemeConfig
+import com.openchamber.ptt.service.HeadsetTapMode
 import com.openchamber.ptt.service.PttForegroundService
 import com.openchamber.ptt.service.PttState
+import com.openchamber.ptt.service.VolumeKeyDraftMode
+import com.openchamber.ptt.service.VolumeKeyRecordingMode
 import com.openchamber.ptt.session.ServerSessionsResult
 import com.openchamber.ptt.session.SessionRepository
 import com.openchamber.ptt.session.SessionSummary
@@ -169,6 +176,18 @@ internal class VoiceCockpitState(
         private set
     var telecomCallForRecording by mutableStateOf(tokenStore.getTelecomCallForRecording())
         private set
+    var bluetoothCaptureMode by mutableStateOf(tokenStore.getBluetoothCaptureMode())
+        private set
+    var telecomHangupAction by mutableStateOf(tokenStore.getTelecomHangupAction())
+        private set
+    var headsetTapMode by mutableStateOf(tokenStore.getHeadsetTapMode())
+        private set
+    var avrcpTrackControlsEnabled by mutableStateOf(tokenStore.getAvrcpTrackControlsEnabled())
+        private set
+    var volumeKeyRecordingMode by mutableStateOf(tokenStore.getVolumeKeyRecordingMode())
+        private set
+    var volumeKeyDraftMode by mutableStateOf(tokenStore.getVolumeKeyDraftMode())
+        private set
     var mirrorRecordingNotification by mutableStateOf(tokenStore.getMirrorRecordingNotification())
         private set
 
@@ -187,6 +206,18 @@ internal class VoiceCockpitState(
         internal set
     var storeChangeVersion by mutableLongStateOf(tokenStore.changes.value)
         private set
+
+    val controlSchemeConfig: ControlSchemeConfig
+        get() = ControlSchemeConfig(
+            pinBluetoothSco = pinSco,
+            bluetoothCaptureMode = bluetoothCaptureMode,
+            telecomHangupAction = telecomHangupAction,
+            headsetTapMode = headsetTapMode,
+            avrcpTrackControlsEnabled = avrcpTrackControlsEnabled,
+            volumeKeyRecordingMode = volumeKeyRecordingMode,
+            volumeKeyDraftMode = volumeKeyDraftMode,
+            mirrorRecordingNotification = mirrorRecordingNotification,
+        )
 
     val boundService: PttForegroundService?
         get() = boundServiceState.value
@@ -339,8 +370,15 @@ internal class VoiceCockpitState(
         pinnedSession = active?.lastPinnedSession
         storeChangeVersion = tokenStore.changes.value
         syncEffectiveVoiceState(active?.id)
+        pinSco = boundService?.pinBluetoothSco ?: tokenStore.getPinBluetoothSco()
         volumeKeyStopRecording = tokenStore.getVolumeKeyStopRecording()
         telecomCallForRecording = tokenStore.getTelecomCallForRecording()
+        bluetoothCaptureMode = tokenStore.getBluetoothCaptureMode()
+        telecomHangupAction = tokenStore.getTelecomHangupAction()
+        headsetTapMode = tokenStore.getHeadsetTapMode()
+        avrcpTrackControlsEnabled = tokenStore.getAvrcpTrackControlsEnabled()
+        volumeKeyRecordingMode = tokenStore.getVolumeKeyRecordingMode()
+        volumeKeyDraftMode = tokenStore.getVolumeKeyDraftMode()
         mirrorRecordingNotification = tokenStore.getMirrorRecordingNotification()
     }
 
@@ -523,6 +561,16 @@ internal class VoiceCockpitState(
         showSessionPicker = true
     }
 
+    fun ensureVoiceCatalogLoaded() {
+        refreshMlKitTtsStatus()
+        if (systemVoices.isEmpty()) {
+            refreshSystemVoices()
+        }
+        if (voices.isEmpty() && !isLoadingVoices) {
+            refreshVoices()
+        }
+    }
+
     fun openVoicePicker() {
         val rolePipeline = VoiceRoleResolver.resolvePipelineForRole(ttsPipeline, roleVoiceProfiles.agent)
         val primary = VoicePipelineDefaults.primaryEnabledEngine(rolePipeline) ?: TtsEngine.GEMINI_BRIDGE
@@ -696,6 +744,49 @@ internal class VoiceCockpitState(
         syncServerStateFromStore()
     }
 
+    fun selectBluetoothCaptureMode(mode: BluetoothCaptureMode) {
+        bluetoothCaptureMode = mode
+        telecomCallForRecording = mode == BluetoothCaptureMode.TELECOM_HFP
+        tokenStore.setBluetoothCaptureMode(mode)
+        syncServerStateFromStore()
+    }
+
+    fun selectTelecomHangupAction(action: TelecomHangupAction) {
+        telecomHangupAction = action
+        tokenStore.setTelecomHangupAction(action)
+        syncServerStateFromStore()
+    }
+
+    fun selectHeadsetTapMode(mode: HeadsetTapMode) {
+        headsetTapMode = mode
+        tokenStore.setHeadsetTapMode(mode)
+        syncServerStateFromStore()
+    }
+
+    fun toggleAvrcpTrackControls(enabled: Boolean) {
+        avrcpTrackControlsEnabled = enabled
+        tokenStore.setAvrcpTrackControlsEnabled(enabled)
+        syncServerStateFromStore()
+    }
+
+    fun selectVolumeKeyRecordingMode(mode: VolumeKeyRecordingMode) {
+        volumeKeyRecordingMode = mode
+        volumeKeyStopRecording = mode.isEnabled
+        tokenStore.setVolumeKeyRecordingMode(mode)
+        syncServerStateFromStore()
+    }
+
+    fun selectVolumeKeyDraftMode(mode: VolumeKeyDraftMode) {
+        volumeKeyDraftMode = mode
+        tokenStore.setVolumeKeyDraftMode(mode)
+        syncServerStateFromStore()
+    }
+
+    fun applyControlPreset(preset: ControlPreset) {
+        tokenStore.applyControlPreset(preset)
+        syncServerStateFromStore()
+    }
+
     fun setMirrorRecordingNotif(enabled: Boolean) {
         mirrorRecordingNotification = enabled
         tokenStore.setMirrorRecordingNotification(enabled)
@@ -746,10 +837,14 @@ internal class VoiceCockpitState(
         sessionsError = null
     }
 
+    fun setPinSco(enabled: Boolean) {
+        pinSco = enabled
+        tokenStore.setPinBluetoothSco(enabled)
+        boundService?.pinBluetoothSco = enabled
+    }
+
     fun togglePinSco() {
-        val next = !pinSco
-        pinSco = next
-        boundService?.pinBluetoothSco = next
+        setPinSco(!pinSco)
     }
 
     fun armPtt() {
@@ -938,7 +1033,7 @@ internal fun rememberVoiceCockpitState(
             voicePickerInitialEngineState = voicePickerInitialEngineState,
             voicePickerInitialRoleState = voicePickerInitialRoleState,
             mlKitTtsSpeaker = mlKitTtsSpeaker,
-            initialPinSco = boundService?.pinBluetoothSco ?: false,
+            initialPinSco = boundService?.pinBluetoothSco ?: tokenStore.getPinBluetoothSco(),
             onSessionExpiredAuthErrorState = onSessionExpiredAuthErrorState,
         )
     }
@@ -968,13 +1063,7 @@ internal fun rememberVoiceCockpitState(
 
     LaunchedEffect(state.showVoicePicker) {
         if (state.showVoicePicker) {
-            state.refreshMlKitTtsStatus()
-            if (state.systemVoices.isEmpty()) {
-                state.refreshSystemVoices()
-            }
-            if (state.voices.isEmpty() && !state.isLoadingVoices) {
-                state.refreshVoices()
-            }
+            state.ensureVoiceCatalogLoaded()
         }
     }
 
@@ -1025,6 +1114,7 @@ internal fun VoiceCockpitSheets(
     onSignInServer: (ServerProfile) -> Unit,
     onAddServer: () -> Unit,
     onOpenSettings: () -> Unit,
+    includeVoicePickerSheet: Boolean = true,
 ) {
     if (state.showSessionPicker) {
         SessionPickerSheet(
@@ -1043,11 +1133,10 @@ internal fun VoiceCockpitSheets(
         )
     }
 
-    if (state.showVoicePicker) {
+    if (includeVoicePickerSheet && state.showVoicePicker) {
         VoicePickerSheet(
             ttsPipeline = state.ttsPipeline,
             roleProfiles = state.roleVoiceProfiles,
-            initialEngine = state.voicePickerInitialEngine,
             initialRole = state.voicePickerInitialRole,
             geminiVoices = state.voices,
             isLoadingGemini = state.isLoadingVoices,

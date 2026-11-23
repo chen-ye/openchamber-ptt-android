@@ -74,6 +74,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.openchamber.ptt.R
+import com.openchamber.ptt.service.ControlHintFormatter
+import com.openchamber.ptt.service.ControlSchemeConfig
 import com.openchamber.ptt.service.PttState
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.StagedDraft
@@ -306,6 +308,8 @@ internal fun HeroPttControl(
     onPullBackToDraft: (() -> Unit)? = null,
     sendGraceRemainingMs: Long? = null,
     pendingQuickTranscript: String? = null,
+    controlScheme: ControlSchemeConfig = ControlSchemeConfig(),
+    hasDraft: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -440,23 +444,14 @@ internal fun HeroPttControl(
         PttState.ERROR -> "Tap to Re-Arm"
     }
 
-    val helperText = when (pttState) {
-        PttState.DISARMED -> if (canArm) {
-            "Starts foreground audio for screen-off & headset PTT"
-        } else {
-            "Select a pinned session above to arm"
-        }
-        PttState.ARMED_IDLE -> "1x headset tap: talk · 2x/Next: read latest reply"
-        PttState.RECORDING -> "1x: quick send · 2x/Next: stage & organize · 3x/Prev: discard"
-        PttState.TRANSCRIBING_SEND, PttState.TRANSCRIBING_STAGE, PttState.WAITING_AGENT -> statusText
-        PttState.SEND_GRACE -> pendingQuickTranscript?.takeIf { it.isNotBlank() }
-            ?: "Sending shortly — tap anywhere to pull into staged draft"
-        PttState.STAGED_DRAFT -> "1x: append voice · 2x/Next: send draft · 3x/Prev: discard"
-        PttState.STAGED_DRAFT_SPEAKING -> "1x: pause preview · 2x/Next: send now · 3x/Prev: discard"
-        PttState.SPEAKING_TTS -> "Tap anytime to barge in and interrupt speech"
-        PttState.PERMISSION_BLOCKED -> statusText
-        PttState.ERROR -> statusText
-    }
+    val helperText = ControlHintFormatter.formatCockpitHelper(
+        config = controlScheme,
+        pttState = pttState,
+        hasDraft = hasDraft,
+        statusText = statusText,
+        pendingQuickTranscript = pendingQuickTranscript,
+        canArm = canArm,
+    )
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -540,7 +535,7 @@ internal fun HeroPttControl(
             } else {
                 MaterialTheme.colorScheme.onSurfaceVariant
             },
-            maxLines = 3,
+            maxLines = 4,
             overflow = TextOverflow.Ellipsis,
         )
 
