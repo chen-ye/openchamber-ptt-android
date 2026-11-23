@@ -53,6 +53,7 @@ internal class SessionResponseController(
     private val onFeedUpdated: (ResponseFeedState) -> Unit = {},
     private val wallClockMs: () -> Long = { System.currentTimeMillis() },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val lookupCachedSpokenSummary: ((String) -> String?)? = null,
 ) {
     private val stateLock = Any()
     private val syncMutex = Mutex()
@@ -151,7 +152,7 @@ internal class SessionResponseController(
                                 .map { it.messageId },
                         )
                         initialSyncDoneForSession = true
-                        projected
+                        hydrateFocusedSpokenSummaryLocked(projected)
                     } else {
                         ResponseFeedState()
                     }
@@ -578,8 +579,8 @@ internal class SessionResponseController(
             if (idx < 0) return
             lastInterruptedMessageId = null
             userNavigatedFocus = !(cur.unreadQueue.isEmpty() && idx == inspectable.lastIndex)
-            if (cur.focusedMessageId != messageId) {
-                val updated = cur.copy(focusedMessageId = messageId)
+            val updated = hydrateFocusedSpokenSummaryLocked(cur.copy(focusedMessageId = messageId))
+            if (updated != cur) {
                 _feedState.value = updated
                 notifyFeed = updated
             }
@@ -602,8 +603,29 @@ internal class SessionResponseController(
             val targetId = inspectable[targetIdx].messageId
             lastInterruptedMessageId = null
             userNavigatedFocus = !(cur.unreadQueue.isEmpty() && targetIdx == inspectable.lastIndex)
-            if (cur.focusedMessageId != targetId) {
-                val updated = cur.copy(focusedMessageId = targetId)
+            val updated = hydrateFocusedSpokenSummaryLocked(cur.copy(focusedMessageId = targetId))
+            if (updated != cur) {
+                _feedState.value = updated
+                notifyFeed = updated
+            }
+        }
+        notifyFeed?.let(onFeedUpdated)
+    }
+
+    fun refreshFocusedSpokenSummaryFromCache() {
+        val lookup = lookupCachedSpokenSummary ?: return
+        var notifyFeed: ResponseFeedState? = null
+        synchronized(stateLock) {
+            val cur = _feedState.value
+            val focused = cur.focusedResponse
+            val cached = focused?.let { lookup(it.assistantText) }?.trim()?.takeIf { it.isNotEmpty() }
+            val nextSummary = if (focused != null && cached != null) {
+                SpokenSummaryState(messageId = focused.messageId, text = cached)
+            } else {
+                null
+            }
+            if (cur.spokenSummary != nextSummary) {
+                val updated = cur.copy(spokenSummary = nextSummary)
                 _feedState.value = updated
                 notifyFeed = updated
             }
@@ -911,15 +933,17 @@ internal class SessionResponseController(
         val effectiveForceFocusLatest = forceFocusLatest ||
             (!playbackBusy && !userNavigatedFocus && newTurnOrResponseArrived)
 
-        val projected = SessionTurnProjection.projectResponseFeed(
-            chronologicalRecords = window.records,
-            turns = window.turns,
-            cursor = cursor,
-            previousState = prevFeed.copy(
-                autoSpeakPaused = nextAutoSpeakPaused,
-                directAnswer = if (newTurnOrResponseArrived) null else prevFeed.directAnswer,
+        val projected = hydrateFocusedSpokenSummaryLocked(
+            SessionTurnProjection.projectResponseFeed(
+                chronologicalRecords = window.records,
+                turns = window.turns,
+                cursor = cursor,
+                previousState = prevFeed.copy(
+                    autoSpeakPaused = nextAutoSpeakPaused,
+                    directAnswer = if (newTurnOrResponseArrived) null else prevFeed.directAnswer,
+                ),
+                forceFocusLatest = effectiveForceFocusLatest,
             ),
-            forceFocusLatest = effectiveForceFocusLatest,
         )
 
         if (projected.focusedMessageId == projected.inspectableResponses.lastOrNull()?.messageId) {
@@ -978,12 +1002,14 @@ internal class SessionResponseController(
         val cursor = tokenStore.getReplyCursor(session.sessionKey)
         val cached = windowCache[session.sessionKey]
         val records = cached?.records ?: synthesizeRecordsFromTurns(cur.turns)
-        val projected = SessionTurnProjection.projectResponseFeed(
-            chronologicalRecords = records,
-            turns = cur.turns,
-            cursor = cursor,
-            previousState = cur,
-            forceFocusLatest = forceFocusLatest,
+        val projected = hydrateFocusedSpokenSummaryLocked(
+            SessionTurnProjection.projectResponseFeed(
+                chronologicalRecords = records,
+                turns = cur.turns,
+                cursor = cursor,
+                previousState = cur,
+                forceFocusLatest = forceFocusLatest,
+            ),
         )
         if (projected.focusedMessageId == projected.inspectableResponses.lastOrNull()?.messageId) {
             userNavigatedFocus = false
@@ -998,15 +1024,32 @@ internal class SessionResponseController(
         val cached = windowCache[session.sessionKey] ?: return false
         if (cached.turns.none { it.responses.isNotEmpty() }) return false
         val cursor = tokenStore.getReplyCursor(session.sessionKey)
-        val projected = SessionTurnProjection.projectResponseFeed(
-            chronologicalRecords = cached.records,
-            turns = cached.turns,
-            cursor = cursor,
-            previousState = cur,
-            forceFocusLatest = false,
+        val projected = hydrateFocusedSpokenSummaryLocked(
+            SessionTurnProjection.projectResponseFeed(
+                chronologicalRecords = cached.records,
+                turns = cached.turns,
+                cursor = cursor,
+                previousState = cur,
+                forceFocusLatest = false,
+            ),
         )
         _feedState.value = projected
         return true
+    }
+
+    private fun hydrateFocusedSpokenSummaryLocked(feed: ResponseFeedState): ResponseFeedState {
+        val lookup = lookupCachedSpokenSummary ?: return feed
+        val focused = feed.focusedResponse ?: return feed
+        if (feed.spokenSummary?.messageId == focused.messageId && feed.spokenSummary.text.isNotBlank()) {
+            return feed
+        }
+        val cachedText = lookup(focused.assistantText)?.trim()?.takeIf { it.isNotEmpty() } ?: return feed
+        return feed.copy(
+            spokenSummary = SpokenSummaryState(
+                messageId = focused.messageId,
+                text = cachedText,
+            ),
+        )
     }
 
     private fun nextItemToAutoSpeakLocked(

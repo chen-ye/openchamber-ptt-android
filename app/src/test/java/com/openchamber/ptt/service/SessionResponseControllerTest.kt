@@ -5,6 +5,9 @@ import com.openchamber.ptt.network.OpenChamberHttp
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.SessionReplyCursor
 import com.openchamber.ptt.storage.TokenStore
+import com.openchamber.ptt.tts.SpokenDetailLevel
+import com.openchamber.ptt.tts.TtsCache
+import com.openchamber.ptt.tts.TtsInputMode
 import com.openchamber.ptt.voice.AssistantResponseItem
 import com.openchamber.ptt.voice.DirectVoiceAnswer
 import com.openchamber.ptt.voice.EventStreamClient
@@ -35,7 +38,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -43,6 +48,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class SessionResponseControllerTest {
+    @get:Rule
+    val tempFolder = TemporaryFolder()
+
     private lateinit var server: MockWebServer
 
     @Before
@@ -98,6 +106,7 @@ class SessionResponseControllerTest {
         stateProvider: () -> PttState,
         playbackProvider: () -> Boolean = { false },
         onAutoSpeak: () -> Unit = {},
+        lookupCachedSpokenSummary: ((String) -> String?)? = null,
     ): Triple<TokenStore, BoundServerSession, SessionResponseController> {
         val store = TokenStore(InMemoryPrefs())
         val srv = store.upsertServer(baseUrl, label = "Local", token = "tok_test", makeActive = true)
@@ -121,6 +130,7 @@ class SessionResponseControllerTest {
             currentState = stateProvider,
             isPlaybackActive = playbackProvider,
             onTriggerAutoSpeak = onAutoSpeak,
+            lookupCachedSpokenSummary = lookupCachedSpokenSummary,
         )
         controller.bindSession(session, forceClear = true)
         return Triple(store, session, controller)
@@ -960,6 +970,84 @@ class SessionResponseControllerTest {
                 assertEquals(listOf("a3"), feed.unreadQueue.map { it.messageId })
             } finally {
                 scope.cancel()
+            }
+        }
+
+    @Test
+    fun `stepping between responses and restarting hydrates focusedSpokenSummary from TtsCache and refreshes on mode change`() =
+        runBlocking {
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+            val raw1 = "Detailed response one with `CodeOne.kt` and enough characters to exceed the threshold for spoken translation. ".repeat(3)
+            val raw2 = "Detailed response two with `CodeTwo.kt` and enough characters to exceed the threshold for spoken translation. ".repeat(3)
+            val body = """
+                {
+                  "data": [
+                    {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":400}},
+                    {"id":"a2","type":"assistant","finish":"stop","time":{"created":300,"completed":350},"content":[{"type":"text","text":"$raw2"}]},
+                    {"id":"a1","type":"assistant","finish":"tool-calls","time":{"created":200,"completed":250},"content":[{"type":"text","text":"$raw1"}]},
+                    {"id":"u1","type":"user","time":{"created":100},"text":"Check two responses"}
+                  ],
+                  "cursor":{}
+                }
+            """.trimIndent()
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> MockResponse().setResponseCode(200).setBody(body)
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val cacheRoot = tempFolder.newFolder("controller_cache")
+            val cache1 = TtsCache(cacheRoot)
+            cache1.putPreparedText(raw1, TtsInputMode.SUMMARIZED, SpokenDetailLevel.BALANCED, "Spoken summary one.")
+            cache1.putPreparedText(raw2, TtsInputMode.SUMMARIZED, SpokenDetailLevel.BALANCED, "Spoken summary two.")
+            cache1.putPreparedText(raw2, TtsInputMode.SUMMARIZED, SpokenDetailLevel.ESSENTIALS, "Essentials summary two.")
+            cache1.close()
+
+            // Brand-new TtsCache instance simulates app restart
+            val cache2 = TtsCache(cacheRoot)
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            var currentMode = TtsInputMode.SUMMARIZED
+            var currentDetail = SpokenDetailLevel.BALANCED
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val (_, _, controller) = createController(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    stateProvider = { PttState.ARMED_IDLE },
+                    lookupCachedSpokenSummary = { raw ->
+                        if (currentMode == TtsInputMode.SUMMARIZED) {
+                            cache2.getPreparedText(raw, currentMode, currentDetail)
+                        } else {
+                            null
+                        }
+                    },
+                )
+
+                val feed = controller.syncSessionTurns("init_hydrate")
+                assertEquals("a2", feed.focusedResponse?.messageId)
+                assertEquals("Spoken summary two.", feed.focusedSpokenSummary)
+
+                controller.stepResponse(-1)
+                assertEquals("a1", controller.feedState.value.focusedResponse?.messageId)
+                assertEquals("Spoken summary one.", controller.feedState.value.focusedSpokenSummary)
+
+                controller.stepResponse(+1)
+                assertEquals("a2", controller.feedState.value.focusedResponse?.messageId)
+                assertEquals("Spoken summary two.", controller.feedState.value.focusedSpokenSummary)
+
+                // Detail level change refreshes focused readout from cache
+                currentDetail = SpokenDetailLevel.ESSENTIALS
+                controller.refreshFocusedSpokenSummaryFromCache()
+                assertEquals("Essentials summary two.", controller.feedState.value.focusedSpokenSummary)
+
+                // Switching to RAW clears cached spoken summary
+                currentMode = TtsInputMode.RAW
+                controller.refreshFocusedSpokenSummaryFromCache()
+                assertNull(controller.feedState.value.focusedSpokenSummary)
+            } finally {
+                scope.cancel()
+                cache2.close()
             }
         }
 }

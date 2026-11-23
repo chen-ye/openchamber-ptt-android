@@ -16,10 +16,15 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import java.util.concurrent.atomic.AtomicBoolean
 
 class TtsPlayerTest {
+    @get:Rule
+    val tempFolder = TemporaryFolder()
+
     private lateinit var server: MockWebServer
 
     @Before
@@ -611,5 +616,96 @@ class TtsPlayerTest {
         assertEquals(2, stats.size)
         assertEquals(160, stats[0].prerollMs)
         assertEquals(0, stats[1].prerollMs)
+    }
+
+    @Test
+    fun `re-reading same reply hits both text and audio caches offline and voice switch reuses text cache`() = runTest {
+        val wavKore = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        val wavPuck = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x05, 0x06, 0x07, 0x08),
+        )
+        val longReply = "Detailed build output: ".repeat(15)
+
+        // 1. small-model summarize for longReply
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"text":"Build passed cleanly."}"""))
+        // 2. synthesize Kore
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavKore)),
+        )
+        // 3. synthesize Puck (no second small-model call!)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavPuck)),
+        )
+
+        val playedWavs = mutableListOf<WavAudio>()
+        val stats = mutableListOf<TtsSpeakStats>()
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playedWavs += wav
+            }
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val cache = TtsCache(tempFolder.newFolder("player_cache"))
+        try {
+            val player = TtsPlayer(
+                ttsClient = TtsClient(OpenChamberHttp.createClient(), ttsCache = cache),
+                pcmPlayerFactory = { fakeTrack },
+                systemTtsSpeaker = fakeSystemTts,
+                ioDispatcher = Dispatchers.Unconfined,
+                pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+                inputModeProvider = { TtsInputMode.SUMMARIZED },
+                detailLevelProvider = { SpokenDetailLevel.BALANCED },
+                onSpeakStats = { stats += it },
+            )
+
+            val baseUrl = server.url("/").toString().trimEnd('/')
+
+            // First read: cold text + cold Kore audio (2 requests)
+            player.speak(baseUrl, longReply, voice = "Kore")
+            assertEquals(2, server.requestCount)
+            assertEquals("/api/small-model/generate", server.takeRequest().path)
+            assertEquals("/api/tts/speak", server.takeRequest().path)
+            assertFalse(stats[0].textCacheHit)
+            assertFalse(stats[0].audioCacheHit)
+
+            // Switch voice to Puck: hits TextPrepCache, misses AudioCache (1 request total)
+            player.speak(baseUrl, longReply, voice = "Puck")
+            assertEquals(3, server.requestCount)
+            val puckReq = server.takeRequest()
+            assertEquals("/api/tts/speak", puckReq.path)
+            assertTrue(puckReq.body.readUtf8().contains("\"voice\":\"Puck\""))
+            assertTrue(stats[1].textCacheHit)
+            assertFalse(stats[1].audioCacheHit)
+            assertArrayEquals(wavPuck.copyOfRange(44, wavPuck.size), playedWavs[1].pcmData)
+
+            // Shut down server -> re-reading with Kore works 100% offline with 0 requests
+            server.shutdown()
+            player.speak(baseUrl, longReply, voice = "Kore")
+            assertTrue(stats[2].textCacheHit)
+            assertTrue(stats[2].audioCacheHit)
+            assertArrayEquals(wavKore.copyOfRange(44, wavKore.size), playedWavs[2].pcmData)
+        } finally {
+            cache.close()
+        }
     }
 }

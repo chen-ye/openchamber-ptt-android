@@ -37,8 +37,11 @@ import com.openchamber.ptt.session.SessionApiException
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.StagedDraft
 import com.openchamber.ptt.storage.TokenStore
+import com.openchamber.ptt.tts.TtsCache
+import com.openchamber.ptt.tts.TtsCacheStats
 import com.openchamber.ptt.tts.TtsClient
 import com.openchamber.ptt.tts.TtsException
+import com.openchamber.ptt.tts.TtsInputMode
 import com.openchamber.ptt.tts.TtsPlayer
 import com.openchamber.ptt.voice.DictationClient
 import com.openchamber.ptt.voice.DictationException
@@ -123,6 +126,7 @@ class PttForegroundService : Service() {
 
     private lateinit var tokenStore: TokenStore
     private lateinit var sessionClient: SessionClient
+    private lateinit var ttsCache: TtsCache
     private lateinit var ttsPlayer: TtsPlayer
     private lateinit var voiceUxLogger: VoiceUxLogger
     private lateinit var serviceScope: CoroutineScope
@@ -170,7 +174,8 @@ class PttForegroundService : Service() {
         val mlKitSttClient = MlKitSttClient()
         sessionClient = SessionClient(httpClient)
         val eventStreamClient = EventStreamClient(httpClient)
-        val ttsClient = TtsClient(httpClient)
+        ttsCache = TtsCache(applicationContext)
+        val ttsClient = TtsClient(httpClient, ttsCache = ttsCache)
         val promptOrganizer = PromptOrganizer(httpClient)
         val voiceControlPlane = VoiceControlPlane(httpClient)
         ttsPlayer = TtsPlayer(
@@ -209,6 +214,8 @@ class PttForegroundService : Service() {
                         "spokenChars" to stats.spokenChars,
                         "engine" to stats.engine.name,
                         "prerollMs" to stats.prerollMs,
+                        "textCacheHit" to stats.textCacheHit,
+                        "audioCacheHit" to stats.audioCacheHit,
                     ),
                 )
             },
@@ -246,7 +253,36 @@ class PttForegroundService : Service() {
             },
             onTriggerAutoSpeak = { dispatch(PttEvent.PlayQueuedReply) },
             onFeedUpdated = { feed -> syncFromResponseFeed(feed) },
+            lookupCachedSpokenSummary = { rawText ->
+                val mode = tokenStore.getEffectiveTtsInputMode()
+                if (mode == TtsInputMode.SUMMARIZED) {
+                    val detail = tokenStore.getEffectiveSpokenDetailLevel()
+                    ttsCache.getPreparedText(rawText, mode, detail)
+                } else {
+                    null
+                }
+            },
         )
+
+        var lastEffectiveServerId = tokenStore.getActiveServer()?.id
+        var lastEffectiveInputMode = tokenStore.getEffectiveTtsInputMode(lastEffectiveServerId)
+        var lastEffectiveDetailLevel = tokenStore.getEffectiveSpokenDetailLevel(lastEffectiveServerId)
+        serviceScope.launch {
+            tokenStore.changes.collect {
+                val curServerId = tokenStore.getActiveServer()?.id
+                val curMode = tokenStore.getEffectiveTtsInputMode(curServerId)
+                val curDetail = tokenStore.getEffectiveSpokenDetailLevel(curServerId)
+                if (curServerId != lastEffectiveServerId ||
+                    curMode != lastEffectiveInputMode ||
+                    curDetail != lastEffectiveDetailLevel
+                ) {
+                    lastEffectiveServerId = curServerId
+                    lastEffectiveInputMode = curMode
+                    lastEffectiveDetailLevel = curDetail
+                    sessionResponseController.refreshFocusedSpokenSummaryFromCache()
+                }
+            }
+        }
 
         agentTurnRunner = AgentTurnRunner(
             scope = serviceScope,
@@ -458,6 +494,9 @@ class PttForegroundService : Service() {
         }
         if (::ttsPlayer.isInitialized) {
             ttsPlayer.release()
+        }
+        if (::ttsCache.isInitialized) {
+            ttsCache.close()
         }
         mediaSession?.let { session ->
             session.isActive = false
@@ -684,6 +723,18 @@ class PttForegroundService : Service() {
 
     fun clearVoiceUxLog() {
         voiceUxLogger.clear()
+    }
+
+    fun getTtsCacheStats(): TtsCacheStats =
+        if (::ttsCache.isInitialized) ttsCache.stats() else TtsCacheStats(0, 0L, 0, 0L)
+
+    fun clearTtsCache() {
+        if (::ttsCache.isInitialized) {
+            ttsCache.clear()
+            if (::sessionResponseController.isInitialized) {
+                sessionResponseController.refreshFocusedSpokenSummaryFromCache()
+            }
+        }
     }
 
     fun onActiveSessionOrServerChanged() {

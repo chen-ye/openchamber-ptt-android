@@ -14,12 +14,18 @@ import okio.Buffer
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 class TtsClientTest {
+    @get:Rule
+    val tempFolder = TemporaryFolder()
+
     private lateinit var server: MockWebServer
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -392,5 +398,103 @@ class TtsClientTest {
         val baseUrl = server.url("/").toString().trimEnd('/')
         val res = ttsClient.summarizeForSpeech(baseUrl, "Long text ".repeat(30))
         org.junit.Assert.assertNull(res)
+    }
+
+    @Test
+    fun `prepareTextForTtsDetailed does not poison SUMMARIZED cache when small-model fails and caches genuine summaries`() = runTest {
+        val longReply = "Detailed build output: ".repeat(15)
+        server.enqueue(MockResponse().setResponseCode(500).setBody("""{"error":"transient"}"""))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Sanitized fallback."}"""))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"text":"Genuine spoken summary."}"""))
+
+        val cache = TtsCache(tempFolder.newFolder("client_prep_cache"))
+        try {
+            val client = TtsClient(httpClient = OpenChamberHttp.createClient(), ttsCache = cache)
+            val baseUrl = server.url("/").toString().trimEnd('/')
+
+            // 1st call fails small-model -> falls back to /api/text/summarize without poisoning SUMMARIZED cache
+            val first = client.prepareTextForTtsDetailed(baseUrl, longReply, TtsInputMode.SUMMARIZED)
+            assertEquals("Sanitized fallback.", first.text)
+            assertFalse(first.cacheHit)
+            assertEquals("/api/small-model/generate", server.takeRequest().path)
+            assertEquals("/api/text/summarize", server.takeRequest().path)
+
+            // 2nd call hits /api/small-model/generate cleanly and populates cache
+            val second = client.prepareTextForTtsDetailed(baseUrl, longReply, TtsInputMode.SUMMARIZED)
+            assertEquals("Genuine spoken summary.", second.text)
+            assertFalse(second.cacheHit)
+            assertEquals("/api/small-model/generate", server.takeRequest().path)
+
+            // 3rd call hits cache with 0 network requests
+            val third = client.prepareTextForTtsDetailed(baseUrl, longReply, TtsInputMode.SUMMARIZED)
+            assertEquals("Genuine spoken summary.", third.text)
+            assertTrue(third.cacheHit)
+            assertEquals(3, server.requestCount)
+        } finally {
+            cache.close()
+        }
+    }
+
+    @Test
+    fun `prepareTextForTtsDetailed SANITIZED does not poison cache on HTTP error and caches genuine 2xx`() = runTest {
+        val raw = "Markdown **reply** to sanitize."
+        server.enqueue(MockResponse().setResponseCode(503))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"summary":"Clean sanitized reply."}"""))
+
+        val cache = TtsCache(tempFolder.newFolder("client_sanitize_cache"))
+        try {
+            val client = TtsClient(httpClient = OpenChamberHttp.createClient(), ttsCache = cache)
+            val baseUrl = server.url("/").toString().trimEnd('/')
+
+            val first = client.prepareTextForTtsDetailed(baseUrl, raw, TtsInputMode.SANITIZED)
+            assertEquals(raw, first.text)
+            assertFalse(first.cacheHit)
+
+            val second = client.prepareTextForTtsDetailed(baseUrl, raw, TtsInputMode.SANITIZED)
+            assertEquals("Clean sanitized reply.", second.text)
+            assertFalse(second.cacheHit)
+
+            val third = client.prepareTextForTtsDetailed(baseUrl, raw, TtsInputMode.SANITIZED)
+            assertEquals("Clean sanitized reply.", third.text)
+            assertTrue(third.cacheHit)
+            assertEquals(2, server.requestCount)
+        } finally {
+            cache.close()
+        }
+    }
+
+    @Test
+    fun `synthesizeWithEngineDetailed serves cached audio offline after server shutdown`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(11, 22, 33, 44),
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+
+        val cache = TtsCache(tempFolder.newFolder("client_audio_cache"))
+        try {
+            val client = TtsClient(httpClient = OpenChamberHttp.createClient(), ttsCache = cache)
+            val baseUrl = server.url("/").toString().trimEnd('/')
+
+            val first = client.synthesizeWithEngineDetailed(baseUrl, "Offline test", "Kore", TtsEngine.GEMINI_BRIDGE)
+            assertFalse(first.cacheHit)
+            assertArrayEquals(wavBytes, first.audio.bytes)
+
+            server.shutdown()
+
+            val second = client.synthesizeWithEngineDetailed(baseUrl, "Offline test", "Kore", TtsEngine.GEMINI_BRIDGE)
+            assertTrue(second.cacheHit)
+            assertEquals("audio/wav", second.audio.contentType)
+            assertArrayEquals(wavBytes, second.audio.bytes)
+        } finally {
+            cache.close()
+        }
     }
 }

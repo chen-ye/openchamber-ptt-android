@@ -55,6 +55,8 @@ data class TtsSpeakStats(
     val engine: TtsEngine,
     val kind: String = "reply",
     val prerollMs: Int = 0,
+    val textCacheHit: Boolean = false,
+    val audioCacheHit: Boolean = false,
 )
 
 class TtsPlayer internal constructor(
@@ -135,15 +137,17 @@ class TtsPlayer internal constructor(
         try {
             val effectiveMode = inputModeOverride ?: inputModeProvider()
             val prepareStartMs = System.currentTimeMillis()
-            val spokenText = ttsClient.prepareTextForTts(
+            val preparedText = ttsClient.prepareTextForTtsDetailed(
                 serverUrl = serverUrl,
                 text = rawTrimmed,
                 inputMode = effectiveMode,
                 sessionLabel = sessionLabel,
                 detailLevel = detailLevelProvider(),
             )
+            val spokenText = preparedText.text
                 .trim()
                 .ifEmpty { rawTrimmed }
+            val textCacheHit = preparedText.cacheHit
             val prepareElapsedMs = (System.currentTimeMillis() - prepareStartMs).coerceAtLeast(0L)
 
             ensureGenerationActive(myGeneration)
@@ -159,6 +163,7 @@ class TtsPlayer internal constructor(
             var played = false
             var usedEngine: TtsEngine? = null
             var usedPrerollMs = 0
+            var usedAudioCacheHit = false
 
             for (option in enabledPipeline) {
                 ensureGenerationActive(myGeneration)
@@ -194,6 +199,7 @@ class TtsPlayer internal constructor(
                                 }
                             }
                             usedPrerollMs = prerollMs
+                            usedAudioCacheHit = false
                             true
                         }
                         TtsEngine.ANDROID_SYSTEM -> {
@@ -223,6 +229,7 @@ class TtsPlayer internal constructor(
                                 }
                             }
                             usedPrerollMs = prerollMs
+                            usedAudioCacheHit = false
                             true
                         }
                         TtsEngine.GEMINI_BRIDGE,
@@ -233,7 +240,13 @@ class TtsPlayer internal constructor(
                                 TtsEngine.OPENAI_CLOUD -> openAiVoiceProvider()
                                 else -> voice
                             }
-                            val audio = ttsClient.synthesizeWithEngine(serverUrl, spokenText, engineVoice, engine)
+                            val synthesized = ttsClient.synthesizeWithEngineDetailed(
+                                serverUrl = serverUrl,
+                                text = spokenText,
+                                voice = engineVoice,
+                                engine = engine,
+                            )
+                            val audio = synthesized.audio
                             ensureGenerationActive(myGeneration)
                             val wav = if (isRiffWav(audio.bytes)) {
                                 WavParser.parse(audio.bytes)
@@ -266,6 +279,7 @@ class TtsPlayer internal constructor(
                                 }
                             }
                             usedPrerollMs = prerollMs
+                            usedAudioCacheHit = synthesized.cacheHit
                             true
                         }
                     }
@@ -304,6 +318,8 @@ class TtsPlayer internal constructor(
                         engine = usedEngine,
                         kind = kind,
                         prerollMs = usedPrerollMs,
+                        textCacheHit = textCacheHit,
+                        audioCacheHit = usedAudioCacheHit,
                     ),
                 )
             }

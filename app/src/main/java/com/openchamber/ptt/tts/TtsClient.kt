@@ -71,10 +71,21 @@ data class TtsAudio(
     }
 }
 
+data class PreparedSpeechText(
+    val text: String,
+    val cacheHit: Boolean,
+)
+
+data class SynthesizedSpeechAudio(
+    val audio: TtsAudio,
+    val cacheHit: Boolean,
+)
+
 class TtsClient(
     private val httpClient: OkHttpClient,
     private val json: Json = DefaultJson,
     private val summarizeTimeoutMs: Long = DEFAULT_SUMMARIZE_TIMEOUT_MS,
+    private val ttsCache: TtsCache? = null,
 ) {
     internal val ttsHttpClient: OkHttpClient = if (httpClient.readTimeoutMillis < MIN_TTS_READ_TIMEOUT_MS) {
         httpClient.newBuilder()
@@ -95,14 +106,83 @@ class TtsClient(
         inputMode: TtsInputMode,
         sessionLabel: String? = null,
         detailLevel: SpokenDetailLevel = SpokenDetailLevel.BALANCED,
-    ): String {
+    ): String = prepareTextForTtsDetailed(
+        serverUrl = serverUrl,
+        text = text,
+        inputMode = inputMode,
+        sessionLabel = sessionLabel,
+        detailLevel = detailLevel,
+    ).text
+
+    suspend fun prepareTextForTtsDetailed(
+        serverUrl: String,
+        text: String,
+        inputMode: TtsInputMode,
+        sessionLabel: String? = null,
+        detailLevel: SpokenDetailLevel = SpokenDetailLevel.BALANCED,
+    ): PreparedSpeechText {
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) return ""
+        if (trimmed.isEmpty()) return PreparedSpeechText(text = "", cacheHit = false)
         return when (inputMode) {
-            TtsInputMode.RAW -> trimmed
-            TtsInputMode.SANITIZED -> sanitizeForTts(serverUrl, trimmed)
+            TtsInputMode.RAW -> PreparedSpeechText(text = trimmed, cacheHit = false)
+            TtsInputMode.SANITIZED -> {
+                val cache = ttsCache
+                if (cache != null) {
+                    cache.getPreparedText(trimmed, TtsInputMode.SANITIZED, detailLevel)?.let { cached ->
+                        return PreparedSpeechText(text = cached, cacheHit = true)
+                    }
+                    val flightKey = "prep:${cache.textCacheKey(trimmed, TtsInputMode.SANITIZED, detailLevel)}"
+                    cache.singleFlight(flightKey) {
+                        cache.getPreparedText(trimmed, TtsInputMode.SANITIZED, detailLevel)?.let { cached ->
+                            return@singleFlight PreparedSpeechText(text = cached, cacheHit = true)
+                        }
+                        val (sanitized, isGenuine) = sanitizeForTtsInternal(serverUrl, trimmed)
+                        if (isGenuine) {
+                            cache.putPreparedText(trimmed, TtsInputMode.SANITIZED, detailLevel, sanitized)
+                        }
+                        PreparedSpeechText(text = sanitized, cacheHit = false)
+                    }
+                } else {
+                    PreparedSpeechText(
+                        text = sanitizeForTtsInternal(serverUrl, trimmed).first,
+                        cacheHit = false,
+                    )
+                }
+            }
             TtsInputMode.SUMMARIZED -> {
-                if (shouldTranslateForSpeech(trimmed)) {
+                if (!shouldTranslateForSpeech(trimmed)) {
+                    val normalized = normalizeSpokenOutput(trimmed).ifEmpty { trimmed }
+                    return PreparedSpeechText(text = normalized, cacheHit = false)
+                }
+                val cache = ttsCache
+                if (cache != null) {
+                    cache.getPreparedText(trimmed, TtsInputMode.SUMMARIZED, detailLevel)?.let { cached ->
+                        return PreparedSpeechText(text = cached, cacheHit = true)
+                    }
+                    val flightKey = "prep:${cache.textCacheKey(trimmed, TtsInputMode.SUMMARIZED, detailLevel)}"
+                    cache.singleFlight(flightKey) {
+                        cache.getPreparedText(trimmed, TtsInputMode.SUMMARIZED, detailLevel)?.let { cached ->
+                            return@singleFlight PreparedSpeechText(text = cached, cacheHit = true)
+                        }
+                        val translated = summarizeForSpeech(
+                            serverUrl = serverUrl,
+                            text = trimmed,
+                            sessionLabel = sessionLabel,
+                            detailLevel = detailLevel,
+                        )
+                        if (translated != null) {
+                            val normalized = normalizeSpokenOutput(translated).ifEmpty { trimmed }
+                            cache.putPreparedText(trimmed, TtsInputMode.SUMMARIZED, detailLevel, normalized)
+                            PreparedSpeechText(text = normalized, cacheHit = false)
+                        } else {
+                            // Do not poison SUMMARIZED cache with sanitized fallback on transient error.
+                            PreparedSpeechText(
+                                text = sanitizeForTtsInternal(serverUrl, trimmed).first,
+                                cacheHit = false,
+                            )
+                        }
+                    }
+                } else {
                     val translated = summarizeForSpeech(
                         serverUrl = serverUrl,
                         text = trimmed,
@@ -110,12 +190,17 @@ class TtsClient(
                         detailLevel = detailLevel,
                     )
                     if (translated != null) {
-                        return normalizeSpokenOutput(translated).ifEmpty { trimmed }
+                        PreparedSpeechText(
+                            text = normalizeSpokenOutput(translated).ifEmpty { trimmed },
+                            cacheHit = false,
+                        )
+                    } else {
+                        PreparedSpeechText(
+                            text = sanitizeForTtsInternal(serverUrl, trimmed).first,
+                            cacheHit = false,
+                        )
                     }
-                } else {
-                    return normalizeSpokenOutput(trimmed).ifEmpty { trimmed }
                 }
-                sanitizeForTts(serverUrl, trimmed)
             }
         }
     }
@@ -178,7 +263,13 @@ class TtsClient(
     ): String {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return ""
+        return sanitizeForTtsInternal(serverUrl, trimmed).first
+    }
 
+    private suspend fun sanitizeForTtsInternal(
+        serverUrl: String,
+        trimmed: String,
+    ): Pair<String, Boolean> {
         val baseUrl = OpenChamberHttp.normalizeBaseUrl(serverUrl)
         val payload = json.encodeToString(SummarizeRequest(text = trimmed, mode = SUMMARIZE_MODE_TTS))
         val request = Request.Builder()
@@ -193,20 +284,25 @@ class TtsClient(
                 throw TtsException(statusCode = 401, message = "Unauthorized sanitizing text for TTS")
             }
             if (response.statusCode !in 200..299 || response.bytes.isEmpty()) {
-                return trimmed
+                return trimmed to false
             }
             val bodyText = response.bytes.toString(Charsets.UTF_8).trim()
             if (bodyText.isEmpty()) {
-                return trimmed
+                return trimmed to false
             }
-            extractSummaryText(bodyText) ?: trimmed
+            val extracted = extractSummaryText(bodyText)
+            if (extracted != null) {
+                extracted to true
+            } else {
+                trimmed to false
+            }
         } catch (ce: CancellationException) {
             throw ce
         } catch (te: TtsException) {
             if (te.statusCode == 401) throw te
-            trimmed
+            trimmed to false
         } catch (_: Throwable) {
-            trimmed
+            trimmed to false
         }
     }
 
@@ -258,20 +354,84 @@ class TtsClient(
         text: String,
         voice: String = DEFAULT_TTS_VOICE,
         engine: TtsEngine,
-    ): TtsAudio {
+        kokoroSpeakerId: Int = DEFAULT_KOKORO_SPEAKER_ID,
+    ): TtsAudio = synthesizeWithEngineDetailed(
+        serverUrl = serverUrl,
+        text = text,
+        voice = voice,
+        engine = engine,
+        kokoroSpeakerId = kokoroSpeakerId,
+    ).audio
+
+    suspend fun synthesizeWithEngineDetailed(
+        serverUrl: String,
+        text: String,
+        voice: String = DEFAULT_TTS_VOICE,
+        engine: TtsEngine,
+        kokoroSpeakerId: Int = DEFAULT_KOKORO_SPEAKER_ID,
+    ): SynthesizedSpeechAudio {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) {
             throw TtsException(message = "Cannot synthesize empty text")
         }
+        if (engine == TtsEngine.MLKIT_GENAI) {
+            throw TtsException(message = "MLKIT_GENAI is handled locally by TtsPlayer")
+        }
+        if (engine == TtsEngine.ANDROID_SYSTEM) {
+            throw TtsException(message = "ANDROID_SYSTEM is handled locally by TtsPlayer")
+        }
         val baseUrl = OpenChamberHttp.normalizeBaseUrl(serverUrl)
         val chosenVoice = voice.trim().ifEmpty { DEFAULT_TTS_VOICE }
-        return when (engine) {
-            TtsEngine.GEMINI_BRIDGE -> requestPrimaryTts(baseUrl, trimmed, chosenVoice).getOrThrow()
-            TtsEngine.LOCAL_KOKORO -> requestKokoroFallbackTts(baseUrl, trimmed)
-            TtsEngine.OPENAI_CLOUD -> requestOpenAiCloudTts(baseUrl, trimmed, chosenVoice)
-            TtsEngine.MLKIT_GENAI -> throw TtsException(message = "MLKIT_GENAI is handled locally by TtsPlayer")
-            TtsEngine.ANDROID_SYSTEM -> throw TtsException(message = "ANDROID_SYSTEM is handled locally by TtsPlayer")
+        val cache = ttsCache
+        if (cache != null) {
+            val cacheKey = cache.audioCacheKey(
+                serverUrl = baseUrl,
+                engine = engine,
+                voice = chosenVoice,
+                spokenText = trimmed,
+                speed = DEFAULT_TTS_SPEED,
+                kokoroSpeakerId = kokoroSpeakerId,
+            )
+            cache.getAudio(cacheKey)?.let { hit ->
+                return SynthesizedSpeechAudio(audio = hit, cacheHit = true)
+            }
+            return cache.singleFlight("audio:$cacheKey") {
+                cache.getAudio(cacheKey)?.let { hit ->
+                    return@singleFlight SynthesizedSpeechAudio(audio = hit, cacheHit = true)
+                }
+                val audio = synthesizeUncached(
+                    baseUrl = baseUrl,
+                    text = trimmed,
+                    voice = chosenVoice,
+                    engine = engine,
+                    kokoroSpeakerId = kokoroSpeakerId,
+                )
+                cache.putAudio(cacheKey, audio)
+                SynthesizedSpeechAudio(audio = audio, cacheHit = false)
+            }
         }
+        val audio = synthesizeUncached(
+            baseUrl = baseUrl,
+            text = trimmed,
+            voice = chosenVoice,
+            engine = engine,
+            kokoroSpeakerId = kokoroSpeakerId,
+        )
+        return SynthesizedSpeechAudio(audio = audio, cacheHit = false)
+    }
+
+    private suspend fun synthesizeUncached(
+        baseUrl: String,
+        text: String,
+        voice: String,
+        engine: TtsEngine,
+        kokoroSpeakerId: Int,
+    ): TtsAudio = when (engine) {
+        TtsEngine.GEMINI_BRIDGE -> requestPrimaryTts(baseUrl, text, voice).getOrThrow()
+        TtsEngine.LOCAL_KOKORO -> requestKokoroFallbackTts(baseUrl, text, kokoroSpeakerId)
+        TtsEngine.OPENAI_CLOUD -> requestOpenAiCloudTts(baseUrl, text, voice)
+        TtsEngine.MLKIT_GENAI -> throw TtsException(message = "MLKIT_GENAI is handled locally by TtsPlayer")
+        TtsEngine.ANDROID_SYSTEM -> throw TtsException(message = "ANDROID_SYSTEM is handled locally by TtsPlayer")
     }
 
     private suspend fun requestPrimaryTts(
@@ -324,7 +484,7 @@ class TtsClient(
         text: String,
         voice: String,
     ): TtsAudio {
-        val openAiVoice = if (voice.lowercase() in OPENAI_VOICES) voice.lowercase() else DEFAULT_OPENAI_VOICE
+        val openAiVoice = normalizeOpenAiVoice(voice)
         val payload = json.encodeToString(
             OpenAiSpeakRequest(
                 text = text,
@@ -361,11 +521,12 @@ class TtsClient(
     private suspend fun requestKokoroFallbackTts(
         baseUrl: String,
         text: String,
+        speakerId: Int = DEFAULT_KOKORO_SPEAKER_ID,
     ): TtsAudio {
         val payload = json.encodeToString(
             KokoroSpeakRequest(
                 text = text,
-                speakerId = DEFAULT_KOKORO_SPEAKER_ID,
+                speakerId = speakerId,
                 speed = DEFAULT_TTS_SPEED,
             ),
         )
@@ -601,6 +762,11 @@ class TtsClient(
             "alloy", "ash", "ballad", "coral", "echo", "fable",
             "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar",
         )
+
+        internal fun normalizeOpenAiVoice(voice: String): String {
+            val normalized = voice.trim().lowercase()
+            return if (normalized in OPENAI_VOICES) normalized else DEFAULT_OPENAI_VOICE
+        }
         const val DEFAULT_KOKORO_SPEAKER_ID = 0
         const val MIN_TTS_READ_TIMEOUT_MS = 60_000L
         const val DEFAULT_TTS_READ_TIMEOUT_MS = 90_000L
