@@ -5,7 +5,12 @@ import com.openchamber.ptt.network.OpenChamberHttp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -894,5 +899,192 @@ class TtsPlayerTest {
         assertEquals(TtsEngine.GEMINI_BRIDGE, stats[0].engine)
         assertEquals(VoiceRole.OPERATOR, stats[0].role)
         assertEquals("Puck", stats[0].voiceId)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `latency bridge skips on fast cache hit and fires at 450ms with A2DP comfort keep-alive on slow synthesis`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24_000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        var synthDelayMs = 0L
+        var synthCacheHit = true
+        val fakeClient = object : TtsClient(OpenChamberHttp.createClient()) {
+            override suspend fun prepareTextForTtsDetailed(
+                serverUrl: String,
+                text: String,
+                inputMode: TtsInputMode,
+                sessionLabel: String?,
+                detailLevel: SpokenDetailLevel,
+            ): PreparedSpeechText = PreparedSpeechText(text = text, cacheHit = true)
+
+            override suspend fun synthesizeWithEngineDetailed(
+                serverUrl: String,
+                text: String,
+                voice: String,
+                engine: TtsEngine,
+                kokoroSpeakerId: Int,
+            ): SynthesizedSpeechAudio {
+                if (synthDelayMs > 0L) {
+                    delay(synthDelayMs)
+                }
+                return SynthesizedSpeechAudio(
+                    audio = TtsAudio(bytes = wavBytes, contentType = "audio/wav"),
+                    cacheHit = synthCacheHit,
+                )
+            }
+        }
+
+        val playedReplies = mutableListOf<WavAudio>()
+        val keepAliveChunks = mutableListOf<WavAudio>()
+        val bridgeKinds = mutableListOf<String>()
+        val stats = mutableListOf<TtsSpeakStats>()
+        var useComm = false
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playedReplies += wav
+            }
+            override fun stopNow() = Unit
+        }
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val coordinator = AudioOutputCoordinator(clockElapsedMs = { testScheduler.currentTime })
+        val player = TtsPlayer(
+            ttsClient = fakeClient,
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = StandardTestDispatcher(testScheduler),
+            useCommunicationUsage = { useComm },
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+            audioOutputCoordinator = coordinator,
+            onSpeakStats = { stats += it },
+            onLatencyBridgeNeeded = { kind -> bridgeKinds += kind },
+            latencyBridgeDelayMs = 450L,
+            keepAliveSinkPlayer = { wav, _ -> keepAliveChunks += wav },
+        )
+
+        // 1. Cache hit (0ms) -> bridge NEVER fires, no keep-alive chunks
+        player.speak("http://localhost:4096", "Cached reply.")
+        assertTrue(bridgeKinds.isEmpty())
+        assertTrue(keepAliveChunks.isEmpty())
+        assertEquals(1, playedReplies.size)
+
+        // 2. Slow synthesis (1_100ms) -> bridge fires at 450ms ("reply"), emits 200ms dither chunks until 1_100ms
+        bridgeKinds.clear()
+        keepAliveChunks.clear()
+        playedReplies.clear()
+        stats.clear()
+        synthDelayMs = 1_100L
+        synthCacheHit = false
+
+        val slowJob = launch {
+            player.speak("http://localhost:4096", "Slow reply.", kind = TtsPlayer.KIND_REPLY, isManualRead = false)
+        }
+        advanceTimeBy(449L)
+        runCurrent()
+        assertTrue(bridgeKinds.isEmpty())
+        assertTrue(keepAliveChunks.isEmpty())
+
+        advanceTimeBy(1L)
+        runCurrent()
+        assertEquals(listOf(TtsPlayer.KIND_REPLY), bridgeKinds)
+        assertTrue(keepAliveChunks.isNotEmpty())
+        assertEquals((24_000 * 200 / 1000) * 2, keepAliveChunks.first().pcmData.size)
+
+        advanceTimeBy(700L)
+        runCurrent()
+        slowJob.join()
+        assertEquals(1, playedReplies.size)
+        // Sink stayed warm via keep-alive -> 0ms cold preroll on final reply!
+        assertEquals(0, stats.single().prerollMs)
+        val chunksAfterCompletion = keepAliveChunks.size
+        assertTrue(chunksAfterCompletion in 3..4)
+
+        // 3. Manual read sets "manual_reply" on bridge while preserving telemetry kind = "reply"; SCO skips keep-alive dither
+        bridgeKinds.clear()
+        keepAliveChunks.clear()
+        useComm = true
+        synthDelayMs = 600L
+        val manualJob = launch {
+            player.speak("http://localhost:4096", "Manual read.", kind = TtsPlayer.KIND_REPLY, isManualRead = true)
+        }
+        advanceTimeBy(700L)
+        runCurrent()
+        manualJob.join()
+        assertEquals(listOf(TtsPlayer.BRIDGE_KIND_MANUAL_REPLY), bridgeKinds)
+        assertTrue(keepAliveChunks.isEmpty())
+        assertEquals(TtsPlayer.KIND_REPLY, stats.last().kind)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `latency bridge comfort keep-alive caps at 12000ms for ultra-slow synthesis`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24_000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        val fakeClient = object : TtsClient(OpenChamberHttp.createClient()) {
+            override suspend fun prepareTextForTtsDetailed(
+                serverUrl: String,
+                text: String,
+                inputMode: TtsInputMode,
+                sessionLabel: String?,
+                detailLevel: SpokenDetailLevel,
+            ): PreparedSpeechText = PreparedSpeechText(text = text, cacheHit = true)
+
+            override suspend fun synthesizeWithEngineDetailed(
+                serverUrl: String,
+                text: String,
+                voice: String,
+                engine: TtsEngine,
+                kokoroSpeakerId: Int,
+            ): SynthesizedSpeechAudio {
+                delay(20_000L)
+                return SynthesizedSpeechAudio(
+                    audio = TtsAudio(bytes = wavBytes, contentType = "audio/wav"),
+                    cacheHit = false,
+                )
+            }
+        }
+        val keepAliveChunks = mutableListOf<WavAudio>()
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+        val player = TtsPlayer(
+            ttsClient = fakeClient,
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = StandardTestDispatcher(testScheduler),
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+            keepAliveSinkPlayer = { wav, _ -> keepAliveChunks += wav },
+        )
+
+        val job = launch {
+            player.speak("http://localhost:4096", "Very slow reply.")
+        }
+        advanceTimeBy(20_500L)
+        runCurrent()
+        job.join()
+
+        // 12_000ms cap / 200ms chunk = 60 chunks
+        assertEquals(60, keepAliveChunks.size)
     }
 }

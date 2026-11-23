@@ -81,7 +81,7 @@ data class SynthesizedSpeechAudio(
     val cacheHit: Boolean,
 )
 
-class TtsClient(
+open class TtsClient(
     private val httpClient: OkHttpClient,
     private val json: Json = DefaultJson,
     private val summarizeTimeoutMs: Long = DEFAULT_SUMMARIZE_TIMEOUT_MS,
@@ -114,7 +114,7 @@ class TtsClient(
         detailLevel = detailLevel,
     ).text
 
-    suspend fun prepareTextForTtsDetailed(
+    open suspend fun prepareTextForTtsDetailed(
         serverUrl: String,
         text: String,
         inputMode: TtsInputMode,
@@ -363,7 +363,7 @@ class TtsClient(
         kokoroSpeakerId = kokoroSpeakerId,
     ).audio
 
-    suspend fun synthesizeWithEngineDetailed(
+    open suspend fun synthesizeWithEngineDetailed(
         serverUrl: String,
         text: String,
         voice: String = DEFAULT_TTS_VOICE,

@@ -192,6 +192,25 @@ object VoicePipelineDefaults {
 }
 
 @Serializable
+enum class AudioCueMode(
+    val title: String,
+    val subtitle: String,
+) {
+    HYBRID(
+        title = "Hybrid",
+        subtitle = "Crisp tones for button taps; spoken cues for latency, blind spots, and errors",
+    ),
+    VOCAL(
+        title = "Vocal cues",
+        subtitle = "Spoken status updates and latency masking (live-mic start/warning stay tones)",
+    ),
+    TONES(
+        title = "Studio tones",
+        subtitle = "Non-verbal studio earcons across all transitions",
+    ),
+}
+
+@Serializable
 enum class VoiceRole(
     val title: String,
     val shortTitle: String,

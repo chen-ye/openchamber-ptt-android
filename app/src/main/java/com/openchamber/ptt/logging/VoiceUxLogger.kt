@@ -290,6 +290,7 @@ class VoiceUxLogger internal constructor(
         const val CAT_DRAFT = "draft"
         const val CAT_TTS = "tts"
         const val CAT_TURN = "turn"
+        const val CAT_CUE = "cue"
 
         private val ISO_FORMATTER = DateTimeFormatter.ISO_INSTANT.withZone(ZoneOffset.UTC)
         private val DefaultJson = Json {

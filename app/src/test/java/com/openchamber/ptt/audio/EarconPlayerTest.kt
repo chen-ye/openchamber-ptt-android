@@ -128,4 +128,51 @@ class EarconPlayerTest {
             player.release()
         }
     }
+
+    @Test
+    fun `playCustomClip dispatches PCM16 clip via playbackSpec and stopUnless preserves REC_START`() {
+        val customPlayed = CopyOnWriteArrayList<Pair<String?, PcmClip>>()
+        val earconsPlayed = CopyOnWriteArrayList<Earcon>()
+        val customLatch = CountDownLatch(1)
+        val recLatch = CountDownLatch(1)
+        val player = EarconPlayer(
+            context = null,
+            useCommunicationUsage = { true },
+            clipObserver = { earcon, _ ->
+                earconsPlayed += earcon
+                if (earcon == Earcon.REC_START) recLatch.countDown()
+            },
+            customClipObserver = { tag, clip, spec ->
+                assertEquals(
+                    EarconPlayer.PlaybackSpec(
+                        usage = AudioAttributes.USAGE_VOICE_COMMUNICATION,
+                        contentType = AudioAttributes.CONTENT_TYPE_SONIFICATION,
+                    ),
+                    spec,
+                )
+                customPlayed += tag to clip
+                customLatch.countDown()
+            },
+        )
+        try {
+            val pcmClip = PcmClip(
+                pcmBytes = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+                sampleRateHz = 24_000,
+                channelCount = 1,
+                durationMs = 80,
+            )
+            player.playCustomClip(pcmClip, keepTag = "empty_speech")
+            assertTrue(customLatch.await(3, TimeUnit.SECONDS))
+            assertEquals(1, customPlayed.size)
+            assertEquals("empty_speech", customPlayed[0].first)
+            assertEquals(pcmClip, customPlayed[0].second)
+
+            player.play(Earcon.REC_START)
+            assertTrue(recLatch.await(3, TimeUnit.SECONDS))
+            player.stopUnless(Earcon.REC_START)
+            assertEquals(listOf(Earcon.REC_START), earconsPlayed.toList())
+        } finally {
+            player.release()
+        }
+    }
 }

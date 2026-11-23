@@ -1,6 +1,7 @@
 package com.openchamber.ptt.voice
 
 import com.openchamber.ptt.network.OpenChamberHttp
+import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.TtsInputMode
 import kotlinx.coroutines.test.runTest
@@ -390,5 +391,66 @@ class VoiceControlPlaneTest {
         assertFalse(routeCriteria.containsKey("answer_directly"))
         assertTrue(routeCriteria.containsKey("live_tuning"))
         assertTrue(routeCriteria.containsKey("pass_through"))
+    }
+
+    @Test
+    fun `evaluateTurn parses tuning_cues and formats cue mode confirmation speech`() = runTest {
+        val vocalInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"live_tuning"},"tuning_detail":{"choice":"none"},"tuning_mode":{"choice":"none"},"tuning_cues":{"choice":"vocal"}}}"""
+        val tonesInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"live_tuning"},"tuning_detail":{"choice":"none"},"tuning_mode":{"choice":"none"},"tuning_cues":{"choice":"tones"}}}"""
+        val combinedInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"live_tuning"},"tuning_detail":{"choice":"none"},"tuning_mode":{"choice":"raw"},"tuning_cues":{"choice":"hybrid"}}}"""
+        listOf(vocalInner, tonesInner, combinedInner).forEach { inner ->
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"status":200,"body":"${inner.replace("\"", "\\\"")}"}"""),
+            )
+        }
+
+        val vcp = VoiceControlPlane(OpenChamberHttp.createClient())
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        val vocal = vcp.evaluateTurn(
+            serverUrl = baseUrl,
+            utterance = "Turn on vocal cues",
+            replyContext = VoiceReplyContext(),
+            currentDetailLevel = SpokenDetailLevel.BALANCED,
+            currentInputMode = TtsInputMode.SUMMARIZED,
+            currentCueMode = AudioCueMode.HYBRID,
+        ) as VoiceControlDecision.LiveTuning
+        assertEquals(AudioCueMode.VOCAL, vocal.cueMode)
+        assertEquals(null, vocal.detailLevel)
+        assertEquals(null, vocal.inputMode)
+        assertEquals("Switched to Vocal cues.", vocal.confirmationSpeech)
+
+        val tones = vcp.evaluateTurn(
+            serverUrl = baseUrl,
+            utterance = "Switch to studio tones",
+            replyContext = VoiceReplyContext(),
+            currentDetailLevel = SpokenDetailLevel.BALANCED,
+            currentInputMode = TtsInputMode.SUMMARIZED,
+            currentCueMode = AudioCueMode.VOCAL,
+        ) as VoiceControlDecision.LiveTuning
+        assertEquals(AudioCueMode.TONES, tones.cueMode)
+        assertEquals("Switched to Studio tones.", tones.confirmationSpeech)
+
+        val combined = vcp.evaluateTurn(
+            serverUrl = baseUrl,
+            utterance = "Use raw mode and hybrid cues",
+            replyContext = VoiceReplyContext(),
+            currentDetailLevel = SpokenDetailLevel.BALANCED,
+            currentInputMode = TtsInputMode.SUMMARIZED,
+            currentCueMode = AudioCueMode.TONES,
+        ) as VoiceControlDecision.LiveTuning
+        assertEquals(TtsInputMode.RAW, combined.inputMode)
+        assertEquals(AudioCueMode.HYBRID, combined.cueMode)
+        assertEquals("Switched to Raw mode and Hybrid cues.", combined.confirmationSpeech)
+
+        val reqBody = Json.parseToJsonElement(server.takeRequest().body.readUtf8())
+            .jsonObject["body"]!!.jsonObject
+        assertEquals("HYBRID", reqBody["state"]!!.jsonObject["current_cue_mode"]!!.jsonPrimitive.content)
+        val tuningCuesQ = reqBody["questions"]!!.jsonObject["tuning_cues"]!!.jsonObject
+        assertTrue(tuningCuesQ["criteria"]!!.jsonObject.containsKey("vocal"))
+        assertTrue(tuningCuesQ["criteria"]!!.jsonObject.containsKey("tones"))
+        assertTrue(tuningCuesQ["criteria"]!!.jsonObject.containsKey("hybrid"))
     }
 }

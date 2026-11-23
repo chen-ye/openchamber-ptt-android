@@ -42,6 +42,9 @@ class MlKitTtsSpeaker(
     var availableVoiceNames: List<String> = emptyList()
         private set
 
+    override val availableVoices: List<String>
+        get() = availableVoiceNames
+
     private fun getOrCreateClientWithError(): Pair<SpeechSynthesizer?, String?> = synchronized(clientLock) {
         if (closed) return null to "client closed"
         synthesizer?.let { return it to null }

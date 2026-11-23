@@ -37,6 +37,7 @@ import com.openchamber.ptt.storage.ServerVoiceOverride
 import com.openchamber.ptt.storage.StagedDraft
 import com.openchamber.ptt.storage.TokenStore
 import com.openchamber.ptt.storage.toServerCloudOverride
+import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.MlKitTtsSpeaker
 import com.openchamber.ptt.tts.MlKitTtsVoiceSummary
 import com.openchamber.ptt.tts.SpokenDetailLevel
@@ -144,6 +145,8 @@ internal class VoiceCockpitState(
         private set
     var quickTranscriptCleanup by mutableStateOf(tokenStore.getEffectiveQuickTranscriptCleanup())
         private set
+    var audioCueMode by mutableStateOf(tokenStore.getEffectiveAudioCueMode())
+        private set
 
     var mlKitTtsStatus by mutableStateOf<MlKitStatusReport?>(null)
         private set
@@ -249,6 +252,7 @@ internal class VoiceCockpitState(
         sttFallbackToParakeet = tokenStore.getEffectiveSttFallbackToParakeet(serverId)
         quickTurnDirectAnswer = tokenStore.getEffectiveQuickTurnDirectAnswer(serverId)
         quickTranscriptCleanup = tokenStore.getEffectiveQuickTranscriptCleanup(serverId)
+        audioCueMode = tokenStore.getEffectiveAudioCueMode(serverId)
     }
 
     fun syncServerStateFromStore() {
@@ -526,6 +530,7 @@ internal class VoiceCockpitState(
                     sttFallbackToParakeet = sttFallbackToParakeet,
                     quickTurnDirectAnswer = quickTurnDirectAnswer,
                     quickTranscriptCleanup = quickTranscriptCleanup,
+                    audioCueMode = audioCueMode,
                     agentRoleOverride = effectiveRoles.agent.toServerCloudOverride(),
                     operatorRoleOverride = effectiveRoles.operator.toServerCloudOverride(),
                     cueRoleOverride = effectiveRoles.cue.toServerCloudOverride(),
@@ -570,6 +575,12 @@ internal class VoiceCockpitState(
     fun toggleQuickTranscriptCleanup(enabled: Boolean) {
         quickTranscriptCleanup = enabled
         tokenStore.saveQuickTranscriptCleanup(enabled, customServerId)
+        syncServerStateFromStore()
+    }
+
+    fun selectAudioCueMode(mode: AudioCueMode) {
+        audioCueMode = mode
+        tokenStore.saveAudioCueMode(mode, customServerId)
         syncServerStateFromStore()
     }
 

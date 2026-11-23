@@ -1,6 +1,7 @@
 package com.openchamber.ptt.service
 
 import android.os.SystemClock
+import com.openchamber.ptt.audio.CueEvent
 import com.openchamber.ptt.logging.VoiceUxLogger
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.StagedDraft
@@ -44,6 +45,7 @@ internal data class TtsSpeakRequest(
     val inputModeOverride: TtsInputMode? = null,
     val kind: String = AgentTurnRunner.TTS_KIND_REPLY,
     val notifySpokenSummary: Boolean = true,
+    val isManualRead: Boolean = false,
 )
 
 internal class AgentTurnRunner(
@@ -107,6 +109,8 @@ internal class AgentTurnRunner(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val permissionAlertDelayMs: Long = PttForegroundService.PERMISSION_ALERT_DELAY_MS,
     private val eventStreamReadyTimeoutMs: Long = EVENT_STREAM_READY_TIMEOUT_MS,
+    private val onPlayCue: (CueEvent) -> Unit = {},
+    private val stillWorkingCueDelayMs: Long = DEFAULT_STILL_WORKING_DELAY_MS,
 ) {
     private val turnLock = Any()
     private var activeTurnJob: Job? = null
@@ -197,11 +201,13 @@ internal class AgentTurnRunner(
                         currentDetailLevel = tokenStore.getEffectiveSpokenDetailLevel(serverId),
                         currentInputMode = tokenStore.getEffectiveTtsInputMode(serverId),
                         allowDirectAnswer = allowDirectAnswer,
+                        currentCueMode = tokenStore.getEffectiveAudioCueMode(serverId),
                     )
                     when (decision) {
                         is VoiceControlDecision.LiveTuning -> {
                             decision.detailLevel?.let { tokenStore.saveSpokenDetailLevel(it, customServerId) }
                             decision.inputMode?.let { tokenStore.saveTtsInputMode(it, customServerId) }
+                            decision.cueMode?.let { tokenStore.saveAudioCueMode(it, customServerId) }
                             voiceUxLogger.log(
                                 category = VoiceUxLogger.CAT_TURN,
                                 event = "live_tuning",
@@ -209,6 +215,7 @@ internal class AgentTurnRunner(
                                 metrics = mapOf(
                                     "detailLevel" to decision.detailLevel?.name,
                                     "inputMode" to decision.inputMode?.name,
+                                    "cueMode" to decision.cueMode?.name,
                                 ),
                             )
                             updateStatusText(decision.confirmationSpeech)
@@ -376,6 +383,7 @@ internal class AgentTurnRunner(
 
                 var permissionDelayJob: Job? = null
                 var permissionTtsJob: Job? = null
+                var stillWorkingJob: Job? = null
                 try {
                     withTimeoutOrNull(eventStreamReadyTimeoutMs) {
                         wsReady.await()
@@ -399,9 +407,18 @@ internal class AgentTurnRunner(
                         voiceUxLogger.log(VoiceUxLogger.CAT_DRAFT, "committed", sessionKey)
                     }
 
+                    stillWorkingJob = launch(ioDispatcher) {
+                        delay(stillWorkingCueDelayMs)
+                        if (currentState() == PttState.WAITING_AGENT) {
+                            onPlayCue(CueEvent.STILL_WORKING)
+                        }
+                    }
+
                     for (turnEvent in turnEvents) {
                         when (turnEvent) {
                             is TurnEvent.PermissionAsked -> {
+                                stillWorkingJob?.cancel()
+                                stillWorkingJob = null
                                 permissionDelayJob?.cancel()
                                 permissionDelayJob = launch(ioDispatcher) {
                                     delay(permissionAlertDelayMs)
@@ -441,6 +458,8 @@ internal class AgentTurnRunner(
                             is TurnEvent.SyntheticArrived -> Unit
 
                             TurnEvent.Completed -> {
+                                stillWorkingJob?.cancel()
+                                stillWorkingJob = null
                                 permissionDelayJob?.cancel()
                                 permissionTtsJob?.cancel()
                                 onCancelPermissionAlertNotification()
@@ -539,6 +558,8 @@ internal class AgentTurnRunner(
                             }
 
                             is TurnEvent.Failed -> {
+                                stillWorkingJob?.cancel()
+                                stillWorkingJob = null
                                 permissionDelayJob?.cancel()
                                 permissionTtsJob?.cancel()
                                 onCancelPermissionAlertNotification()
@@ -553,6 +574,8 @@ internal class AgentTurnRunner(
                             }
 
                             is TurnEvent.Interrupted -> {
+                                stillWorkingJob?.cancel()
+                                stillWorkingJob = null
                                 permissionDelayJob?.cancel()
                                 permissionTtsJob?.cancel()
                                 onCancelPermissionAlertNotification()
@@ -573,6 +596,7 @@ internal class AgentTurnRunner(
                     }
                 } finally {
                     setActivePromptTurn(false)
+                    stillWorkingJob?.cancel()
                     permissionDelayJob?.cancel()
                     permissionTtsJob?.cancel()
                     eventCollectorJob.cancel()
@@ -725,6 +749,7 @@ internal class AgentTurnRunner(
                     pinnedSession = pinnedSession,
                     initialItems = initialItems,
                     drainTrailingAutoItems = (onSyncForManualReadAloud != null),
+                    isManualRead = true,
                 )
             } catch (ce: CancellationException) {
                 throw ce
@@ -779,6 +804,7 @@ internal class AgentTurnRunner(
         pinnedSession: PinnedSession,
         initialItems: List<AssistantResponseItem>,
         drainTrailingAutoItems: Boolean,
+        isManualRead: Boolean = false,
     ): Boolean {
         val sessionLabel = PttForegroundService.formatSpeechSessionLabel(pinnedSession)
         val attemptedIds = HashSet<String>()
@@ -809,6 +835,7 @@ internal class AgentTurnRunner(
                     sessionLabel = sessionLabel,
                     kind = TTS_KIND_REPLY,
                     notifySpokenSummary = true,
+                    isManualRead = isManualRead,
                 ),
             )
             if (currentState() != PttState.SPEAKING_TTS || !currentCoroutineContext().isActive) {
@@ -1183,5 +1210,6 @@ internal class AgentTurnRunner(
         internal const val TTS_KIND_PERMISSION = "permission_alert"
         internal const val TTS_KIND_CONTROL = "control_plane"
         internal const val EVENT_STREAM_READY_TIMEOUT_MS = 5_000L
+        internal const val DEFAULT_STILL_WORKING_DELAY_MS = 8_000L
     }
 }

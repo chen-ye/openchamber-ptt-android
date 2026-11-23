@@ -1,6 +1,7 @@
 package com.openchamber.ptt.storage
 
 import android.content.SharedPreferences
+import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.SttEngine
 import com.openchamber.ptt.tts.TtsEngine
@@ -559,6 +560,25 @@ class TokenStoreTest {
         val effBGlobalDevice = store.getEffectiveRoleVoiceProfiles(srvB.id)
         assertEquals("star08", effBGlobalDevice.operator.mlKitVoice)
         assertEquals("sys-z", effBGlobalDevice.cue.systemVoice)
+    }
+
+    @Test
+    fun `audioCueMode defaults to HYBRID and resolves global vs ServerVoiceOverride`() {
+        val store = TokenStore(InMemorySharedPreferences())
+        val srvA = store.upsertServer("http://srv-a:14096", label = "A", token = "tok_a")
+        val srvB = store.upsertServer("http://srv-b:14096", label = "B", token = "tok_b", makeActive = false)
+
+        assertEquals(AudioCueMode.HYBRID, store.getAudioCueMode())
+        assertEquals(AudioCueMode.HYBRID, store.getEffectiveAudioCueMode(srvA.id))
+
+        store.saveAudioCueMode(AudioCueMode.VOCAL)
+        assertEquals(AudioCueMode.VOCAL, store.getAudioCueMode())
+        assertEquals(AudioCueMode.VOCAL, store.getEffectiveAudioCueMode(srvA.id))
+        assertEquals(AudioCueMode.VOCAL, store.getEffectiveAudioCueMode(srvB.id))
+
+        store.saveAudioCueMode(AudioCueMode.TONES, customServerId = srvB.id)
+        assertEquals(AudioCueMode.VOCAL, store.getEffectiveAudioCueMode(srvA.id))
+        assertEquals(AudioCueMode.TONES, store.getEffectiveAudioCueMode(srvB.id))
     }
 
     private class InMemorySharedPreferences : SharedPreferences {

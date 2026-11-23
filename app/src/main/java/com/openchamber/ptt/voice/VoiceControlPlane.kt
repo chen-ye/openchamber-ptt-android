@@ -1,6 +1,7 @@
 package com.openchamber.ptt.voice
 
 import com.openchamber.ptt.network.OpenChamberHttp
+import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.TtsClient
 import com.openchamber.ptt.tts.TtsInputMode
@@ -46,6 +47,7 @@ sealed interface VoiceControlDecision {
     data class LiveTuning(
         val detailLevel: SpokenDetailLevel? = null,
         val inputMode: TtsInputMode? = null,
+        val cueMode: AudioCueMode? = null,
         val confirmationSpeech: String,
     ) : VoiceControlDecision
 }
@@ -80,6 +82,7 @@ class VoiceControlPlane(
         currentDetailLevel: SpokenDetailLevel,
         currentInputMode: TtsInputMode,
         allowDirectAnswer: Boolean = true,
+        currentCueMode: AudioCueMode = AudioCueMode.HYBRID,
     ): VoiceControlDecision {
         val cleanUtterance = utterance.trim()
         if (cleanUtterance.isEmpty()) return VoiceControlDecision.PassThrough
@@ -92,6 +95,7 @@ class VoiceControlPlane(
             currentDetailLevel = currentDetailLevel,
             currentInputMode = currentInputMode,
             allowDirectAnswer = allowDirectAnswer,
+            currentCueMode = currentCueMode,
         )
 
         return when (routeChoice.route) {
@@ -100,16 +104,25 @@ class VoiceControlPlane(
             VoiceRoute.LIVE_TUNING -> {
                 val targetDetail = routeChoice.detailLevel
                 val targetMode = routeChoice.inputMode
-                if (targetDetail == null && targetMode == null) {
+                val targetCueMode = routeChoice.cueMode
+                if (targetDetail == null && targetMode == null && targetCueMode == null) {
                     VoiceControlDecision.PassThrough
                 } else {
                     val parts = listOfNotNull(
                         targetMode?.let { "${it.title} mode" },
                         targetDetail?.let { "${it.title} detail" },
+                        targetCueMode?.let {
+                            when (it) {
+                                AudioCueMode.HYBRID -> "Hybrid cues"
+                                AudioCueMode.VOCAL -> "Vocal cues"
+                                AudioCueMode.TONES -> "Studio tones"
+                            }
+                        },
                     )
                     VoiceControlDecision.LiveTuning(
                         detailLevel = targetDetail,
                         inputMode = targetMode,
+                        cueMode = targetCueMode,
                         confirmationSpeech = "Switched to ${parts.joinToString(" and ")}.",
                     )
                 }
@@ -133,6 +146,7 @@ class VoiceControlPlane(
         val route: VoiceRoute,
         val detailLevel: SpokenDetailLevel? = null,
         val inputMode: TtsInputMode? = null,
+        val cueMode: AudioCueMode? = null,
     )
 
     internal data class FormattedReplyContext(
@@ -256,6 +270,7 @@ class VoiceControlPlane(
         currentDetailLevel: SpokenDetailLevel,
         currentInputMode: TtsInputMode,
         allowDirectAnswer: Boolean = true,
+        currentCueMode: AudioCueMode = AudioCueMode.HYBRID,
     ): RouteClassification {
         val baseUrl = OpenChamberHttp.normalizeBaseUrl(serverUrl)
         val hasLastReply = allowDirectAnswer && formattedContext?.hasLastReply == true
@@ -264,6 +279,7 @@ class VoiceControlPlane(
             put("user_utterance", JsonPrimitive(utterance))
             put("current_detail_level", JsonPrimitive(currentDetailLevel.name))
             put("current_input_mode", JsonPrimitive(currentInputMode.name))
+            put("current_cue_mode", JsonPrimitive(currentCueMode.name))
             if (allowDirectAnswer && formattedContext != null) {
                 put("has_pending_unread", JsonPrimitive(hasPendingUnread))
                 formattedContext.lastAssistantReply?.let { put("last_assistant_reply", JsonPrimitive(it)) }
@@ -274,13 +290,13 @@ class VoiceControlPlane(
         val questionsMap = buildMap<String, SystemOneQuestion> {
             val routeInstructions = if (allowDirectAnswer) {
                 "Route the user's spoken utterance. " +
-                    "Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed) or speech input mode (spoken/sanitized/raw). " +
+                    "Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed), speech input mode (spoken/sanitized/raw), or audio cue mode (hybrid/vocal/tones). " +
                     "Choose 'answer_directly' ONLY if (a) last_assistant_reply is present and completely answers a clarifying or follow-up question about the focused reply without needing new code edits, file reads, or tool execution, OR " +
                     "(b) pending_unread_replies is present and the user is explicitly asking about the unread queue or what else finished in the background, and pending_unread_replies answers it. " +
                     "Choose 'pass_through' for ambiguous status queries when has_pending_unread is true, or whenever codebase/tool access or action is needed."
             } else {
                 "Route the user's spoken utterance. " +
-                    "Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed) or speech input mode (spoken/sanitized/raw). " +
+                    "Choose 'live_tuning' ONLY if the user is explicitly asking to change spoken detail level (essentials/balanced/detailed), speech input mode (spoken/sanitized/raw), or audio cue mode (hybrid/vocal/tones). " +
                     "For everything else, choose 'pass_through'."
             }
             val routeCriteria = buildMap {
@@ -300,7 +316,7 @@ class VoiceControlPlane(
                 }
                 put(
                     "live_tuning",
-                    "An explicit request to change spoken detail level (essentials, balanced, detailed) or speech input mode (spoken, sanitized, raw).",
+                    "An explicit request to change spoken detail level (essentials, balanced, detailed), speech input mode (spoken, sanitized, raw), or audio cue mode (hybrid, vocal cues, studio tones).",
                 )
             }
             put(
@@ -334,6 +350,19 @@ class VoiceControlPlane(
                         "sanitized" to "User wants sanitized speech input mode.",
                         "raw" to "User wants raw/verbatim speech input mode.",
                         "none" to "Not changing speech input mode.",
+                    ),
+                ),
+            )
+            put(
+                "tuning_cues",
+                SystemOneQuestion(
+                    type = "choice",
+                    instructions = "If route is live_tuning and the user requested an audio cue mode, pick it; otherwise pick none.",
+                    criteria = mapOf(
+                        "hybrid" to "User wants hybrid cues (crisp tones for button taps, spoken cues for latency and errors).",
+                        "vocal" to "User wants vocal cues or spoken status updates.",
+                        "tones" to "User wants studio tones or non-verbal earcons only.",
+                        "none" to "Not changing audio cue mode.",
                     ),
                 ),
             )
@@ -374,6 +403,7 @@ class VoiceControlPlane(
             val routeChoice = answers["route"]?.jsonObject?.get("choice")?.jsonPrimitive?.contentOrNull
             val detailChoice = answers["tuning_detail"]?.jsonObject?.get("choice")?.jsonPrimitive?.contentOrNull
             val modeChoice = answers["tuning_mode"]?.jsonObject?.get("choice")?.jsonPrimitive?.contentOrNull
+            val cuesChoice = answers["tuning_cues"]?.jsonObject?.get("choice")?.jsonPrimitive?.contentOrNull
 
             when (routeChoice) {
                 "answer_directly" -> if (allowDirectAnswer && (hasLastReply || hasPendingUnread)) {
@@ -394,10 +424,17 @@ class VoiceControlPlane(
                         "raw" -> TtsInputMode.RAW
                         else -> null
                     }
+                    val cueMode = when (cuesChoice) {
+                        "hybrid" -> AudioCueMode.HYBRID
+                        "vocal" -> AudioCueMode.VOCAL
+                        "tones" -> AudioCueMode.TONES
+                        else -> null
+                    }
                     RouteClassification(
                         route = VoiceRoute.LIVE_TUNING,
                         detailLevel = level,
                         inputMode = mode,
+                        cueMode = cueMode,
                     )
                 }
                 else -> RouteClassification(VoiceRoute.PASS_THROUGH)

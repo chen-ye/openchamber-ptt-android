@@ -1,6 +1,6 @@
 package com.openchamber.ptt.service
 
-import com.openchamber.ptt.audio.Earcon
+import com.openchamber.ptt.audio.CueEvent
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,7 +59,7 @@ sealed interface PttEvent {
 }
 
 sealed interface PttEffect {
-    data class PlayEarcon(val earcon: Earcon) : PttEffect
+    data class PlayCue(val cue: CueEvent) : PttEffect
     data object AcquireWakeAndWifiLocks : PttEffect
     data object ReleaseWakeAndWifiLocks : PttEffect
     data object PinBluetoothAudio : PttEffect
@@ -238,7 +238,9 @@ class PttStateMachine(
             PttState.PERMISSION_BLOCKED,
             -> {
                 val target = if (event.hasPersistedDraft) PttState.STAGED_DRAFT else PttState.ARMED_IDLE
-                target to listOf(PttEffect.PlayEarcon(Earcon.ARMED))
+                target to listOf(
+                    PttEffect.PlayCue(if (event.hasPersistedDraft) CueEvent.ARMED_WITH_DRAFT else CueEvent.ARMED),
+                )
             }
 
             else -> current to emptyList()
@@ -254,7 +256,7 @@ class PttStateMachine(
                 if (current == PttState.SEND_GRACE) add(PttEffect.CancelSendGraceTimer)
                 add(PttEffect.ReleaseWakeAndWifiLocks)
                 add(PttEffect.ReleaseBluetoothAudio)
-                add(PttEffect.PlayEarcon(Earcon.DISARMED))
+                add(PttEffect.PlayCue(CueEvent.DISARMED))
             }
         }
 
@@ -264,7 +266,7 @@ class PttStateMachine(
             -> PttState.RECORDING to listOf(
                 PttEffect.PinBluetoothAudio,
                 PttEffect.AcquireWakeAndWifiLocks,
-                PttEffect.PlayEarcon(Earcon.REC_START),
+                PttEffect.PlayCue(CueEvent.REC_START),
                 PttEffect.StartRecording,
             )
 
@@ -272,12 +274,13 @@ class PttStateMachine(
                 PttState.TRANSCRIBING_STAGE to listOf(
                     PttEffect.StopRecording,
                     PttEffect.ReleaseBluetoothAudio,
-                    PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
+                    PttEffect.PlayCue(CueEvent.STAGE_APPENDING),
                 )
             } else {
                 PttState.TRANSCRIBING_SEND to listOf(
                     PttEffect.StopRecording,
                     PttEffect.ReleaseBluetoothAudio,
+                    PttEffect.PlayCue(CueEvent.QUICK_STOP_ACK),
                 )
             }
 
@@ -285,7 +288,7 @@ class PttStateMachine(
                 PttEffect.CancelSendGraceTimer,
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.UNDO),
+                PttEffect.PlayCue(CueEvent.UNDO_TO_DRAFT),
             )
 
             PttState.STAGED_DRAFT_SPEAKING -> PttState.STAGED_DRAFT to listOf(
@@ -319,20 +322,20 @@ class PttStateMachine(
             PttState.RECORDING -> PttState.TRANSCRIBING_STAGE to listOf(
                 PttEffect.StopRecording,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
+                PttEffect.PlayCue(if (hasDraft) CueEvent.STAGE_APPENDING else CueEvent.STAGE_ORGANIZING),
             )
 
             PttState.SEND_GRACE -> PttState.STAGED_DRAFT to listOf(
                 PttEffect.CancelSendGraceTimer,
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.UNDO),
+                PttEffect.PlayCue(CueEvent.UNDO_TO_DRAFT),
             )
 
             PttState.STAGED_DRAFT -> PttState.WAITING_AGENT to listOf(
                 PttEffect.AcquireWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.REC_SENT),
+                PttEffect.PlayCue(CueEvent.PROMPT_SENT),
                 PttEffect.DispatchPrompt(fromStagedDraft = true),
             )
 
@@ -340,7 +343,7 @@ class PttStateMachine(
                 PttEffect.StopTts,
                 PttEffect.AcquireWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.REC_SENT),
+                PttEffect.PlayCue(CueEvent.PROMPT_SENT),
                 PttEffect.DispatchPrompt(fromStagedDraft = true),
             )
 
@@ -355,7 +358,7 @@ class PttStateMachine(
                 PttEffect.DiscardRecording,
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.CANCEL_DISCARD),
+                PttEffect.PlayCue(CueEvent.CANCEL_DISCARD),
             )
 
             PttState.SEND_GRACE -> idleState() to listOf(
@@ -363,14 +366,14 @@ class PttStateMachine(
                 PttEffect.DiscardRecording,
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.CANCEL_DISCARD),
+                PttEffect.PlayCue(CueEvent.CANCEL_DISCARD),
             )
 
             PttState.STAGED_DRAFT -> PttState.ARMED_IDLE to listOf(
                 PttEffect.ClearDraft,
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.CANCEL_DISCARD),
+                PttEffect.PlayCue(CueEvent.CANCEL_DISCARD),
             )
 
             PttState.STAGED_DRAFT_SPEAKING -> PttState.ARMED_IDLE to listOf(
@@ -378,7 +381,7 @@ class PttStateMachine(
                 PttEffect.ClearDraft,
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.CANCEL_DISCARD),
+                PttEffect.PlayCue(CueEvent.CANCEL_DISCARD),
             )
 
             else -> current to emptyList()
@@ -388,7 +391,7 @@ class PttStateMachine(
             PttState.RECORDING -> PttState.TRANSCRIBING_STAGE to listOf(
                 PttEffect.StopRecording,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
+                PttEffect.PlayCue(if (hasDraft) CueEvent.STAGE_APPENDING else CueEvent.STAGE_ORGANIZING),
             )
             else -> current to emptyList()
         }
@@ -397,7 +400,7 @@ class PttStateMachine(
             PttState.STAGED_DRAFT -> PttState.WAITING_AGENT to listOf(
                 PttEffect.AcquireWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.REC_SENT),
+                PttEffect.PlayCue(CueEvent.PROMPT_SENT),
                 PttEffect.DispatchPrompt(fromStagedDraft = true),
             )
 
@@ -405,7 +408,7 @@ class PttStateMachine(
                 PttEffect.StopTts,
                 PttEffect.AcquireWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.REC_SENT),
+                PttEffect.PlayCue(CueEvent.PROMPT_SENT),
                 PttEffect.DispatchPrompt(fromStagedDraft = true),
             )
 
@@ -417,7 +420,7 @@ class PttStateMachine(
                 PttEffect.CancelSendGraceTimer,
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.UNDO),
+                PttEffect.PlayCue(CueEvent.UNDO_TO_DRAFT),
             )
             else -> current to emptyList()
         }
@@ -426,7 +429,7 @@ class PttStateMachine(
             PttState.SEND_GRACE -> PttState.WAITING_AGENT to listOf(
                 PttEffect.AcquireWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.REC_SENT),
+                PttEffect.PlayCue(CueEvent.PROMPT_SENT),
                 PttEffect.DispatchPrompt(fromStagedDraft = false),
             )
             else -> current to emptyList()
@@ -461,10 +464,11 @@ class PttStateMachine(
                     idleState() to listOf(
                         PttEffect.ReleaseWakeAndWifiLocks,
                         PttEffect.ReleaseBluetoothAudio,
+                        PttEffect.PlayCue(CueEvent.EMPTY_SPEECH),
                     )
                 } else {
                     PttState.SEND_GRACE to listOf(
-                        PttEffect.PlayEarcon(Earcon.SEND_GRACE),
+                        PttEffect.PlayCue(CueEvent.SEND_GRACE),
                         PttEffect.StartSendGraceTimer,
                     )
                 }
@@ -476,6 +480,7 @@ class PttStateMachine(
                     idleState() to listOf(
                         PttEffect.ReleaseWakeAndWifiLocks,
                         PttEffect.ReleaseBluetoothAudio,
+                        PttEffect.PlayCue(CueEvent.EMPTY_SPEECH),
                     )
                 } else {
                     PttState.TRANSCRIBING_STAGE to listOf(
@@ -503,13 +508,13 @@ class PttStateMachine(
                     PttState.SPEAKING_TTS to listOf(
                         PttEffect.PinBluetoothAudio,
                         PttEffect.AcquireWakeAndWifiLocks,
-                        PttEffect.PlayEarcon(Earcon.TURN_COMPLETE),
+                        PttEffect.PlayCue(CueEvent.TURN_COMPLETE),
                     )
                 } else {
                     idleState() to listOf(
                         PttEffect.ReleaseWakeAndWifiLocks,
                         PttEffect.ReleaseBluetoothAudio,
-                        PttEffect.PlayEarcon(Earcon.TURN_COMPLETE),
+                        PttEffect.PlayCue(CueEvent.TURN_COMPLETE_NO_TTS),
                     )
                 }
             }
@@ -522,7 +527,7 @@ class PttStateMachine(
             -> idleState() to listOf(
                 PttEffect.ReleaseWakeAndWifiLocks,
                 PttEffect.ReleaseBluetoothAudio,
-                PttEffect.PlayEarcon(Earcon.TURN_INTERRUPTED),
+                PttEffect.PlayCue(CueEvent.TURN_INTERRUPTED),
             )
             else -> current to emptyList()
         }
@@ -545,7 +550,7 @@ class PttStateMachine(
                 }
                 add(PttEffect.ReleaseWakeAndWifiLocks)
                 add(PttEffect.ReleaseBluetoothAudio)
-                add(PttEffect.PlayEarcon(Earcon.PERMISSION_NEEDED))
+                add(PttEffect.PlayCue(CueEvent.PERMISSION_NEEDED))
             }
 
             PttState.DISARMED,
@@ -579,7 +584,7 @@ class PttStateMachine(
             -> PttState.SPEAKING_TTS to listOf(
                 PttEffect.PinBluetoothAudio,
                 PttEffect.AcquireWakeAndWifiLocks,
-                PttEffect.PlayEarcon(Earcon.TURN_COMPLETE),
+                PttEffect.PlayCue(CueEvent.TURN_COMPLETE),
                 PttEffect.SpeakPendingReplies,
             )
             else -> current to emptyList()
@@ -605,7 +610,7 @@ class PttStateMachine(
                     PttEffect.StopTts,
                     PttEffect.ReleaseWakeAndWifiLocks,
                     PttEffect.ReleaseBluetoothAudio,
-                    PttEffect.PlayEarcon(if (event.isAuthExpired) Earcon.AUTH_EXPIRED else Earcon.ERROR),
+                    PttEffect.PlayCue(if (event.isAuthExpired) CueEvent.AUTH_EXPIRED else CueEvent.ERROR),
                 )
             }
             else -> PttState.ERROR to buildList {
@@ -616,7 +621,7 @@ class PttStateMachine(
                 }
                 add(PttEffect.ReleaseWakeAndWifiLocks)
                 add(PttEffect.ReleaseBluetoothAudio)
-                add(PttEffect.PlayEarcon(if (event.isAuthExpired) Earcon.AUTH_EXPIRED else Earcon.ERROR))
+                add(PttEffect.PlayCue(if (event.isAuthExpired) CueEvent.AUTH_EXPIRED else CueEvent.ERROR))
             }
         }
     }

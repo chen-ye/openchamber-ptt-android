@@ -1,12 +1,14 @@
 package com.openchamber.ptt.service
 
 import android.content.SharedPreferences
+import com.openchamber.ptt.audio.CueEvent
 import com.openchamber.ptt.logging.VoiceUxLogger
 import com.openchamber.ptt.network.OpenChamberHttp
 import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.SessionReplyCursor
 import com.openchamber.ptt.storage.StagedDraft
 import com.openchamber.ptt.storage.TokenStore
+import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.TtsInputMode
 import com.openchamber.ptt.tts.VoiceRole
@@ -15,13 +17,17 @@ import com.openchamber.ptt.voice.EventStreamClient
 import com.openchamber.ptt.voice.PromptOrganizer
 import com.openchamber.ptt.voice.SessionClient
 import com.openchamber.ptt.voice.SessionTurnProjection
+import com.openchamber.ptt.voice.TurnEvent
 import com.openchamber.ptt.voice.UnreadReplyPreview
 import com.openchamber.ptt.voice.VoiceControlPlane
 import com.openchamber.ptt.voice.VoiceReplyContext
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.booleanOrNull
@@ -131,6 +137,10 @@ class AgentTurnRunnerTest {
         wireController: Boolean = false,
         onFinishedLatch: CountDownLatch? = null,
         speakHook: suspend (TtsSpeakRequest) -> Unit = {},
+        ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        onPlayCue: (CueEvent) -> Unit = {},
+        stillWorkingCueDelayMs: Long = AgentTurnRunner.DEFAULT_STILL_WORKING_DELAY_MS,
+        observeTurnEventsOverride: ((String, String, () -> Unit) -> kotlinx.coroutines.flow.Flow<TurnEvent>)? = null,
     ): Harness {
         val store = TokenStore(InMemoryPrefs())
         val srv = store.upsertServer(baseUrl, label = "Local", token = "tok_primary", makeActive = true)
@@ -223,7 +233,7 @@ class AgentTurnRunnerTest {
             },
             onPostPermissionAlertNotification = { tool -> postedAlerts += tool },
             onCancelPermissionAlertNotification = { cancelAlertCount.incrementAndGet() },
-            observeTurnEvents = if (controller != null) {
+            observeTurnEvents = observeTurnEventsOverride ?: if (controller != null) {
                 controller::observeEventsForActiveTurn
             } else {
                 { url, sid, ready ->
@@ -278,8 +288,11 @@ class AgentTurnRunnerTest {
             markItemHeard = { item -> controller?.markItemHeard(item) },
             setSpeakingMessage = { id -> controller?.setSpeakingMessage(id) },
             clockElapsedMs = { System.currentTimeMillis() },
+            ioDispatcher = ioDispatcher,
             permissionAlertDelayMs = permissionAlertDelayMs,
             eventStreamReadyTimeoutMs = 2_000L,
+            onPlayCue = onPlayCue,
+            stillWorkingCueDelayMs = stillWorkingCueDelayMs,
         )
 
         harness = Harness(
@@ -677,6 +690,7 @@ class AgentTurnRunnerTest {
 
                 assertEquals(listOf("First part.", "Second part."), harness.speakRequests.map { it.text })
                 assertEquals(AgentTurnRunner.TTS_KIND_REPLY, harness.speakRequests[0].kind)
+                assertTrue(harness.speakRequests[0].isManualRead)
                 assertTrue(harness.speakRequests.all { it.role == VoiceRole.AGENT })
                 assertTrue(harness.speakRequests[0].notifySpokenSummary)
                 assertEquals("Payments", harness.speakRequests[0].sessionLabel)
@@ -999,6 +1013,157 @@ class AgentTurnRunnerTest {
                 assertEquals("maybe check foo_bar.kt --no-verify please", harness.pendingQuickTranscript)
                 assertEquals("maybe check foo_bar.kt --no-verify please", harness.lastTranscript)
                 assertEquals(PttState.SEND_GRACE, harness.stateMachine.currentState)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `LiveTuning persists audioCueMode in TokenStore`() = runBlocking {
+        val liveCueInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"live_tuning"},"tuning_detail":{"choice":"none"},"tuning_mode":{"choice":"none"},"tuning_cues":{"choice":"vocal"}}}"""
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/api/guests/gemini-decisions-bridge/service/request" ->
+                    MockResponse().setResponseCode(200)
+                        .setBody("""{"status":200,"body":"${liveCueInner.replace("\"", "\\\"")}"}""")
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val baseUrl = server.url("/").toString().trimEnd('/')
+            val doneLatch = CountDownLatch(1)
+            val harness = createHarness(
+                scope = scope,
+                baseUrl = baseUrl,
+                initialState = PttState.WAITING_AGENT,
+                onFinishedLatch = doneLatch,
+            )
+            assertEquals(AudioCueMode.HYBRID, harness.store.getEffectiveAudioCueMode(harness.serverId))
+            harness.pendingQuickTranscript = "Turn on vocal cues"
+
+            harness.runner.dispatchPrompt(fromStagedDraft = false)
+            assertTrue(doneLatch.await(3, TimeUnit.SECONDS))
+
+            assertEquals(AudioCueMode.VOCAL, harness.store.getEffectiveAudioCueMode(harness.serverId))
+            assertEquals("Switched to Vocal cues.", harness.speakRequests.single().text)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `runAgentTurn emits STILL_WORKING cue once after delay and cancels on early permission or completion`() =
+        runBlocking {
+            val eventsFlow = MutableSharedFlow<TurnEvent>(extraBufferCapacity = 8)
+            val playedCues = CopyOnWriteArrayList<CueEvent>()
+            val stillWorkingLatch = CountDownLatch(1)
+            val promptSentLatch = AtomicReference(CountDownLatch(1))
+            val replyReadCount = AtomicInteger(0)
+            val messagesPath = "/api/session/ses_1/message?limit=${SessionClient.DEFAULT_PAGE_LIMIT}"
+
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                    messagesPath -> {
+                        if (replyReadCount.getAndIncrement() == 0) {
+                            MockResponse().setResponseCode(200)
+                                .setBody("""{"data":[{"id":"msg_old","type":"assistant","time":{"created":100,"completed":150},"content":[{"type":"text","text":"old"}]}],"cursor":{}}""")
+                        } else {
+                            MockResponse().setResponseCode(200)
+                                .setBody(
+                                    """
+                                    {
+                                      "data": [
+                                        {"id":"idle_1","type":"idle","outcome":"succeeded","time":{"created":300}},
+                                        {"id":"msg_new","type":"assistant","finish":"stop","time":{"created":200,"completed":250},"content":[{"type":"text","text":"Done."}]},
+                                        {"id":"msg_u1","type":"user","time":{"created":180},"text":"[voice]\nRun slow build"},
+                                        {"id":"msg_old","type":"assistant","time":{"created":100,"completed":150},"content":[{"type":"text","text":"old"}]}
+                                      ],
+                                      "cursor":{}
+                                    }
+                                    """.trimIndent(),
+                                )
+                        }
+                    }
+                    "/api/session/ses_1/prompt" -> {
+                        promptSentLatch.get().countDown()
+                        MockResponse().setResponseCode(200).setBody("""{"id":"msg_u1"}""")
+                    }
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                val done1 = CountDownLatch(1)
+                val harness = createHarness(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    initialState = PttState.WAITING_AGENT,
+                    onFinishedLatch = done1,
+                    onPlayCue = { cue ->
+                        playedCues += cue
+                        if (cue == CueEvent.STILL_WORKING) {
+                            stillWorkingLatch.countDown()
+                        }
+                    },
+                    stillWorkingCueDelayMs = 80L,
+                    observeTurnEventsOverride = { _, _, onReady ->
+                        onReady()
+                        eventsFlow
+                    },
+                )
+
+                // 1. Slow turn -> STILL_WORKING fires once
+                val turn1Job = scope.launch {
+                    harness.runner.runAgentTurn(
+                        serverId = harness.serverId,
+                        serverUrl = baseUrl,
+                        pinnedSession = PinnedSession("ses_1", "/proj", "Payments"),
+                        promptText = "Run slow build",
+                        fromStagedDraft = false,
+                    )
+                }
+                assertTrue(promptSentLatch.get().await(2, TimeUnit.SECONDS))
+                assertTrue(stillWorkingLatch.await(2, TimeUnit.SECONDS))
+                assertEquals(listOf(CueEvent.STILL_WORKING), playedCues.toList())
+
+                eventsFlow.emit(TurnEvent.Completed)
+                turn1Job.join()
+                assertTrue(done1.await(2, TimeUnit.SECONDS))
+                assertEquals(listOf(CueEvent.STILL_WORKING), playedCues.toList())
+                assertFalse(harness.speakRequests.last().isManualRead)
+
+                // 2. PermissionAsked before delay cancels stillWorkingJob
+                playedCues.clear()
+                replyReadCount.set(0)
+                promptSentLatch.set(CountDownLatch(1))
+                val sm2 = harness.stateMachine
+                sm2.dispatch(PttEvent.Arm())
+                sm2.dispatch(PttEvent.SingleTap)
+                sm2.dispatch(PttEvent.SingleTap)
+                sm2.dispatch(PttEvent.TranscriptReady("run check"))
+                sm2.dispatch(PttEvent.GraceTimerExpired)
+                assertEquals(PttState.WAITING_AGENT, sm2.currentState)
+
+                val turn2Job = scope.launch {
+                    harness.runner.runAgentTurn(
+                        serverId = harness.serverId,
+                        serverUrl = baseUrl,
+                        pinnedSession = PinnedSession("ses_1", "/proj", "Payments"),
+                        promptText = "Run quick permission check",
+                        fromStagedDraft = false,
+                    )
+                }
+                assertTrue(promptSentLatch.get().await(2, TimeUnit.SECONDS))
+                eventsFlow.emit(TurnEvent.PermissionAsked("bash"))
+                kotlinx.coroutines.delay(140L)
+                assertTrue(CueEvent.STILL_WORKING !in playedCues)
+
+                eventsFlow.emit(TurnEvent.Interrupted("cancelled"))
+                turn2Job.join()
             } finally {
                 scope.cancel()
             }

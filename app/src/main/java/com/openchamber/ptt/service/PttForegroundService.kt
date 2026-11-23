@@ -26,9 +26,12 @@ import androidx.core.content.IntentCompat
 import androidx.media.session.MediaButtonReceiver
 import com.openchamber.ptt.audio.AudioOutputCoordinator
 import com.openchamber.ptt.audio.BluetoothAudioRouter
-import com.openchamber.ptt.audio.Earcon
+import com.openchamber.ptt.audio.CueEvent
+import com.openchamber.ptt.audio.CuePackWarmState
+import com.openchamber.ptt.audio.CuePlayer
 import com.openchamber.ptt.audio.EarconPlayer
 import com.openchamber.ptt.audio.ScoDropEvent
+import com.openchamber.ptt.audio.VocalCuePackWarmer
 import com.openchamber.ptt.bubble.BubbleHelper
 import com.openchamber.ptt.logging.VoiceUxLogger
 import com.openchamber.ptt.logging.VoiceUxSummary
@@ -108,6 +111,8 @@ class PttForegroundService : Service() {
     val transitions: SharedFlow<PttTransition> = _transitions.asSharedFlow()
     val responseFeed: StateFlow<ResponseFeedState>
         get() = sessionResponseController.feedState
+    val cuePackWarmState: StateFlow<CuePackWarmState>
+        get() = vocalCuePackWarmer.state
 
     var pinBluetoothSco: Boolean
         get() = _pinBluetoothSco.value
@@ -117,6 +122,8 @@ class PttForegroundService : Service() {
 
     private lateinit var audioOutputCoordinator: AudioOutputCoordinator
     private lateinit var earconPlayer: EarconPlayer
+    private lateinit var vocalCuePackWarmer: VocalCuePackWarmer
+    private lateinit var cuePlayer: CuePlayer
     private lateinit var bluetoothAudioRouter: BluetoothAudioRouter
     private lateinit var gestureDetector: MediaButtonGestureDetector
     private var mediaSession: MediaSessionCompat? = null
@@ -219,6 +226,49 @@ class PttForegroundService : Service() {
                     ),
                 )
             },
+            onLatencyBridgeNeeded = { bridgeKind ->
+                if (::cuePlayer.isInitialized) {
+                    cuePlayer.play(
+                        if (bridgeKind == TtsPlayer.BRIDGE_KIND_MANUAL_REPLY) {
+                            CueEvent.READING_REPLY
+                        } else {
+                            CueEvent.REPLY_PREPARING
+                        },
+                    )
+                }
+            },
+        )
+
+        vocalCuePackWarmer = VocalCuePackWarmer(
+            scope = serviceScope,
+            ttsClient = ttsClient,
+            ttsCache = ttsCache,
+            serverUrlProvider = { tokenStore.getServerUrl() },
+            cueModeProvider = { tokenStore.getEffectiveAudioCueMode() },
+            pipelineProvider = { tokenStore.getEffectiveTtsPipeline() },
+            roleProfilesProvider = { tokenStore.getEffectiveRoleVoiceProfiles() },
+            availableMlKitVoicesProvider = { ttsPlayer.mlKitTtsSpeaker?.availableVoices.orEmpty() },
+            availableSystemVoicesProvider = { ttsPlayer.systemTtsSpeaker.availableVoices },
+            voiceUxLogger = voiceUxLogger,
+        )
+
+        cuePlayer = CuePlayer(
+            scope = serviceScope,
+            earconPlayer = earconPlayer,
+            ttsCache = ttsCache,
+            warmer = vocalCuePackWarmer,
+            serverUrlProvider = { tokenStore.getServerUrl() },
+            cueModeProvider = { tokenStore.getEffectiveAudioCueMode() },
+            pipelineProvider = { tokenStore.getEffectiveTtsPipeline() },
+            roleProfilesProvider = { tokenStore.getEffectiveRoleVoiceProfiles() },
+            availableMlKitVoicesProvider = { ttsPlayer.mlKitTtsSpeaker?.availableVoices.orEmpty() },
+            availableSystemVoicesProvider = { ttsPlayer.systemTtsSpeaker.availableVoices },
+            useCommunicationUsage = { bluetoothAudioRouter.isScoPinned },
+            isTtsSpeakingProvider = { ttsPlayer.isSpeaking },
+            mlKitTtsSpeaker = ttsPlayer.mlKitTtsSpeaker,
+            systemTtsSpeaker = ttsPlayer.systemTtsSpeaker,
+            voiceUxLogger = voiceUxLogger,
+            sessionKeyProvider = { activeSessionKey() },
         )
 
         audioBurstRecorder = AudioBurstRecorder(
@@ -233,7 +283,7 @@ class PttForegroundService : Service() {
             pinBluetoothScoProvider = { pinBluetoothSco },
             sttEngineProvider = { tokenStore.getEffectiveSttEngine() },
             sttFallbackToParakeetProvider = { tokenStore.getEffectiveSttFallbackToParakeet() },
-            onPlayWarningCue = { earconPlayer.play(Earcon.STAGED_PAUSE) },
+            onPlayWarningCue = { cuePlayer.play(CueEvent.MAX_DURATION_WARNING) },
             onMaxCapAutoStage = { stageOnMaxCap() },
             onPartialTranscript = { partial -> _lastTranscript.value = partial },
             onStatusUpdate = { msg -> _statusText.value = msg },
@@ -267,19 +317,38 @@ class PttForegroundService : Service() {
         var lastEffectiveServerId = tokenStore.getActiveServer()?.id
         var lastEffectiveInputMode = tokenStore.getEffectiveTtsInputMode(lastEffectiveServerId)
         var lastEffectiveDetailLevel = tokenStore.getEffectiveSpokenDetailLevel(lastEffectiveServerId)
+        var lastEffectiveCueMode = tokenStore.getEffectiveAudioCueMode(lastEffectiveServerId)
+        var lastEffectivePipeline = tokenStore.getEffectiveTtsPipeline(lastEffectiveServerId)
+        var lastEffectiveRoles = tokenStore.getEffectiveRoleVoiceProfiles(lastEffectiveServerId)
         serviceScope.launch {
             tokenStore.changes.collect {
                 val curServerId = tokenStore.getActiveServer()?.id
                 val curMode = tokenStore.getEffectiveTtsInputMode(curServerId)
                 val curDetail = tokenStore.getEffectiveSpokenDetailLevel(curServerId)
-                if (curServerId != lastEffectiveServerId ||
+                val curCueMode = tokenStore.getEffectiveAudioCueMode(curServerId)
+                val curPipeline = tokenStore.getEffectiveTtsPipeline(curServerId)
+                val curRoles = tokenStore.getEffectiveRoleVoiceProfiles(curServerId)
+                val serverChanged = curServerId != lastEffectiveServerId
+                val summaryConfigChanged = serverChanged ||
                     curMode != lastEffectiveInputMode ||
                     curDetail != lastEffectiveDetailLevel
-                ) {
-                    lastEffectiveServerId = curServerId
-                    lastEffectiveInputMode = curMode
-                    lastEffectiveDetailLevel = curDetail
+                val cueConfigChanged = serverChanged ||
+                    curCueMode != lastEffectiveCueMode ||
+                    curPipeline != lastEffectivePipeline ||
+                    curRoles != lastEffectiveRoles
+
+                lastEffectiveServerId = curServerId
+                lastEffectiveInputMode = curMode
+                lastEffectiveDetailLevel = curDetail
+                lastEffectiveCueMode = curCueMode
+                lastEffectivePipeline = curPipeline
+                lastEffectiveRoles = curRoles
+
+                if (summaryConfigChanged) {
                     sessionResponseController.refreshFocusedSpokenSummaryFromCache()
+                }
+                if (cueConfigChanged) {
+                    vocalCuePackWarmer.ensureWarmedAsync()
                 }
             }
         }
@@ -301,6 +370,7 @@ class PttForegroundService : Service() {
                     inputModeOverride = req.inputModeOverride,
                     kind = req.kind,
                     notifySpokenSummary = req.notifySpokenSummary,
+                    isManualRead = req.isManualRead,
                 )
             },
             currentState = { stateMachine.currentState },
@@ -356,6 +426,11 @@ class PttForegroundService : Service() {
             setSpeakingMessage = { msgId ->
                 activeSpokenMessageId = msgId
                 sessionResponseController.setSpeakingMessage(msgId)
+            },
+            onPlayCue = { cue ->
+                if (::cuePlayer.isInitialized) {
+                    cuePlayer.play(cue)
+                }
             },
         )
 
@@ -486,6 +561,9 @@ class PttForegroundService : Service() {
             bluetoothAudioRouter.stopMonitoring()
             bluetoothAudioRouter.release()
         }
+        if (::cuePlayer.isInitialized) {
+            cuePlayer.release()
+        }
         if (::earconPlayer.isInitialized) {
             earconPlayer.release()
         }
@@ -514,7 +592,7 @@ class PttForegroundService : Service() {
         if (validationError != null) {
             _lastError.value = validationError
             _statusText.value = validationError
-            earconPlayer.play(Earcon.ERROR)
+            cuePlayer.play(CueEvent.ERROR)
             return false
         }
         promotedForStandaloneTts = false
@@ -539,6 +617,7 @@ class PttForegroundService : Service() {
                 runCatching { startForegroundWithState(transition.current) }
             }
             sessionResponseController.setArmed(true)
+            vocalCuePackWarmer.ensureWarmedAsync()
             if (transition.changed) {
                 sessionResponseController.requestBackgroundSync(
                     reason = "arm",
@@ -637,7 +716,7 @@ class PttForegroundService : Service() {
             voiceUxLogger.log(VoiceUxLogger.CAT_DRAFT, "discarded", key)
         }
         _stagedDraft.value = null
-        earconPlayer.play(Earcon.CANCEL_DISCARD)
+        cuePlayer.play(CueEvent.CANCEL_DISCARD)
         dispatch(PttEvent.SyncDraftPresence(hasPersistedDraft = false))
         syncActiveBubble()
     }
@@ -711,7 +790,7 @@ class PttForegroundService : Service() {
         tokenStore.saveStagedDraft(reverted)
         _stagedDraft.value = reverted
         _lastTranscript.value = prevText
-        earconPlayer.play(Earcon.UNDO)
+        cuePlayer.play(CueEvent.UNDO_TO_DRAFT)
         voiceUxLogger.log(VoiceUxLogger.CAT_DRAFT, "reverted", key)
         syncActiveBubble()
     }
@@ -834,7 +913,7 @@ class PttForegroundService : Service() {
         if (bound == null) {
             _lastError.value = "Connect to OpenChamber and select a session first"
             _statusText.value = _lastError.value.orEmpty()
-            earconPlayer.play(Earcon.ERROR)
+            cuePlayer.play(CueEvent.ERROR)
             return
         }
         if (::sessionResponseController.isInitialized) {
@@ -1096,14 +1175,16 @@ class PttForegroundService : Service() {
     private fun applyEffects(transition: PttTransition) {
         for (effect in transition.effects) {
             when (effect) {
-                is PttEffect.PlayEarcon -> earconPlayer.play(effect.earcon)
+                is PttEffect.PlayCue -> cuePlayer.play(effect.cue)
                 PttEffect.AcquireWakeAndWifiLocks -> acquireWakeAndWifiLocks()
                 PttEffect.ReleaseWakeAndWifiLocks -> releaseWakeAndWifiLocks()
                 PttEffect.PinBluetoothAudio -> bluetoothAudioRouter.configureForPtt(pinSco = pinBluetoothSco)
                 PttEffect.ReleaseBluetoothAudio -> bluetoothAudioRouter.release()
                 PttEffect.StartRecording -> {
-                    if (::earconPlayer.isInitialized) {
-                        earconPlayer.stopUnless(Earcon.REC_START)
+                    if (::cuePlayer.isInitialized) {
+                        cuePlayer.stopUnlessRecStart()
+                    } else if (::earconPlayer.isInitialized) {
+                        earconPlayer.stopUnless(com.openchamber.ptt.audio.Earcon.REC_START)
                     }
                     startBurstRecording()
                 }
@@ -1217,8 +1298,12 @@ class PttForegroundService : Service() {
             audioOutputCoordinator.stopAll(
                 earconPlayer = if (::earconPlayer.isInitialized) earconPlayer else null,
                 ttsPlayer = if (::ttsPlayer.isInitialized) ttsPlayer else null,
+                cuePlayer = if (::cuePlayer.isInitialized) cuePlayer else null,
             )
         } else {
+            if (::cuePlayer.isInitialized) {
+                cuePlayer.stop()
+            }
             if (::earconPlayer.isInitialized) {
                 earconPlayer.stop()
             }

@@ -87,7 +87,9 @@ class AudioOutputCoordinator(
     fun stopAll(
         earconPlayer: EarconPlayer? = null,
         ttsPlayer: TtsPlayer? = null,
+        cuePlayer: CuePlayer? = null,
     ) {
+        cuePlayer?.stop()
         earconPlayer?.stop()
         ttsPlayer?.stop()
         onCueStopped()

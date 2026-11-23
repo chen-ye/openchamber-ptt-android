@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.openchamber.ptt.network.OpenChamberHttp
+import com.openchamber.ptt.tts.AudioCueMode
 import com.openchamber.ptt.tts.RoleVoiceAssignment
 import com.openchamber.ptt.tts.RoleVoiceProfileMap
 import com.openchamber.ptt.tts.SpokenDetailLevel
@@ -69,6 +70,7 @@ data class ServerVoiceOverride(
     val sttFallbackToParakeet: Boolean? = null,
     val quickTurnDirectAnswer: Boolean? = null,
     val quickTranscriptCleanup: Boolean? = null,
+    val audioCueMode: AudioCueMode? = null,
     val agentRoleOverride: ServerRoleCloudOverride? = null,
     val operatorRoleOverride: ServerRoleCloudOverride? = null,
     val cueRoleOverride: ServerRoleCloudOverride? = null,
@@ -730,6 +732,31 @@ class TokenStore(
             overrideUpdate = { it.copy(quickTranscriptCleanup = enabled) },
         )
 
+    fun getAudioCueMode(): AudioCueMode {
+        val raw = prefs.getString(KEY_AUDIO_CUE_MODE, null)?.takeIf { it.isNotBlank() }
+            ?: return AudioCueMode.HYBRID
+        return runCatching { AudioCueMode.valueOf(raw) }.getOrDefault(AudioCueMode.HYBRID)
+    }
+
+    fun setAudioCueMode(mode: AudioCueMode) {
+        prefs.edit().putString(KEY_AUDIO_CUE_MODE, mode.name).apply()
+        notifyChanged()
+    }
+
+    fun getEffectiveAudioCueMode(serverId: String? = getActiveServer()?.id): AudioCueMode =
+        effectiveSetting(
+            serverId = serverId,
+            overridePick = { it.audioCueMode },
+            globalPick = ::getAudioCueMode,
+        )
+
+    fun saveAudioCueMode(mode: AudioCueMode, customServerId: String? = null) =
+        updateSetting(
+            customServerId = customServerId,
+            globalSave = { setAudioCueMode(mode) },
+            overrideUpdate = { it.copy(audioCueMode = mode) },
+        )
+
     fun getOrCreateInstallId(): String {
         val existing = prefs.getString(KEY_INSTALL_ID, null)?.takeIf { it.isNotBlank() }
         if (existing != null) return existing
@@ -926,6 +953,7 @@ class TokenStore(
         private const val KEY_STT_FALLBACK_PARAKEET = "stt_fallback_parakeet"
         private const val KEY_QUICK_TURN_DIRECT_ANSWER = "quick_turn_direct_answer"
         private const val KEY_QUICK_TRANSCRIPT_CLEANUP = "quick_transcript_cleanup"
+        private const val KEY_AUDIO_CUE_MODE = "audio_cue_mode"
         private const val KEY_ROLE_VOICE_PROFILES = "role_voice_profiles_v1"
         const val DEFAULT_TTS_VOICE = "Kore"
         private const val KEY_INSTALL_ID = "install_id"
