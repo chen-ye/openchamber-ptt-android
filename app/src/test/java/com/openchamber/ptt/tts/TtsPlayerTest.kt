@@ -65,7 +65,7 @@ class TtsPlayerTest {
         }
         val spokenBySystemTts = mutableListOf<String>()
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
                 spokenBySystemTts += text
             }
 
@@ -102,7 +102,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
                 spokenBySystemTts += text
             }
 
@@ -158,7 +158,7 @@ class TtsPlayerTest {
             }
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
                 systemTtsCalled.set(true)
             }
 
@@ -220,7 +220,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
             override fun stop() = Unit
             override fun shutdown() = Unit
         }
@@ -263,7 +263,7 @@ class TtsPlayerTest {
         }
         val spokenBySystem = mutableListOf<String>()
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
                 spokenBySystem += text
             }
             override fun stop() = Unit
@@ -271,7 +271,7 @@ class TtsPlayerTest {
         }
         val mlKitAttempts = mutableListOf<String>()
         val fakeMlKitTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
                 mlKitAttempts += text
                 throw TtsException(message = "ML Kit GenAI TTS unavailable")
             }
@@ -302,7 +302,7 @@ class TtsPlayerTest {
     }
 
     @Test
-    fun `OPENAI_CLOUD uses openAiVoiceProvider instead of Gemini voice`() = runTest {
+    fun `OPENAI_CLOUD uses agent openAiVoice instead of Gemini voice`() = runTest {
         val wavBytes = WavParserTest.buildStandardWav(
             sampleRate = 24000,
             channels = 1,
@@ -322,7 +322,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
             override fun stop() = Unit
             override fun shutdown() = Unit
         }
@@ -333,12 +333,16 @@ class TtsPlayerTest {
             systemTtsSpeaker = fakeSystemTts,
             ioDispatcher = Dispatchers.Unconfined,
             pipelineProvider = { listOf(TtsEngineOption(TtsEngine.OPENAI_CLOUD, enabled = true)) },
-            openAiVoiceProvider = { "onyx" },
+            roleProfilesProvider = {
+                RoleVoiceProfileMap(
+                    agent = RoleVoiceAssignment(geminiVoice = "Sulafat", openAiVoice = "onyx"),
+                )
+            },
             inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
         val baseUrl = server.url("/").toString().trimEnd('/')
-        player.speak(baseUrl, "OpenAI voice check.", voice = "Sulafat")
+        player.speak(baseUrl, "OpenAI voice check.", role = VoiceRole.AGENT)
 
         server.takeRequest() // summarize
         val synthReq = server.takeRequest()
@@ -359,7 +363,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
             override fun stop() = Unit
             override fun shutdown() = Unit
         }
@@ -369,7 +373,9 @@ class TtsPlayerTest {
             pcmPlayerFactory = { fakeTrack },
             systemTtsSpeaker = fakeSystemTts,
             ioDispatcher = Dispatchers.Unconfined,
-            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            pipelineProvider = {
+                TtsEngine.entries.map { TtsEngineOption(it, enabled = it == TtsEngine.GEMINI_BRIDGE) }
+            },
             inputModeProvider = { TtsInputMode.SANITIZED },
         )
 
@@ -411,7 +417,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
             override fun stop() = Unit
             override fun shutdown() = Unit
         }
@@ -456,7 +462,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
             override fun stop() = Unit
             override fun shutdown() = Unit
         }
@@ -518,7 +524,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
             override fun stop() = Unit
             override fun shutdown() = Unit
         }
@@ -580,7 +586,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
                 spokenTexts += text
             }
 
@@ -660,7 +666,7 @@ class TtsPlayerTest {
             override fun stopNow() = Unit
         }
         val fakeSystemTts = object : SystemTtsSpeaker {
-            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
             override fun stop() = Unit
             override fun shutdown() = Unit
         }
@@ -680,32 +686,213 @@ class TtsPlayerTest {
 
             val baseUrl = server.url("/").toString().trimEnd('/')
 
-            // First read: cold text + cold Kore audio (2 requests)
-            player.speak(baseUrl, longReply, voice = "Kore")
+            // First read (AGENT -> Kore): cold text + cold Kore audio (2 requests)
+            player.speak(baseUrl, longReply, role = VoiceRole.AGENT)
             assertEquals(2, server.requestCount)
             assertEquals("/api/small-model/generate", server.takeRequest().path)
             assertEquals("/api/tts/speak", server.takeRequest().path)
             assertFalse(stats[0].textCacheHit)
             assertFalse(stats[0].audioCacheHit)
+            assertEquals(VoiceRole.AGENT, stats[0].role)
+            assertEquals("Kore", stats[0].voiceId)
 
-            // Switch voice to Puck: hits TextPrepCache, misses AudioCache (1 request total)
-            player.speak(baseUrl, longReply, voice = "Puck")
+            // Switch role (OPERATOR -> Puck): hits TextPrepCache, misses AudioCache (1 request total)
+            player.speak(baseUrl, longReply, role = VoiceRole.OPERATOR)
             assertEquals(3, server.requestCount)
             val puckReq = server.takeRequest()
             assertEquals("/api/tts/speak", puckReq.path)
             assertTrue(puckReq.body.readUtf8().contains("\"voice\":\"Puck\""))
             assertTrue(stats[1].textCacheHit)
             assertFalse(stats[1].audioCacheHit)
+            assertEquals(VoiceRole.OPERATOR, stats[1].role)
+            assertEquals("Puck", stats[1].voiceId)
             assertArrayEquals(wavPuck.copyOfRange(44, wavPuck.size), playedWavs[1].pcmData)
 
-            // Shut down server -> re-reading with Kore works 100% offline with 0 requests
+            // Shut down server -> re-reading with AGENT (Kore) works 100% offline with 0 requests
             server.shutdown()
-            player.speak(baseUrl, longReply, voice = "Kore")
+            player.speak(baseUrl, longReply, role = VoiceRole.AGENT)
             assertTrue(stats[2].textCacheHit)
             assertTrue(stats[2].audioCacheHit)
             assertArrayEquals(wavKore.copyOfRange(44, wavKore.size), playedWavs[2].pcmData)
         } finally {
             cache.close()
         }
+    }
+
+    @Test
+    fun `speaking with AGENT OPERATOR and CUE sends 3 distinct voices across Gemini OpenAI ML Kit and System TTS`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        repeat(6) {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "audio/wav")
+                    .setBody(Buffer().write(wavBytes)),
+            )
+        }
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val mlKitVoicesUsed = mutableListOf<String?>()
+        val fakeMlKit = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
+                mlKitVoicesUsed += preferredVoiceName
+            }
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+        val sysVoicesUsed = mutableListOf<String?>()
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) {
+                sysVoicesUsed += preferredVoiceName
+            }
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        val stats = mutableListOf<TtsSpeakStats>()
+
+        // 1. Gemini Bridge: Kore, Puck, Zephyr
+        val geminiPlayer = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+            onSpeakStats = { stats += it },
+        )
+        geminiPlayer.speak(baseUrl, "Agent line", role = VoiceRole.AGENT)
+        geminiPlayer.speak(baseUrl, "Operator line", role = VoiceRole.OPERATOR)
+        geminiPlayer.speak(baseUrl, "Cue line", role = VoiceRole.CUE)
+
+        val geminiBodies = (1..3).map { server.takeRequest().body.readUtf8() }
+        assertTrue(geminiBodies[0].contains("\"voice\":\"Kore\""))
+        assertTrue(geminiBodies[1].contains("\"voice\":\"Puck\""))
+        assertTrue(geminiBodies[2].contains("\"voice\":\"Zephyr\""))
+        assertEquals(listOf("Kore", "Puck", "Zephyr"), stats.map { it.voiceId })
+        assertEquals(listOf(VoiceRole.AGENT, VoiceRole.OPERATOR, VoiceRole.CUE), stats.map { it.role })
+
+        // 2. OpenAI Cloud: alloy, sage, ash
+        val openAiPlayer = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.OPENAI_CLOUD, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+        openAiPlayer.speak(baseUrl, "Agent line", role = VoiceRole.AGENT)
+        openAiPlayer.speak(baseUrl, "Operator line", role = VoiceRole.OPERATOR)
+        openAiPlayer.speak(baseUrl, "Cue line", role = VoiceRole.CUE)
+
+        val openAiBodies = (1..3).map { server.takeRequest().body.readUtf8() }
+        assertTrue(openAiBodies[0].contains("\"voice\":\"alloy\""))
+        assertTrue(openAiBodies[1].contains("\"voice\":\"sage\""))
+        assertTrue(openAiBodies[2].contains("\"voice\":\"ash\""))
+
+        // 3. ML Kit GenAI & Android System: 3 distinct installed voices
+        val mlKitPlayer = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            mlKitTtsSpeaker = fakeMlKit,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.MLKIT_GENAI, enabled = true)) },
+            availableMlKitVoicesProvider = { listOf("star02", "star04", "star05") },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+        mlKitPlayer.speak(baseUrl, "Agent", role = VoiceRole.AGENT)
+        mlKitPlayer.speak(baseUrl, "Operator", role = VoiceRole.OPERATOR)
+        mlKitPlayer.speak(baseUrl, "Cue", role = VoiceRole.CUE)
+        assertEquals(listOf("star02", "star04", "star05"), mlKitVoicesUsed)
+
+        val systemPlayer = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true)) },
+            availableSystemVoicesProvider = { listOf("sys-v1", "sys-v2", "sys-v3") },
+            inputModeProvider = { TtsInputMode.RAW },
+        )
+        systemPlayer.speak(baseUrl, "Agent", role = VoiceRole.AGENT)
+        systemPlayer.speak(baseUrl, "Operator", role = VoiceRole.OPERATOR)
+        systemPlayer.speak(baseUrl, "Cue", role = VoiceRole.CUE)
+        assertEquals(listOf("sys-v1", "sys-v2", "sys-v3"), sysVoicesUsed)
+    }
+
+    @Test
+    fun `role preferredEngine routes first and falls back to basePipeline on failure`() = runTest {
+        val wavBytes = WavParserTest.buildStandardWav(
+            sampleRate = 24000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04),
+        )
+        // 1st attempt: pinned OPENAI_CLOUD -> fails 503
+        server.enqueue(MockResponse().setResponseCode(503))
+        // 2nd attempt: fallback to GEMINI_BRIDGE -> succeeds with Puck
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "audio/wav")
+                .setBody(Buffer().write(wavBytes)),
+        )
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) = Unit
+            override fun stopNow() = Unit
+        }
+        val fakeSystem = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, preferredVoiceName: String?, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        val stats = mutableListOf<TtsSpeakStats>()
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystem,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = {
+                listOf(
+                    TtsEngineOption(TtsEngine.GEMINI_BRIDGE, enabled = true),
+                    TtsEngineOption(TtsEngine.OPENAI_CLOUD, enabled = false),
+                )
+            },
+            roleProfilesProvider = {
+                RoleVoiceProfileMap(
+                    operator = RoleVoiceAssignment(preferredEngine = TtsEngine.OPENAI_CLOUD),
+                )
+            },
+            inputModeProvider = { TtsInputMode.RAW },
+            onSpeakStats = { stats += it },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        player.speak(baseUrl, "Fallback check", role = VoiceRole.OPERATOR)
+
+        val firstReq = server.takeRequest()
+        assertEquals("/api/tts/speak", firstReq.path)
+        assertTrue(firstReq.body.readUtf8().contains("\"voice\":\"sage\""))
+
+        val secondReq = server.takeRequest()
+        assertEquals("/api/tts/speak", secondReq.path)
+        assertTrue(secondReq.body.readUtf8().contains("\"voice\":\"Puck\""))
+
+        assertEquals(1, stats.size)
+        assertEquals(TtsEngine.GEMINI_BRIDGE, stats[0].engine)
+        assertEquals(VoiceRole.OPERATOR, stats[0].role)
+        assertEquals("Puck", stats[0].voiceId)
     }
 }

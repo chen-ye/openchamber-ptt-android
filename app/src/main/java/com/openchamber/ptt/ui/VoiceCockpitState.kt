@@ -36,6 +36,7 @@ import com.openchamber.ptt.storage.ServerProfile
 import com.openchamber.ptt.storage.ServerVoiceOverride
 import com.openchamber.ptt.storage.StagedDraft
 import com.openchamber.ptt.storage.TokenStore
+import com.openchamber.ptt.storage.toServerCloudOverride
 import com.openchamber.ptt.tts.MlKitTtsSpeaker
 import com.openchamber.ptt.tts.MlKitTtsVoiceSummary
 import com.openchamber.ptt.tts.SpokenDetailLevel
@@ -512,6 +513,7 @@ internal class VoiceCockpitState(
     fun toggleCustomServerVoice(useCustom: Boolean) {
         val curActive = activeServer ?: return
         if (useCustom) {
+            val effectiveRoles = tokenStore.getEffectiveRoleVoiceProfiles(curActive.id)
             tokenStore.setServerVoiceOverride(
                 curActive.id,
                 ServerVoiceOverride(
@@ -524,6 +526,9 @@ internal class VoiceCockpitState(
                     sttFallbackToParakeet = sttFallbackToParakeet,
                     quickTurnDirectAnswer = quickTurnDirectAnswer,
                     quickTranscriptCleanup = quickTranscriptCleanup,
+                    agentRoleOverride = effectiveRoles.agent.toServerCloudOverride(),
+                    operatorRoleOverride = effectiveRoles.operator.toServerCloudOverride(),
+                    cueRoleOverride = effectiveRoles.cue.toServerCloudOverride(),
                 ),
             )
         } else {
@@ -744,8 +749,8 @@ internal fun rememberVoiceCockpitState(
         )
     }
 
-    val mlKitTtsSpeaker = remember(tokenStore) {
-        MlKitTtsSpeaker(preferredVoiceNameProvider = { tokenStore.getMlKitTtsVoice() })
+    val mlKitTtsSpeaker = remember {
+        MlKitTtsSpeaker()
     }
     DisposableEffect(mlKitTtsSpeaker) {
         onDispose { mlKitTtsSpeaker.shutdown() }

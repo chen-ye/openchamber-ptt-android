@@ -5,11 +5,15 @@ import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.openchamber.ptt.network.OpenChamberHttp
+import com.openchamber.ptt.tts.RoleVoiceAssignment
+import com.openchamber.ptt.tts.RoleVoiceProfileMap
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.SttEngine
+import com.openchamber.ptt.tts.TtsEngine
 import com.openchamber.ptt.tts.TtsEngineOption
 import com.openchamber.ptt.tts.TtsInputMode
 import com.openchamber.ptt.tts.VoicePipelineDefaults
+import com.openchamber.ptt.tts.VoiceRole
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,6 +51,14 @@ data class SessionReplyCursor(
 )
 
 @Serializable
+data class ServerRoleCloudOverride(
+    val preferredEngine: TtsEngine? = null,
+    val geminiVoice: String? = null,
+    val openAiVoice: String? = null,
+    val kokoroSpeakerId: Int? = null,
+)
+
+@Serializable
 data class ServerVoiceOverride(
     val ttsPipeline: List<TtsEngineOption>? = null,
     val ttsInputMode: TtsInputMode? = null,
@@ -57,7 +69,18 @@ data class ServerVoiceOverride(
     val sttFallbackToParakeet: Boolean? = null,
     val quickTurnDirectAnswer: Boolean? = null,
     val quickTranscriptCleanup: Boolean? = null,
+    val agentRoleOverride: ServerRoleCloudOverride? = null,
+    val operatorRoleOverride: ServerRoleCloudOverride? = null,
+    val cueRoleOverride: ServerRoleCloudOverride? = null,
 )
+
+internal fun RoleVoiceAssignment.toServerCloudOverride(): ServerRoleCloudOverride =
+    ServerRoleCloudOverride(
+        preferredEngine = preferredEngine,
+        geminiVoice = geminiVoice?.trim()?.takeIf { it.isNotBlank() },
+        openAiVoice = openAiVoice?.trim()?.takeIf { it.isNotBlank() },
+        kokoroSpeakerId = kokoroSpeakerId,
+    )
 
 @Serializable
 data class ServerProfile(
@@ -245,6 +268,12 @@ class TokenStore(
         writeServers(servers, activeId = nextActiveId)
     }
 
+    private fun normalizeRoleCloudOverride(ov: ServerRoleCloudOverride?): ServerRoleCloudOverride? =
+        ov?.copy(
+            geminiVoice = ov.geminiVoice?.trim()?.takeIf { it.isNotBlank() },
+            openAiVoice = ov.openAiVoice?.trim()?.takeIf { it.isNotBlank() },
+        )
+
     fun setServerVoiceOverride(serverId: String, override: ServerVoiceOverride?) {
         val servers = getServers().toMutableList()
         val idx = servers.indexOfFirst { it.id == serverId }
@@ -254,6 +283,9 @@ class TokenStore(
                 ttsPipeline = ov.ttsPipeline?.let { VoicePipelineDefaults.normalizeTtsPipeline(it) },
                 geminiVoice = ov.geminiVoice?.trim()?.takeIf { it.isNotBlank() },
                 openAiVoice = ov.openAiVoice?.trim()?.takeIf { it.isNotBlank() },
+                agentRoleOverride = normalizeRoleCloudOverride(ov.agentRoleOverride),
+                operatorRoleOverride = normalizeRoleCloudOverride(ov.operatorRoleOverride),
+                cueRoleOverride = normalizeRoleCloudOverride(ov.cueRoleOverride),
             )
         }
         servers[idx] = servers[idx].copy(voiceOverride = normalized)
@@ -279,16 +311,15 @@ class TokenStore(
     fun getEffectiveTtsVoice(serverId: String? = getActiveServer()?.id): String =
         effectiveSetting(
             serverId = serverId,
-            overridePick = { it.geminiVoice?.takeIf(String::isNotBlank) },
+            overridePick = {
+                it.agentRoleOverride?.geminiVoice?.takeIf(String::isNotBlank)
+                    ?: it.geminiVoice?.takeIf(String::isNotBlank)
+            },
             globalPick = ::getTtsVoice,
         )
 
     fun saveTtsVoice(voice: String?, customServerId: String? = null) =
-        updateSetting(
-            customServerId = customServerId,
-            globalSave = { setTtsVoice(voice) },
-            overrideUpdate = { it.copy(geminiVoice = voice) },
-        )
+        saveRoleGeminiVoice(VoiceRole.AGENT, voice, customServerId)
 
     fun getMlKitTtsVoice(): String? = prefs.getString(KEY_MLKIT_TTS_VOICE, null)?.takeIf { it.isNotBlank() }
 
@@ -315,16 +346,15 @@ class TokenStore(
     fun getEffectiveOpenAiTtsVoice(serverId: String? = getActiveServer()?.id): String =
         effectiveSetting(
             serverId = serverId,
-            overridePick = { it.openAiVoice?.takeIf(String::isNotBlank) },
+            overridePick = {
+                it.agentRoleOverride?.openAiVoice?.takeIf(String::isNotBlank)
+                    ?: it.openAiVoice?.takeIf(String::isNotBlank)
+            },
             globalPick = ::getOpenAiTtsVoice,
         )
 
     fun saveOpenAiTtsVoice(voice: String?, customServerId: String? = null) =
-        updateSetting(
-            customServerId = customServerId,
-            globalSave = { setOpenAiTtsVoice(voice) },
-            overrideUpdate = { it.copy(openAiVoice = voice) },
-        )
+        saveRoleOpenAiVoice(VoiceRole.AGENT, voice, customServerId)
 
     fun getSystemTtsVoice(): String? = prefs.getString(KEY_SYSTEM_TTS_VOICE, null)?.takeIf { it.isNotBlank() }
 
@@ -334,6 +364,202 @@ class TokenStore(
             if (cleaned == null) remove(KEY_SYSTEM_TTS_VOICE) else putString(KEY_SYSTEM_TTS_VOICE, cleaned)
         }.apply()
         notifyChanged()
+    }
+
+    private fun normalizeAssignment(a: RoleVoiceAssignment): RoleVoiceAssignment =
+        a.copy(
+            geminiVoice = a.geminiVoice?.trim()?.takeIf { it.isNotBlank() },
+            openAiVoice = a.openAiVoice?.trim()?.takeIf { it.isNotBlank() },
+            mlKitVoice = a.mlKitVoice?.trim()?.takeIf { it.isNotBlank() },
+            systemVoice = a.systemVoice?.trim()?.takeIf { it.isNotBlank() },
+        )
+
+    private fun readRawGlobalRoleProfiles(): RoleVoiceProfileMap {
+        val raw = prefs.getString(KEY_ROLE_VOICE_PROFILES, null)?.takeIf { it.isNotBlank() }
+            ?: return RoleVoiceProfileMap()
+        val parsed = runCatching { json.decodeFromString<RoleVoiceProfileMap>(raw) }.getOrNull()
+            ?: return RoleVoiceProfileMap()
+        return RoleVoiceProfileMap(
+            agent = RoleVoiceAssignment(
+                preferredEngine = parsed.agent.preferredEngine,
+                kokoroSpeakerId = parsed.agent.kokoroSpeakerId,
+            ),
+            operator = normalizeAssignment(parsed.operator),
+            cue = normalizeAssignment(parsed.cue),
+        )
+    }
+
+    private fun writeRawGlobalRoleProfiles(profiles: RoleVoiceProfileMap) {
+        val sanitized = RoleVoiceProfileMap(
+            agent = RoleVoiceAssignment(
+                preferredEngine = profiles.agent.preferredEngine,
+                kokoroSpeakerId = profiles.agent.kokoroSpeakerId,
+            ),
+            operator = normalizeAssignment(profiles.operator),
+            cue = normalizeAssignment(profiles.cue),
+        )
+        prefs.edit().putString(KEY_ROLE_VOICE_PROFILES, json.encodeToString(sanitized)).apply()
+        notifyChanged()
+    }
+
+    private fun getGlobalRoleVoiceProfiles(): RoleVoiceProfileMap {
+        val raw = readRawGlobalRoleProfiles()
+        return RoleVoiceProfileMap(
+            agent = RoleVoiceAssignment(
+                preferredEngine = raw.agent.preferredEngine,
+                geminiVoice = getTtsVoice(),
+                openAiVoice = getOpenAiTtsVoice(),
+                kokoroSpeakerId = raw.agent.kokoroSpeakerId,
+                mlKitVoice = getMlKitTtsVoice(),
+                systemVoice = getSystemTtsVoice(),
+            ),
+            operator = raw.operator,
+            cue = raw.cue,
+        )
+    }
+
+    fun getEffectiveRoleVoiceProfiles(serverId: String? = getActiveServer()?.id): RoleVoiceProfileMap {
+        val global = getGlobalRoleVoiceProfiles()
+        val override = serverId?.let { getServer(it)?.voiceOverride } ?: return global
+
+        val agentCloud = override.agentRoleOverride
+        val effectiveAgent = if (agentCloud != null) {
+            global.agent.copy(
+                preferredEngine = agentCloud.preferredEngine,
+                geminiVoice = agentCloud.geminiVoice?.takeIf(String::isNotBlank)
+                    ?: override.geminiVoice?.takeIf(String::isNotBlank)
+                    ?: global.agent.geminiVoice,
+                openAiVoice = agentCloud.openAiVoice?.takeIf(String::isNotBlank)
+                    ?: override.openAiVoice?.takeIf(String::isNotBlank)
+                    ?: global.agent.openAiVoice,
+                kokoroSpeakerId = agentCloud.kokoroSpeakerId,
+            )
+        } else {
+            global.agent.copy(
+                geminiVoice = override.geminiVoice?.takeIf(String::isNotBlank) ?: global.agent.geminiVoice,
+                openAiVoice = override.openAiVoice?.takeIf(String::isNotBlank) ?: global.agent.openAiVoice,
+            )
+        }
+
+        val effectiveOperator = override.operatorRoleOverride?.let { opCloud ->
+            global.operator.copy(
+                preferredEngine = opCloud.preferredEngine,
+                geminiVoice = opCloud.geminiVoice?.takeIf(String::isNotBlank),
+                openAiVoice = opCloud.openAiVoice?.takeIf(String::isNotBlank),
+                kokoroSpeakerId = opCloud.kokoroSpeakerId,
+            )
+        } ?: global.operator
+
+        val effectiveCue = override.cueRoleOverride?.let { cueCloud ->
+            global.cue.copy(
+                preferredEngine = cueCloud.preferredEngine,
+                geminiVoice = cueCloud.geminiVoice?.takeIf(String::isNotBlank),
+                openAiVoice = cueCloud.openAiVoice?.takeIf(String::isNotBlank),
+                kokoroSpeakerId = cueCloud.kokoroSpeakerId,
+            )
+        } ?: global.cue
+
+        return RoleVoiceProfileMap(
+            agent = effectiveAgent,
+            operator = effectiveOperator,
+            cue = effectiveCue,
+        )
+    }
+
+    private fun updateServerRoleCloudOverride(
+        customServerId: String,
+        role: VoiceRole,
+        transform: (ServerRoleCloudOverride) -> ServerRoleCloudOverride,
+    ) {
+        val curOverride = getServer(customServerId)?.voiceOverride ?: ServerVoiceOverride()
+        val global = getGlobalRoleVoiceProfiles()
+        val existingRoleCloud = when (role) {
+            VoiceRole.AGENT -> curOverride.agentRoleOverride ?: ServerRoleCloudOverride(
+                preferredEngine = global.agent.preferredEngine,
+                geminiVoice = curOverride.geminiVoice?.takeIf(String::isNotBlank) ?: global.agent.geminiVoice,
+                openAiVoice = curOverride.openAiVoice?.takeIf(String::isNotBlank) ?: global.agent.openAiVoice,
+                kokoroSpeakerId = global.agent.kokoroSpeakerId,
+            )
+            VoiceRole.OPERATOR -> curOverride.operatorRoleOverride ?: global.operator.toServerCloudOverride()
+            VoiceRole.CUE -> curOverride.cueRoleOverride ?: global.cue.toServerCloudOverride()
+        }
+        val updatedRoleCloud = normalizeRoleCloudOverride(transform(existingRoleCloud))!!
+        val nextOverride = when (role) {
+            VoiceRole.AGENT -> curOverride.copy(
+                geminiVoice = updatedRoleCloud.geminiVoice,
+                openAiVoice = updatedRoleCloud.openAiVoice,
+                agentRoleOverride = updatedRoleCloud,
+            )
+            VoiceRole.OPERATOR -> curOverride.copy(operatorRoleOverride = updatedRoleCloud)
+            VoiceRole.CUE -> curOverride.copy(cueRoleOverride = updatedRoleCloud)
+        }
+        setServerVoiceOverride(customServerId, nextOverride)
+    }
+
+    fun saveRolePreferredEngine(role: VoiceRole, engine: TtsEngine?, customServerId: String? = null) {
+        if (customServerId != null) {
+            updateServerRoleCloudOverride(customServerId, role) { it.copy(preferredEngine = engine) }
+            return
+        }
+        val raw = readRawGlobalRoleProfiles()
+        writeRawGlobalRoleProfiles(raw.withRole(role, raw[role].copy(preferredEngine = engine)))
+    }
+
+    fun saveRoleGeminiVoice(role: VoiceRole, voice: String?, customServerId: String? = null) {
+        val cleaned = voice?.trim()?.takeIf { it.isNotBlank() }
+        if (customServerId != null) {
+            updateServerRoleCloudOverride(customServerId, role) { it.copy(geminiVoice = cleaned) }
+            return
+        }
+        if (role == VoiceRole.AGENT) {
+            setTtsVoice(cleaned)
+        } else {
+            val raw = readRawGlobalRoleProfiles()
+            writeRawGlobalRoleProfiles(raw.withRole(role, raw[role].copy(geminiVoice = cleaned)))
+        }
+    }
+
+    fun saveRoleOpenAiVoice(role: VoiceRole, voice: String?, customServerId: String? = null) {
+        val cleaned = voice?.trim()?.takeIf { it.isNotBlank() }
+        if (customServerId != null) {
+            updateServerRoleCloudOverride(customServerId, role) { it.copy(openAiVoice = cleaned) }
+            return
+        }
+        if (role == VoiceRole.AGENT) {
+            setOpenAiTtsVoice(cleaned)
+        } else {
+            val raw = readRawGlobalRoleProfiles()
+            writeRawGlobalRoleProfiles(raw.withRole(role, raw[role].copy(openAiVoice = cleaned)))
+        }
+    }
+
+    fun saveRoleKokoroSpeakerId(role: VoiceRole, speakerId: Int?, customServerId: String? = null) {
+        if (customServerId != null) {
+            updateServerRoleCloudOverride(customServerId, role) { it.copy(kokoroSpeakerId = speakerId) }
+            return
+        }
+        val raw = readRawGlobalRoleProfiles()
+        writeRawGlobalRoleProfiles(raw.withRole(role, raw[role].copy(kokoroSpeakerId = speakerId)))
+    }
+
+    fun setRoleMlKitVoice(role: VoiceRole, voiceName: String?) {
+        val cleaned = voiceName?.trim()?.takeIf { it.isNotBlank() }
+        if (role == VoiceRole.AGENT) {
+            setMlKitTtsVoice(cleaned)
+        } else {
+            val raw = readRawGlobalRoleProfiles()
+            writeRawGlobalRoleProfiles(raw.withRole(role, raw[role].copy(mlKitVoice = cleaned)))
+        }
+    }
+
+    fun setRoleSystemVoice(role: VoiceRole, voiceName: String?) {
+        val cleaned = voiceName?.trim()?.takeIf { it.isNotBlank() }
+        if (role == VoiceRole.AGENT) {
+            setSystemTtsVoice(cleaned)
+        } else {
+            val raw = readRawGlobalRoleProfiles()
+            writeRawGlobalRoleProfiles(raw.withRole(role, raw[role].copy(systemVoice = cleaned)))
+        }
     }
 
     fun getTtsPipeline(): List<TtsEngineOption> {
@@ -700,6 +926,7 @@ class TokenStore(
         private const val KEY_STT_FALLBACK_PARAKEET = "stt_fallback_parakeet"
         private const val KEY_QUICK_TURN_DIRECT_ANSWER = "quick_turn_direct_answer"
         private const val KEY_QUICK_TRANSCRIPT_CLEANUP = "quick_transcript_cleanup"
+        private const val KEY_ROLE_VOICE_PROFILES = "role_voice_profiles_v1"
         const val DEFAULT_TTS_VOICE = "Kore"
         private const val KEY_INSTALL_ID = "install_id"
         private const val KEY_STAGED_DRAFTS = "staged_drafts_v1"

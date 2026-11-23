@@ -6,6 +6,7 @@ import com.openchamber.ptt.tts.SttEngine
 import com.openchamber.ptt.tts.TtsEngine
 import com.openchamber.ptt.tts.TtsEngineOption
 import com.openchamber.ptt.tts.TtsInputMode
+import com.openchamber.ptt.tts.VoiceRole
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -421,6 +422,143 @@ class TokenStoreTest {
         )
         assertEquals("msg_6_updated", storeB.getReplyCursor("srv1|ses_6|/repo")?.lastHeardMessageId)
         assertEquals("msg_7", storeB.getReplyCursor("srv1|ses_7|/repo")?.lastHeardMessageId)
+    }
+
+    @Test
+    fun `role voice profiles resolve global vs ServerVoiceOverride while keeping ML Kit and System voices strictly global`() {
+        val store = TokenStore(InMemorySharedPreferences())
+        val srvA = store.upsertServer("http://srv-a:14096", label = "Server A", token = "tok_a")
+        val srvB = store.upsertServer("http://srv-b:14096", label = "Server B", token = "tok_b", makeActive = false)
+
+        // Global single-source-of-truth for AGENT + global extras for OPERATOR & CUE
+        store.saveRoleGeminiVoice(VoiceRole.AGENT, "Sulafat")
+        store.saveRoleOpenAiVoice(VoiceRole.AGENT, "onyx")
+        store.saveRolePreferredEngine(VoiceRole.AGENT, TtsEngine.GEMINI_BRIDGE)
+        store.saveRoleKokoroSpeakerId(VoiceRole.AGENT, 2)
+
+        store.saveRolePreferredEngine(VoiceRole.OPERATOR, TtsEngine.OPENAI_CLOUD)
+        store.saveRoleGeminiVoice(VoiceRole.OPERATOR, "Charon")
+        store.saveRoleOpenAiVoice(VoiceRole.OPERATOR, "sage")
+        store.saveRoleKokoroSpeakerId(VoiceRole.OPERATOR, 4)
+
+        store.saveRolePreferredEngine(VoiceRole.CUE, TtsEngine.LOCAL_KOKORO)
+        store.saveRoleGeminiVoice(VoiceRole.CUE, "Fenrir")
+        store.saveRoleOpenAiVoice(VoiceRole.CUE, "ash")
+        store.saveRoleKokoroSpeakerId(VoiceRole.CUE, 7)
+
+        // Device-scoped on-device voices for all 3 roles
+        store.setRoleMlKitVoice(VoiceRole.AGENT, "star02")
+        store.setRoleMlKitVoice(VoiceRole.OPERATOR, "star04")
+        store.setRoleMlKitVoice(VoiceRole.CUE, "star05")
+        store.setRoleSystemVoice(VoiceRole.AGENT, "sys-a")
+        store.setRoleSystemVoice(VoiceRole.OPERATOR, "sys-b")
+        store.setRoleSystemVoice(VoiceRole.CUE, "sys-c")
+
+        assertEquals("Sulafat", store.getTtsVoice())
+        assertEquals("onyx", store.getOpenAiTtsVoice())
+        assertEquals("star02", store.getMlKitTtsVoice())
+        assertEquals("sys-a", store.getSystemTtsVoice())
+
+        val effA = store.getEffectiveRoleVoiceProfiles(srvA.id)
+        assertEquals("Sulafat", effA.agent.geminiVoice)
+        assertEquals("onyx", effA.agent.openAiVoice)
+        assertEquals(TtsEngine.GEMINI_BRIDGE, effA.agent.preferredEngine)
+        assertEquals(2, effA.agent.kokoroSpeakerId)
+        assertEquals("star02", effA.agent.mlKitVoice)
+        assertEquals("sys-a", effA.agent.systemVoice)
+
+        assertEquals(TtsEngine.OPENAI_CLOUD, effA.operator.preferredEngine)
+        assertEquals("Charon", effA.operator.geminiVoice)
+        assertEquals("sage", effA.operator.openAiVoice)
+        assertEquals(4, effA.operator.kokoroSpeakerId)
+        assertEquals("star04", effA.operator.mlKitVoice)
+        assertEquals("sys-b", effA.operator.systemVoice)
+
+        assertEquals(TtsEngine.LOCAL_KOKORO, effA.cue.preferredEngine)
+        assertEquals("Fenrir", effA.cue.geminiVoice)
+        assertEquals("ash", effA.cue.openAiVoice)
+        assertEquals(7, effA.cue.kokoroSpeakerId)
+        assertEquals("star05", effA.cue.mlKitVoice)
+        assertEquals("sys-c", effA.cue.systemVoice)
+
+        // Enable Server B cloud override for all 3 roles
+        store.setServerVoiceOverride(
+            srvB.id,
+            ServerVoiceOverride(
+                geminiVoice = "Sulafat",
+                openAiVoice = "onyx",
+                agentRoleOverride = ServerRoleCloudOverride(
+                    preferredEngine = TtsEngine.GEMINI_BRIDGE,
+                    geminiVoice = "Sulafat",
+                    openAiVoice = "onyx",
+                    kokoroSpeakerId = 2,
+                ),
+                operatorRoleOverride = ServerRoleCloudOverride(
+                    preferredEngine = TtsEngine.OPENAI_CLOUD,
+                    geminiVoice = "Charon",
+                    openAiVoice = "sage",
+                    kokoroSpeakerId = 4,
+                ),
+                cueRoleOverride = ServerRoleCloudOverride(
+                    preferredEngine = TtsEngine.LOCAL_KOKORO,
+                    geminiVoice = "Fenrir",
+                    openAiVoice = "ash",
+                    kokoroSpeakerId = 7,
+                ),
+            ),
+        )
+
+        // Mutate Server B cloud roles independently of Server A
+        store.saveRolePreferredEngine(VoiceRole.AGENT, TtsEngine.OPENAI_CLOUD, customServerId = srvB.id)
+        store.saveRoleGeminiVoice(VoiceRole.AGENT, "Zephyr", customServerId = srvB.id)
+        store.saveRoleOpenAiVoice(VoiceRole.AGENT, "nova", customServerId = srvB.id)
+        store.saveRoleKokoroSpeakerId(VoiceRole.AGENT, 9, customServerId = srvB.id)
+
+        store.saveRolePreferredEngine(VoiceRole.OPERATOR, TtsEngine.GEMINI_BRIDGE, customServerId = srvB.id)
+        store.saveRoleGeminiVoice(VoiceRole.OPERATOR, null, customServerId = srvB.id)
+        store.saveRoleOpenAiVoice(VoiceRole.OPERATOR, "coral", customServerId = srvB.id)
+
+        store.saveRolePreferredEngine(VoiceRole.CUE, TtsEngine.GEMINI_BRIDGE, customServerId = srvB.id)
+        store.saveRoleGeminiVoice(VoiceRole.CUE, "Leda", customServerId = srvB.id)
+        store.saveRoleKokoroSpeakerId(VoiceRole.CUE, 11, customServerId = srvB.id)
+
+        // Server A remains untouched
+        val effAAfter = store.getEffectiveRoleVoiceProfiles(srvA.id)
+        assertEquals("Sulafat", effAAfter.agent.geminiVoice)
+        assertEquals("Charon", effAAfter.operator.geminiVoice)
+        assertEquals("Fenrir", effAAfter.cue.geminiVoice)
+
+        // Server B reflects per-server cloud overrides + keeps global ML Kit & System voices
+        val effB = store.getEffectiveRoleVoiceProfiles(srvB.id)
+        assertEquals("Zephyr", store.getEffectiveTtsVoice(srvB.id))
+        assertEquals("nova", store.getEffectiveOpenAiTtsVoice(srvB.id))
+        assertEquals(TtsEngine.OPENAI_CLOUD, effB.agent.preferredEngine)
+        assertEquals("Zephyr", effB.agent.geminiVoice)
+        assertEquals("nova", effB.agent.openAiVoice)
+        assertEquals(9, effB.agent.kokoroSpeakerId)
+        assertEquals("star02", effB.agent.mlKitVoice)
+        assertEquals("sys-a", effB.agent.systemVoice)
+
+        assertEquals(TtsEngine.GEMINI_BRIDGE, effB.operator.preferredEngine)
+        assertNull(effB.operator.geminiVoice)
+        assertEquals("coral", effB.operator.openAiVoice)
+        assertEquals(4, effB.operator.kokoroSpeakerId)
+        assertEquals("star04", effB.operator.mlKitVoice)
+        assertEquals("sys-b", effB.operator.systemVoice)
+
+        assertEquals(TtsEngine.GEMINI_BRIDGE, effB.cue.preferredEngine)
+        assertEquals("Leda", effB.cue.geminiVoice)
+        assertEquals("ash", effB.cue.openAiVoice)
+        assertEquals(11, effB.cue.kokoroSpeakerId)
+        assertEquals("star05", effB.cue.mlKitVoice)
+        assertEquals("sys-c", effB.cue.systemVoice)
+
+        // Updating global ML Kit & System voices reflects on Server B even with ServerVoiceOverride active
+        store.setRoleMlKitVoice(VoiceRole.OPERATOR, "star08")
+        store.setRoleSystemVoice(VoiceRole.CUE, "sys-z")
+        val effBGlobalDevice = store.getEffectiveRoleVoiceProfiles(srvB.id)
+        assertEquals("star08", effBGlobalDevice.operator.mlKitVoice)
+        assertEquals("sys-z", effBGlobalDevice.cue.systemVoice)
     }
 
     private class InMemorySharedPreferences : SharedPreferences {

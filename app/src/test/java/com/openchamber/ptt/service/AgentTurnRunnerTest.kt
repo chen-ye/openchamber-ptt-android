@@ -9,6 +9,7 @@ import com.openchamber.ptt.storage.StagedDraft
 import com.openchamber.ptt.storage.TokenStore
 import com.openchamber.ptt.tts.SpokenDetailLevel
 import com.openchamber.ptt.tts.TtsInputMode
+import com.openchamber.ptt.tts.VoiceRole
 import com.openchamber.ptt.voice.DirectVoiceAnswer
 import com.openchamber.ptt.voice.EventStreamClient
 import com.openchamber.ptt.voice.PromptOrganizer
@@ -356,6 +357,7 @@ class AgentTurnRunnerTest {
                 assertEquals(SpokenDetailLevel.DETAILED, h1.store.getEffectiveSpokenDetailLevel(h1.serverId))
                 assertEquals(TtsInputMode.RAW, h1.store.getEffectiveTtsInputMode(h1.serverId))
                 assertEquals(1, h1.speakRequests.size)
+                assertEquals(VoiceRole.OPERATOR, h1.speakRequests[0].role)
                 assertEquals(TtsInputMode.RAW, h1.speakRequests[0].inputModeOverride)
                 assertEquals(AgentTurnRunner.TTS_KIND_CONTROL, h1.speakRequests[0].kind)
                 assertFalse(h1.speakRequests[0].notifySpokenSummary)
@@ -392,6 +394,7 @@ class AgentTurnRunnerTest {
                     h2.directAnswers[0],
                 )
                 assertEquals(AgentTurnRunner.TTS_KIND_CONTROL, h2.speakRequests[0].kind)
+                assertEquals(VoiceRole.OPERATOR, h2.speakRequests[0].role)
                 assertEquals(TtsInputMode.RAW, h2.speakRequests[0].inputModeOverride)
                 assertFalse(h2.speakRequests[0].notifySpokenSummary)
                 assertEquals("Option two uses Kokoro locally.", h2.speakRequests[0].text)
@@ -494,11 +497,14 @@ class AgentTurnRunnerTest {
 
                 val permissionSpeak = harness.speakRequests.firstOrNull { it.kind == AgentTurnRunner.TTS_KIND_PERMISSION }
                 assertNotNull(permissionSpeak)
+                assertEquals(VoiceRole.OPERATOR, permissionSpeak?.role)
+                assertEquals(TtsInputMode.RAW, permissionSpeak?.inputModeOverride)
                 assertFalse(permissionSpeak?.notifySpokenSummary ?: true)
 
                 val replySpeaks = harness.speakRequests.filter { it.kind == AgentTurnRunner.TTS_KIND_REPLY }
                 assertEquals(listOf("Running gradle suite.", "All tests passed."), replySpeaks.map { it.text })
                 assertEquals("Payments", replySpeaks.first().sessionLabel)
+                assertTrue(replySpeaks.all { it.role == VoiceRole.AGENT })
                 assertTrue(replySpeaks.all { it.notifySpokenSummary })
             } finally {
                 scope.cancel()
@@ -588,6 +594,7 @@ class AgentTurnRunnerTest {
                 assertNotNull(saved)
                 assertEquals("Organized prompt text.", saved?.organizedText)
                 assertEquals(1, h1.speakRequests.size)
+                assertEquals(VoiceRole.OPERATOR, h1.speakRequests[0].role)
                 assertEquals(TtsInputMode.RAW, h1.speakRequests[0].inputModeOverride)
                 assertEquals(AgentTurnRunner.TTS_KIND_DRAFT_PREVIEW, h1.speakRequests[0].kind)
                 assertFalse(h1.speakRequests[0].notifySpokenSummary)
@@ -670,6 +677,7 @@ class AgentTurnRunnerTest {
 
                 assertEquals(listOf("First part.", "Second part."), harness.speakRequests.map { it.text })
                 assertEquals(AgentTurnRunner.TTS_KIND_REPLY, harness.speakRequests[0].kind)
+                assertTrue(harness.speakRequests.all { it.role == VoiceRole.AGENT })
                 assertTrue(harness.speakRequests[0].notifySpokenSummary)
                 assertEquals("Payments", harness.speakRequests[0].sessionLabel)
                 assertEquals(PttState.ARMED_IDLE, harness.stateMachine.currentState)
@@ -783,6 +791,7 @@ class AgentTurnRunnerTest {
                     listOf("First async reply.", "Arrived mid playback."),
                     harness.speakRequests.map { it.text },
                 )
+                assertTrue(harness.speakRequests.all { it.role == VoiceRole.AGENT })
                 assertEquals("a2", harness.store.getReplyCursor(harness.sessionKey)?.lastHeardMessageId)
                 assertTrue(harness.controller.feedState.value.unreadQueue.isEmpty())
                 assertEquals(PttState.ARMED_IDLE, harness.stateMachine.currentState)
@@ -881,6 +890,7 @@ class AgentTurnRunnerTest {
                 assertTrue(harness.directAnswers.filterNotNull().isEmpty())
                 assertEquals(listOf("Session answered directly."), harness.speakRequests.map { it.text })
                 assertEquals(AgentTurnRunner.TTS_KIND_REPLY, harness.speakRequests[0].kind)
+                assertEquals(VoiceRole.AGENT, harness.speakRequests[0].role)
 
                 // And LiveTuning still works even when quickTurnDirectAnswer is disabled
                 val liveInner = """{"model":"gemini-decision-1","answers":{"route":{"choice":"live_tuning"},"tuning_detail":{"choice":"detailed"},"tuning_mode":{"choice":"none"}}}"""
@@ -905,6 +915,7 @@ class AgentTurnRunnerTest {
                 assertTrue(liveDone.await(3, TimeUnit.SECONDS))
                 assertEquals(SpokenDetailLevel.DETAILED, hLive.store.getEffectiveSpokenDetailLevel(hLive.serverId))
                 assertEquals(AgentTurnRunner.TTS_KIND_CONTROL, hLive.speakRequests.single().kind)
+                assertEquals(VoiceRole.OPERATOR, hLive.speakRequests.single().role)
             } finally {
                 scope.cancel()
             }

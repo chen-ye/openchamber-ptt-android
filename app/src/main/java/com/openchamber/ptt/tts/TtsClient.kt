@@ -763,10 +763,13 @@ class TtsClient(
             "nova", "onyx", "sage", "shimmer", "verse", "marin", "cedar",
         )
 
-        internal fun normalizeOpenAiVoice(voice: String): String {
-            val normalized = voice.trim().lowercase()
-            return if (normalized in OPENAI_VOICES) normalized else DEFAULT_OPENAI_VOICE
+        internal fun normalizeOpenAiVoiceOrNull(voice: String?): String? {
+            val normalized = voice?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
+            return normalized.takeIf { it in OPENAI_VOICES }
         }
+
+        internal fun normalizeOpenAiVoice(voice: String): String =
+            normalizeOpenAiVoiceOrNull(voice) ?: DEFAULT_OPENAI_VOICE
         const val DEFAULT_KOKORO_SPEAKER_ID = 0
         const val MIN_TTS_READ_TIMEOUT_MS = 60_000L
         const val DEFAULT_TTS_READ_TIMEOUT_MS = 90_000L

@@ -23,6 +23,7 @@ import kotlinx.coroutines.job
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -42,7 +43,11 @@ data class SystemTtsVoiceSummary(
 )
 
 internal interface SystemTtsSpeaker {
-    suspend fun speak(text: String, useCommunicationUsage: Boolean = false)
+    suspend fun speak(
+        text: String,
+        preferredVoiceName: String? = null,
+        useCommunicationUsage: Boolean = false,
+    )
     fun stop()
     fun shutdown()
 }
@@ -53,6 +58,8 @@ data class TtsSpeakStats(
     val rawChars: Int,
     val spokenChars: Int,
     val engine: TtsEngine,
+    val role: VoiceRole = VoiceRole.AGENT,
+    val voiceId: String? = null,
     val kind: String = "reply",
     val prerollMs: Int = 0,
     val textCacheHit: Boolean = false,
@@ -67,7 +74,14 @@ class TtsPlayer internal constructor(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val useCommunicationUsage: () -> Boolean = { false },
     private val pipelineProvider: () -> List<TtsEngineOption> = { VoicePipelineDefaults.defaultTtsPipeline },
-    private val openAiVoiceProvider: () -> String = { VoicePipelineDefaults.DEFAULT_OPENAI_VOICE },
+    private val roleProfilesProvider: () -> RoleVoiceProfileMap = { RoleVoiceProfileMap() },
+    private val availableGeminiVoicesProvider: () -> List<String> = { emptyList() },
+    private val availableMlKitVoicesProvider: () -> List<String> = {
+        (mlKitTtsSpeaker as? MlKitTtsSpeaker)?.availableVoiceNames.orEmpty()
+    },
+    private val availableSystemVoicesProvider: () -> List<String> = {
+        (systemTtsSpeaker as? AndroidTextToSpeechSpeaker)?.availableLocalVoiceNames.orEmpty()
+    },
     private val inputModeProvider: () -> TtsInputMode = { TtsInputMode.SUMMARIZED },
     private val detailLevelProvider: () -> SpokenDetailLevel = { SpokenDetailLevel.BALANCED },
     private val encodedAudioDecoder: (ByteArray, String?) -> WavAudio = { bytes, contentType ->
@@ -83,9 +97,8 @@ class TtsPlayer internal constructor(
         ttsClient: TtsClient,
         useCommunicationUsage: () -> Boolean = { false },
         pipelineProvider: () -> List<TtsEngineOption> = { VoicePipelineDefaults.defaultTtsPipeline },
-        mlKitVoiceNameProvider: () -> String? = { null },
-        openAiVoiceProvider: () -> String = { VoicePipelineDefaults.DEFAULT_OPENAI_VOICE },
-        systemVoiceNameProvider: () -> String? = { null },
+        roleProfilesProvider: () -> RoleVoiceProfileMap = { RoleVoiceProfileMap() },
+        availableGeminiVoicesProvider: () -> List<String> = { emptyList() },
         inputModeProvider: () -> TtsInputMode = { TtsInputMode.SUMMARIZED },
         detailLevelProvider: () -> SpokenDetailLevel = { SpokenDetailLevel.BALANCED },
         audioOutputCoordinator: AudioOutputCoordinator? = null,
@@ -97,13 +110,13 @@ class TtsPlayer internal constructor(
         pcmPlayerFactory = { AndroidAudioTrackPlayer() },
         systemTtsSpeaker = AndroidTextToSpeechSpeaker(
             appContext = context.applicationContext,
-            preferredVoiceNameProvider = systemVoiceNameProvider,
         ),
-        mlKitTtsSpeaker = MlKitTtsSpeaker(preferredVoiceNameProvider = mlKitVoiceNameProvider),
+        mlKitTtsSpeaker = MlKitTtsSpeaker(),
         ioDispatcher = Dispatchers.IO,
         useCommunicationUsage = useCommunicationUsage,
         pipelineProvider = pipelineProvider,
-        openAiVoiceProvider = openAiVoiceProvider,
+        roleProfilesProvider = roleProfilesProvider,
+        availableGeminiVoicesProvider = availableGeminiVoicesProvider,
         inputModeProvider = inputModeProvider,
         detailLevelProvider = detailLevelProvider,
         audioOutputCoordinator = audioOutputCoordinator,
@@ -124,7 +137,7 @@ class TtsPlayer internal constructor(
     suspend fun speak(
         serverUrl: String,
         text: String,
-        voice: String = TtsClient.DEFAULT_TTS_VOICE,
+        role: VoiceRole = VoiceRole.AGENT,
         sessionLabel: String? = null,
         inputModeOverride: TtsInputMode? = null,
         kind: String = "reply",
@@ -153,21 +166,38 @@ class TtsPlayer internal constructor(
             ensureGenerationActive(myGeneration)
 
             val useComm = useCommunicationUsage()
-            val enabledPipeline = pipelineProvider().filter { it.enabled }
+            val profiles = roleProfilesProvider()
+            val enabledPipeline = VoiceRoleResolver.resolvePipelineForRole(
+                basePipeline = pipelineProvider(),
+                roleAssignment = profiles[role],
+            )
             if (enabledPipeline.isEmpty()) {
                 throw TtsException(message = "All TTS engines are disabled in Settings")
             }
+
+            val geminiVoicePool = availableGeminiVoicesProvider()
+            val mlKitVoicePool = availableMlKitVoicesProvider()
+            val systemVoicePool = availableSystemVoicesProvider()
 
             val failures = mutableListOf<String>()
             var lastStatusCode: Int? = null
             var played = false
             var usedEngine: TtsEngine? = null
+            var usedVoiceId: String? = null
             var usedPrerollMs = 0
             var usedAudioCacheHit = false
 
             for (option in enabledPipeline) {
                 ensureGenerationActive(myGeneration)
                 val engine = option.engine
+                val resolvedVoice = VoiceRoleResolver.resolveVoiceForEngine(
+                    engine = engine,
+                    role = role,
+                    profiles = profiles,
+                    availableGeminiVoices = geminiVoicePool,
+                    availableMlKitVoices = mlKitVoicePool,
+                    availableSystemVoices = systemVoicePool,
+                )
                 val success = try {
                     when (engine) {
                         TtsEngine.MLKIT_GENAI -> {
@@ -192,12 +222,17 @@ class TtsPlayer internal constructor(
                                     playParsedWav(wakeupWav, myGeneration, useComm)
                                     ensureGenerationActive(myGeneration)
                                 }
-                                speaker.speak(spokenText, useComm)
+                                speaker.speak(
+                                    text = spokenText,
+                                    preferredVoiceName = resolvedVoice.voiceId,
+                                    useCommunicationUsage = useComm,
+                                )
                             } finally {
                                 if (playbackStarted) {
                                     audioOutputCoordinator?.onSpeechPlaybackFinished()
                                 }
                             }
+                            usedVoiceId = resolvedVoice.voiceId
                             usedPrerollMs = prerollMs
                             usedAudioCacheHit = false
                             true
@@ -222,12 +257,17 @@ class TtsPlayer internal constructor(
                                     playParsedWav(wakeupWav, myGeneration, useComm)
                                     ensureGenerationActive(myGeneration)
                                 }
-                                systemTtsSpeaker.speak(spokenText, useComm)
+                                systemTtsSpeaker.speak(
+                                    text = spokenText,
+                                    preferredVoiceName = resolvedVoice.voiceId,
+                                    useCommunicationUsage = useComm,
+                                )
                             } finally {
                                 if (playbackStarted) {
                                     audioOutputCoordinator?.onSpeechPlaybackFinished()
                                 }
                             }
+                            usedVoiceId = resolvedVoice.voiceId
                             usedPrerollMs = prerollMs
                             usedAudioCacheHit = false
                             true
@@ -236,15 +276,16 @@ class TtsPlayer internal constructor(
                         TtsEngine.LOCAL_KOKORO,
                         TtsEngine.OPENAI_CLOUD,
                         -> {
-                            val engineVoice = when (engine) {
-                                TtsEngine.OPENAI_CLOUD -> openAiVoiceProvider()
-                                else -> voice
+                            val engineVoice = resolvedVoice.voiceId ?: when (engine) {
+                                TtsEngine.OPENAI_CLOUD -> VoicePipelineDefaults.DEFAULT_OPENAI_VOICE
+                                else -> TtsClient.DEFAULT_TTS_VOICE
                             }
                             val synthesized = ttsClient.synthesizeWithEngineDetailed(
                                 serverUrl = serverUrl,
                                 text = spokenText,
                                 voice = engineVoice,
                                 engine = engine,
+                                kokoroSpeakerId = resolvedVoice.kokoroSpeakerId,
                             )
                             val audio = synthesized.audio
                             ensureGenerationActive(myGeneration)
@@ -278,6 +319,7 @@ class TtsPlayer internal constructor(
                                     audioOutputCoordinator?.onSpeechPlaybackFinished()
                                 }
                             }
+                            usedVoiceId = resolvedVoice.voiceId
                             usedPrerollMs = prerollMs
                             usedAudioCacheHit = synthesized.cacheHit
                             true
@@ -316,6 +358,8 @@ class TtsPlayer internal constructor(
                         rawChars = rawTrimmed.length,
                         spokenChars = spokenText.length,
                         engine = usedEngine,
+                        role = role,
+                        voiceId = usedVoiceId,
                         kind = kind,
                         prerollMs = usedPrerollMs,
                         textCacheHit = textCacheHit,
@@ -686,7 +730,6 @@ private class AndroidAudioTrackPlayer : PcmTrackPlayer {
 
 private class AndroidTextToSpeechSpeaker(
     private val appContext: Context,
-    private val preferredVoiceNameProvider: () -> String? = { null },
 ) : SystemTtsSpeaker {
     private val lock = Any()
     private val pendingUtterances = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
@@ -696,17 +739,28 @@ private class AndroidTextToSpeechSpeaker(
     private var initialized: Boolean = false
     private var released: Boolean = false
 
-    override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+    @Volatile
+    var availableLocalVoiceNames: List<String> = emptyList()
+        private set
+
+    override suspend fun speak(
+        text: String,
+        preferredVoiceName: String?,
+        useCommunicationUsage: Boolean,
+    ) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
 
         val engine = ensureInitialized()
             ?: throw TtsException(message = "Android TextToSpeech engine failed to initialize")
 
-        val preferredName = preferredVoiceNameProvider()?.trim()?.takeIf { it.isNotEmpty() }
+        val preferredName = preferredVoiceName?.trim()?.takeIf { it.isNotEmpty() }
         if (preferredName != null) {
             runCatching {
-                engine.voices?.firstOrNull { it.name == preferredName }?.let { matched ->
+                val voices = engine.voices
+                val matched = voices?.firstOrNull { it.name == preferredName }
+                    ?: voices?.firstOrNull { it.name.equals(preferredName, ignoreCase = true) }
+                if (matched != null) {
                     engine.voice = matched
                 }
             }
@@ -784,6 +838,7 @@ private class AndroidTextToSpeechSpeaker(
                         newDeferred.complete(false)
                     } else if (success) {
                         initialized = true
+                        createdEngine?.let { availableLocalVoiceNames = extractLocalVoiceNames(it) }
                         newDeferred.complete(true)
                     } else {
                         initialized = false
@@ -847,7 +902,31 @@ private class AndroidTextToSpeechSpeaker(
             return null
         }
 
-        return synchronized(lock) { if (!released && initialized) tts else null }
+        val activeEngine = synchronized(lock) { if (!released && initialized) tts else null }
+        if (activeEngine != null && availableLocalVoiceNames.isEmpty()) {
+            availableLocalVoiceNames = extractLocalVoiceNames(activeEngine)
+        }
+        return activeEngine
+    }
+
+    private fun extractLocalVoiceNames(engine: TextToSpeech): List<String> {
+        val defaultLang = Locale.getDefault().language
+        val rawVoices = runCatching { engine.voices }.getOrNull().orEmpty()
+        return rawVoices
+            .filter { v ->
+                !v.isNetworkConnectionRequired &&
+                    v.locale != null &&
+                    (v.locale.language.equals(defaultLang, ignoreCase = true) ||
+                        v.locale.language.equals("en", ignoreCase = true))
+            }
+            .sortedWith(
+                compareBy<android.speech.tts.Voice>(
+                    { !it.locale.language.equals(defaultLang, ignoreCase = true) },
+                    { it.name },
+                ),
+            )
+            .map { it.name }
+            .distinct()
     }
 
     private suspend fun speakSingleUtterance(

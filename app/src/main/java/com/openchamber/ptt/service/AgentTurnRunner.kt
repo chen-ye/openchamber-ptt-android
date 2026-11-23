@@ -6,6 +6,7 @@ import com.openchamber.ptt.storage.PinnedSession
 import com.openchamber.ptt.storage.StagedDraft
 import com.openchamber.ptt.storage.TokenStore
 import com.openchamber.ptt.tts.TtsInputMode
+import com.openchamber.ptt.tts.VoiceRole
 import com.openchamber.ptt.voice.AssistantResponseItem
 import com.openchamber.ptt.voice.DirectVoiceAnswer
 import com.openchamber.ptt.voice.EventStreamClient
@@ -38,7 +39,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 internal data class TtsSpeakRequest(
     val serverUrl: String,
     val text: String,
-    val voice: String,
+    val role: VoiceRole = VoiceRole.AGENT,
     val sessionLabel: String? = null,
     val inputModeOverride: TtsInputMode? = null,
     val kind: String = AgentTurnRunner.TTS_KIND_REPLY,
@@ -294,7 +295,7 @@ internal class AgentTurnRunner(
                     TtsSpeakRequest(
                         serverUrl = serverUrl,
                         text = spokenText,
-                        voice = tokenStore.getEffectiveTtsVoice(serverId),
+                        role = VoiceRole.OPERATOR,
                         inputModeOverride = TtsInputMode.RAW,
                         kind = TTS_KIND_CONTROL,
                         notifySpokenSummary = false,
@@ -413,7 +414,8 @@ internal class AgentTurnRunner(
                                                 TtsSpeakRequest(
                                                     serverUrl = serverUrl,
                                                     text = PttForegroundService.formatPermissionAlertSpeech(turnEvent.tool),
-                                                    voice = tokenStore.getEffectiveTtsVoice(serverId),
+                                                    role = VoiceRole.OPERATOR,
+                                                    inputModeOverride = TtsInputMode.RAW,
                                                     kind = TTS_KIND_PERMISSION,
                                                     notifySpokenSummary = false,
                                                 ),
@@ -499,13 +501,11 @@ internal class AgentTurnRunner(
                                             try {
                                                 if (onSyncTurnCompleted != null) {
                                                     speakQueuedAutoItemsLoop(
-                                                        serverId = serverId,
                                                         serverUrl = serverUrl,
                                                         pinnedSession = pinnedSession,
                                                     )
                                                 } else {
                                                     speakExplicitItemsLoop(
-                                                        serverId = serverId,
                                                         serverUrl = serverUrl,
                                                         pinnedSession = pinnedSession,
                                                         initialItems = itemsToSpeak,
@@ -610,7 +610,6 @@ internal class AgentTurnRunner(
         launchPlayback {
             try {
                 speakQueuedAutoItemsLoop(
-                    serverId = serverId,
                     serverUrl = serverUrl,
                     pinnedSession = pinnedSession,
                 )
@@ -722,7 +721,6 @@ internal class AgentTurnRunner(
                 }
 
                 speakExplicitItemsLoop(
-                    serverId = serverId,
                     serverUrl = serverUrl,
                     pinnedSession = pinnedSession,
                     initialItems = initialItems,
@@ -743,7 +741,6 @@ internal class AgentTurnRunner(
     }
 
     private suspend fun speakQueuedAutoItemsLoop(
-        serverId: String,
         serverUrl: String,
         pinnedSession: PinnedSession,
     ): Boolean {
@@ -761,7 +758,7 @@ internal class AgentTurnRunner(
                 TtsSpeakRequest(
                     serverUrl = serverUrl,
                     text = nextItem.assistantText,
-                    voice = tokenStore.getEffectiveTtsVoice(serverId),
+                    role = VoiceRole.AGENT,
                     sessionLabel = sessionLabel,
                     kind = TTS_KIND_REPLY,
                     notifySpokenSummary = true,
@@ -778,7 +775,6 @@ internal class AgentTurnRunner(
     }
 
     private suspend fun speakExplicitItemsLoop(
-        serverId: String,
         serverUrl: String,
         pinnedSession: PinnedSession,
         initialItems: List<AssistantResponseItem>,
@@ -809,7 +805,7 @@ internal class AgentTurnRunner(
                 TtsSpeakRequest(
                     serverUrl = serverUrl,
                     text = item.assistantText,
-                    voice = tokenStore.getEffectiveTtsVoice(serverId),
+                    role = VoiceRole.AGENT,
                     sessionLabel = sessionLabel,
                     kind = TTS_KIND_REPLY,
                     notifySpokenSummary = true,
@@ -835,7 +831,7 @@ internal class AgentTurnRunner(
                     TtsSpeakRequest(
                         serverUrl = serverUrl,
                         text = trailing.assistantText,
-                        voice = tokenStore.getEffectiveTtsVoice(serverId),
+                        role = VoiceRole.AGENT,
                         sessionLabel = sessionLabel,
                         kind = TTS_KIND_REPLY,
                         notifySpokenSummary = true,
@@ -991,7 +987,7 @@ internal class AgentTurnRunner(
                         TtsSpeakRequest(
                             serverUrl = serverUrl,
                             text = draft.organizedText,
-                            voice = tokenStore.getEffectiveTtsVoice(),
+                            role = VoiceRole.OPERATOR,
                             inputModeOverride = TtsInputMode.RAW,
                             kind = TTS_KIND_DRAFT_PREVIEW,
                             notifySpokenSummary = false,

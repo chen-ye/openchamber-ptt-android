@@ -33,12 +33,14 @@ data class MlKitTtsVoiceSummary(
 
 class MlKitTtsSpeaker(
     private val defaultLocale: Locale = Locale.US,
-    private val preferredVoiceNameProvider: () -> String? = { null },
 ) : SystemTtsSpeaker {
     private val clientLock = Any()
     private var synthesizer: SpeechSynthesizer? = null
     @Volatile
     private var closed = false
+    @Volatile
+    var availableVoiceNames: List<String> = emptyList()
+        private set
 
     private fun getOrCreateClientWithError(): Pair<SpeechSynthesizer?, String?> = synchronized(clientLock) {
         if (closed) return null to "client closed"
@@ -133,6 +135,9 @@ class MlKitTtsSpeaker(
                     summaries.any { it.availability == MlKitAvailability.DOWNLOADABLE } -> MlKitAvailability.DOWNLOADABLE
                     else -> MlKitAvailability.UNAVAILABLE
                 }
+                availableVoiceNames = summaries
+                    .filter { it.availability == MlKitAvailability.AVAILABLE }
+                    .map { it.name }
                 val detail = if (overall == MlKitAvailability.UNAVAILABLE) {
                     "voices=${voices.size} (${matchedLocale.toLanguageTag()})${pkgHint?.let { ", $it" }.orEmpty()}"
                 } else {
@@ -156,7 +161,7 @@ class MlKitTtsSpeaker(
         val client = getOrCreateClient()
             ?: throw IllegalStateException("ML Kit GenAI TTS unavailable on this device")
         val (_, voices) = resolveSupportedVoices(client, locale)
-        val target = resolveVoice(voices, voiceName ?: preferredVoiceNameProvider())
+        val target = resolveVoice(voices, voiceName)
             ?: throw IllegalStateException("No supported ML Kit GenAI TTS voice found")
         client.download(target).collect { status ->
             when (status) {
@@ -168,7 +173,11 @@ class MlKitTtsSpeaker(
         }
     }
 
-    override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+    override suspend fun speak(
+        text: String,
+        preferredVoiceName: String?,
+        useCommunicationUsage: Boolean,
+    ) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
 
@@ -177,7 +186,11 @@ class MlKitTtsSpeaker(
 
         val (_, voices) = runCatching { resolveSupportedVoices(client, defaultLocale) }
             .getOrDefault(defaultLocale to emptyList())
-        val selectedVoice = resolveReadyVoice(client, voices, preferredVoiceNameProvider())
+        val readyVoices = voices.filter { v ->
+            runCatching { client.checkStatus(v) }.getOrNull() == FeatureStatus.AVAILABLE
+        }
+        availableVoiceNames = readyVoices.map { it.name }
+        val selectedVoice = resolveVoice(readyVoices, preferredVoiceName)
             ?: throw TtsException(message = "No installed ML Kit GenAI TTS voice available")
 
         val attributes = AudioAttributes.Builder()
@@ -244,24 +257,6 @@ class MlKitTtsSpeaker(
         }
         runCatching { clientToClose?.stop() }
         runCatching { clientToClose?.close() }
-    }
-
-    private suspend fun resolveReadyVoice(
-        client: SpeechSynthesizer,
-        voices: List<VoiceInfo>,
-        preferredName: String?,
-    ): VoiceInfo? {
-        if (voices.isEmpty()) return null
-        val preferred = resolveVoice(voices, preferredName)
-        if (preferred != null && runCatching { client.checkStatus(preferred) }.getOrNull() == FeatureStatus.AVAILABLE) {
-            return preferred
-        }
-        for (v in voices) {
-            if (runCatching { client.checkStatus(v) }.getOrNull() == FeatureStatus.AVAILABLE) {
-                return v
-            }
-        }
-        return null
     }
 
     private fun resolveVoice(

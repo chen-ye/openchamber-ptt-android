@@ -183,9 +183,7 @@ class PttForegroundService : Service() {
             ttsClient = ttsClient,
             useCommunicationUsage = { bluetoothAudioRouter.isScoPinned },
             pipelineProvider = { tokenStore.getEffectiveTtsPipeline() },
-            mlKitVoiceNameProvider = { tokenStore.getMlKitTtsVoice() },
-            openAiVoiceProvider = { tokenStore.getEffectiveOpenAiTtsVoice() },
-            systemVoiceNameProvider = { tokenStore.getSystemTtsVoice() },
+            roleProfilesProvider = { tokenStore.getEffectiveRoleVoiceProfiles() },
             inputModeProvider = { tokenStore.getEffectiveTtsInputMode() },
             detailLevelProvider = { tokenStore.getEffectiveSpokenDetailLevel() },
             audioOutputCoordinator = audioOutputCoordinator,
@@ -208,6 +206,8 @@ class PttForegroundService : Service() {
                     sessionKey = activeSessionKey(),
                     metrics = mapOf(
                         "kind" to stats.kind,
+                        "role" to stats.role.name,
+                        "voice" to stats.voiceId,
                         "inputMode" to stats.inputMode.name,
                         "prepareMs" to stats.prepareMs,
                         "rawChars" to stats.rawChars,
@@ -296,7 +296,7 @@ class PttForegroundService : Service() {
                 ttsPlayer.speak(
                     serverUrl = req.serverUrl,
                     text = req.text,
-                    voice = req.voice,
+                    role = req.role,
                     sessionLabel = req.sessionLabel,
                     inputModeOverride = req.inputModeOverride,
                     kind = req.kind,
