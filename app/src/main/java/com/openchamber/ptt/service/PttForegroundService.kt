@@ -27,6 +27,7 @@ import androidx.media.session.MediaButtonReceiver
 import com.openchamber.ptt.audio.BluetoothAudioRouter
 import com.openchamber.ptt.audio.Earcon
 import com.openchamber.ptt.audio.EarconPlayer
+import com.openchamber.ptt.audio.ScoDropEvent
 import com.openchamber.ptt.bubble.BubbleHelper
 import com.openchamber.ptt.logging.VoiceUxLogger
 import com.openchamber.ptt.logging.VoiceUxSummary
@@ -146,8 +147,11 @@ class PttForegroundService : Service() {
         super.onCreate()
         serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-        earconPlayer = EarconPlayer(applicationContext)
         bluetoothAudioRouter = BluetoothAudioRouter(this)
+        earconPlayer = EarconPlayer(
+            context = applicationContext,
+            useCommunicationUsage = { bluetoothAudioRouter.isScoPinned },
+        )
         val notificationManager = getSystemService(NotificationManager::class.java)
         notificationBuilder = PttNotificationBuilder(this, notificationManager)
         voiceUxLogger = VoiceUxLogger(applicationContext)
@@ -356,6 +360,9 @@ class PttForegroundService : Service() {
         _statusText.value = notificationBuilder.statusTextForState(stateMachine.currentState)
         notificationBuilder.createNotificationChannels()
         initMediaSession()
+        bluetoothAudioRouter.startMonitoring { drop ->
+            handleUnexpectedScoDrop(drop)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -433,6 +440,7 @@ class PttForegroundService : Service() {
         }
         releaseWakeAndWifiLocks()
         if (::bluetoothAudioRouter.isInitialized) {
+            bluetoothAudioRouter.stopMonitoring()
             bluetoothAudioRouter.release()
         }
         if (::earconPlayer.isInitialized) {
@@ -823,8 +831,19 @@ class PttForegroundService : Service() {
         dispatch(PttEvent.Error(message, isAuthExpired = isAuthExpired))
     }
 
-    fun dispatch(event: PttEvent): PttTransition {
+    fun dispatch(event: PttEvent): PttTransition =
+        dispatchInternal(event, requiredStates = null)
+            ?: error("Unconstrained dispatch must return a transition")
+
+    private fun dispatchInternal(
+        event: PttEvent,
+        requiredStates: Set<PttState>?,
+    ): PttTransition? {
         val transition = synchronized(dispatchLock) {
+            val current = stateMachine.currentState
+            if (requiredStates != null && current !in requiredStates) {
+                return null
+            }
             val tr = stateMachine.dispatch(event)
             syncStateAndStatus(tr)
             applyEffects(tr)
@@ -839,6 +858,57 @@ class PttForegroundService : Service() {
             sessionResponseController.maybeTriggerAutoSpeakIfIdle()
         }
         return transition
+    }
+
+    private fun handleUnexpectedScoDrop(drop: ScoDropEvent) {
+        val current = stateMachine.currentState
+        when (resolveScoDropAction(current, drop)) {
+            ScoDropAction.TRIGGER_STOP_SEND -> {
+                gestureDetector.cancelPending()
+                val tr = dispatchInternal(
+                    PttEvent.SingleTap,
+                    requiredStates = setOf(PttState.RECORDING),
+                )
+                if (tr != null) {
+                    voiceUxLogger.log(
+                        category = VoiceUxLogger.CAT_GESTURE,
+                        event = "sco_drop_stop",
+                        sessionKey = activeSessionKey(),
+                        metrics = mapOf("source" to drop.source.name, "state" to current.name),
+                    )
+                }
+            }
+            ScoDropAction.TRIGGER_BARGE_IN -> {
+                gestureDetector.cancelPending()
+                val tr = dispatchInternal(
+                    PttEvent.SingleTap,
+                    requiredStates = setOf(PttState.SPEAKING_TTS, PttState.STAGED_DRAFT_SPEAKING),
+                )
+                if (tr != null) {
+                    voiceUxLogger.log(
+                        category = VoiceUxLogger.CAT_GESTURE,
+                        event = "sco_drop_barge_in",
+                        sessionKey = activeSessionKey(),
+                        metrics = mapOf("source" to drop.source.name, "state" to current.name),
+                    )
+                }
+            }
+            ScoDropAction.RELEASE_ONLY -> {
+                val reason = when {
+                    drop.interruptedByFocusOrCall -> "sco_drop_interrupted"
+                    !drop.btScoStillAvailable -> "sco_drop_bt_unavailable"
+                    else -> "sco_drop_released"
+                }
+                voiceUxLogger.log(
+                    category = VoiceUxLogger.CAT_GESTURE,
+                    event = reason,
+                    sessionKey = activeSessionKey(),
+                    metrics = mapOf("source" to drop.source.name, "state" to current.name),
+                )
+                bluetoothAudioRouter.release()
+            }
+            ScoDropAction.IGNORE -> Unit
+        }
     }
 
     private fun resolveBoundSession(): BoundServerSession? {
@@ -1120,12 +1190,7 @@ class PttForegroundService : Service() {
                     return@startBurst
                 }
 
-                agentTurnRunner.finalizeQuickTranscript(
-                    serverUrl = url,
-                    sessionKey = TokenStore.sessionKeyFor(sid, session),
-                    pinnedSession = session,
-                    rawTranscript = rawTranscript,
-                )
+                agentTurnRunner.finalizeQuickTranscript(rawTranscript)
             },
             onFailure = { failedServerId, t ->
                 handleUnauthorizedIfNeeded(failedServerId, t)
@@ -1408,6 +1473,13 @@ class PttForegroundService : Service() {
         stopSelf()
     }
 
+    internal enum class ScoDropAction {
+        TRIGGER_STOP_SEND,
+        TRIGGER_BARGE_IN,
+        RELEASE_ONLY,
+        IGNORE,
+    }
+
     companion object {
         const val ACTION_ARM = "com.openchamber.ptt.action.ARM"
         const val ACTION_DISARM = "com.openchamber.ptt.action.DISARM"
@@ -1505,6 +1577,31 @@ class PttForegroundService : Service() {
                 .substringAfterLast('\\')
                 .trim()
                 .takeIf { it.isNotEmpty() }
+        }
+
+        internal fun resolveScoDropAction(
+            state: PttState,
+            drop: ScoDropEvent,
+        ): ScoDropAction {
+            if (drop.interruptedByFocusOrCall) {
+                return when (state) {
+                    PttState.RECORDING,
+                    PttState.SPEAKING_TTS,
+                    PttState.STAGED_DRAFT_SPEAKING,
+                    -> ScoDropAction.RELEASE_ONLY
+                    else -> ScoDropAction.IGNORE
+                }
+            }
+            if (!drop.btScoStillAvailable) {
+                return ScoDropAction.RELEASE_ONLY
+            }
+            return when (state) {
+                PttState.RECORDING -> ScoDropAction.TRIGGER_STOP_SEND
+                PttState.SPEAKING_TTS,
+                PttState.STAGED_DRAFT_SPEAKING,
+                -> ScoDropAction.TRIGGER_BARGE_IN
+                else -> ScoDropAction.RELEASE_ONLY
+            }
         }
 
         internal fun remainingBargeInCooldownMs(

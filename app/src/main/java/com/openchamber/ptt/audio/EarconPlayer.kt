@@ -25,8 +25,9 @@ import kotlin.math.sin
 
 /**
  * Bundled `studio` theme cues from `romainsimon/uisfx` (CC0-1.0), pre-decoded to PCM16 and
- * played via [AudioTrack] (`USAGE_MEDIA`, `MODE_STATIC`) so Android 14+ maintains media-button
- * routing to `OpenChamberPttMediaSession` while screen-locked.
+ * played via [AudioTrack] (`MODE_STATIC`) using `USAGE_VOICE_COMMUNICATION` while SCO is pinned
+ * and `USAGE_MEDIA` otherwise so Android 14+ maintains media-button routing to
+ * `OpenChamberPttMediaSession` while screen-locked.
  */
 enum class Earcon(val cueName: String) {
     ARMED("armed"),
@@ -53,17 +54,22 @@ class EarconPlayer internal constructor(
     context: Context? = null,
     @Suppress("unused") private val streamType: Int = AudioManager.STREAM_MUSIC,
     private val volumePercent: Int = DEFAULT_VOLUME_PERCENT,
+    private val useCommunicationUsage: () -> Boolean = { false },
     private val clipObserver: ((Earcon, DecodedClip) -> Unit)? = null,
+    private val playbackSpecObserver: ((Earcon, PlaybackSpec) -> Unit)? = null,
 ) {
     constructor(
         context: Context? = null,
         streamType: Int = AudioManager.STREAM_MUSIC,
         volumePercent: Int = DEFAULT_VOLUME_PERCENT,
+        useCommunicationUsage: () -> Boolean = { false },
     ) : this(
         context = context,
         streamType = streamType,
         volumePercent = volumePercent,
+        useCommunicationUsage = useCommunicationUsage,
         clipObserver = null,
+        playbackSpecObserver = null,
     )
 
     private val appContext = context?.applicationContext
@@ -99,6 +105,7 @@ class EarconPlayer internal constructor(
     }
 
     fun play(earcon: Earcon) {
+        val useCommunication = useCommunicationUsage()
         val exec = synchronized(lock) {
             if (released) return
             stopActiveTrackLocked()
@@ -111,7 +118,7 @@ class EarconPlayer internal constructor(
                 decodeRawOgg(ctx, rawResFor(earcon))?.also { decodedClips.putIfAbsent(earcon, it) }
             } ?: synthesizeFallbackClip(earcon)
             clipObserver?.invoke(earcon, clip)
-            playClip(clip)
+            playClip(earcon, clip, useCommunication)
         }
     }
 
@@ -179,8 +186,14 @@ class EarconPlayer internal constructor(
         }
     }
 
-    private fun playClip(clip: DecodedClip) {
+    private fun playClip(
+        earcon: Earcon,
+        clip: DecodedClip,
+        useCommunication: Boolean,
+    ) {
         if (clip.pcmBytes.isEmpty()) return
+        val spec = playbackSpecFor(useCommunication)
+        playbackSpecObserver?.invoke(earcon, spec)
         val channelMask = if (clip.channelCount >= 2) {
             AudioFormat.CHANNEL_OUT_STEREO
         } else {
@@ -190,8 +203,8 @@ class EarconPlayer internal constructor(
             AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .setUsage(spec.usage)
+                        .setContentType(spec.contentType)
                         .build(),
                 )
                 .setAudioFormat(
@@ -405,10 +418,28 @@ class EarconPlayer internal constructor(
         val durationMs: Int,
     )
 
+    internal data class PlaybackSpec(
+        val usage: Int,
+        val contentType: Int,
+    )
+
     companion object {
         private const val TAG = "EarconPlayer"
         private const val DEFAULT_VOLUME_PERCENT = 85
         private const val SYNTH_SAMPLE_RATE_HZ = 16_000
+
+        internal fun playbackSpecFor(useCommunicationUsage: Boolean): PlaybackSpec =
+            if (useCommunicationUsage) {
+                PlaybackSpec(
+                    usage = AudioAttributes.USAGE_VOICE_COMMUNICATION,
+                    contentType = AudioAttributes.CONTENT_TYPE_SONIFICATION,
+                )
+            } else {
+                PlaybackSpec(
+                    usage = AudioAttributes.USAGE_MEDIA,
+                    contentType = AudioAttributes.CONTENT_TYPE_MUSIC,
+                )
+            }
 
         @RawRes
         internal fun rawResFor(earcon: Earcon): Int = when (earcon) {

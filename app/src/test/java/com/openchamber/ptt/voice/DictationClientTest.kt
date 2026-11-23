@@ -115,7 +115,7 @@ class DictationClientTest {
         val options = startFrame["options"]!!.jsonObject
         assertEquals("local", options["provider"]?.jsonPrimitive?.content)
         assertEquals("en", options["language"]?.jsonPrimitive?.content)
-        assertTrue(options["correct"]?.jsonPrimitive?.boolean == true)
+        assertEquals(false, options["correct"]?.jsonPrimitive?.boolean)
 
         val chunkFrame0 = json.parseToJsonElement(serverReceivedFrames.poll(5, TimeUnit.SECONDS)!!).jsonObject
         assertEquals("chunk", chunkFrame0["type"]?.jsonPrimitive?.content)

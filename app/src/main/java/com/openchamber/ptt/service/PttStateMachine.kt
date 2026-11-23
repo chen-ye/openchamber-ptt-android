@@ -271,11 +271,13 @@ class PttStateMachine(
             PttState.RECORDING -> if (hasDraft) {
                 PttState.TRANSCRIBING_STAGE to listOf(
                     PttEffect.StopRecording,
+                    PttEffect.ReleaseBluetoothAudio,
                     PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
                 )
             } else {
                 PttState.TRANSCRIBING_SEND to listOf(
                     PttEffect.StopRecording,
+                    PttEffect.ReleaseBluetoothAudio,
                 )
             }
 
@@ -316,6 +318,7 @@ class PttStateMachine(
 
             PttState.RECORDING -> PttState.TRANSCRIBING_STAGE to listOf(
                 PttEffect.StopRecording,
+                PttEffect.ReleaseBluetoothAudio,
                 PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
             )
 
@@ -384,6 +387,7 @@ class PttStateMachine(
         PttEvent.StageCapture -> when (current) {
             PttState.RECORDING -> PttState.TRANSCRIBING_STAGE to listOf(
                 PttEffect.StopRecording,
+                PttEffect.ReleaseBluetoothAudio,
                 PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
             )
             else -> current to emptyList()

@@ -909,4 +909,37 @@ class AgentTurnRunnerTest {
                 scope.cancel()
             }
         }
+
+    @Test
+    fun `finalizeQuickTranscript preserves raw transcript verbatim without calling small-model generate`() =
+        runBlocking {
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+            try {
+                val smallModelHits = AtomicInteger(0)
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                server.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse {
+                        if (request.path == OpenChamberHttp.SMALL_MODEL_GENERATE_PATH) {
+                            smallModelHits.incrementAndGet()
+                        }
+                        return MockResponse().setResponseCode(500)
+                    }
+                }
+                val harness = createHarness(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    initialState = PttState.TRANSCRIBING_SEND,
+                )
+
+                val raw = "  um actually check foo_bar.kt --no-verify please  "
+                harness.runner.finalizeQuickTranscript(raw)
+
+                assertEquals(0, smallModelHits.get())
+                assertEquals("um actually check foo_bar.kt --no-verify please", harness.pendingQuickTranscript)
+                assertEquals("um actually check foo_bar.kt --no-verify please", harness.lastTranscript)
+                assertEquals(PttState.SEND_GRACE, harness.stateMachine.currentState)
+            } finally {
+                scope.cancel()
+            }
+        }
 }

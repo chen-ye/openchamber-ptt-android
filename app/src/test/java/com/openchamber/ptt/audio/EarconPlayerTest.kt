@@ -1,5 +1,6 @@
 package com.openchamber.ptt.audio
 
+import android.media.AudioAttributes
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -9,6 +10,7 @@ import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class EarconPlayerTest {
     @Test
@@ -54,5 +56,59 @@ class EarconPlayerTest {
         Thread.sleep(50L)
         assertEquals(afterReleaseCount, played.size)
         assertNotNull(EarconPlayer.toneSpecFor(Earcon.ARMED))
+    }
+
+    @Test
+    fun `playbackSpec aligns EarconPlayer usage with isScoPinned state`() {
+        assertEquals(
+            EarconPlayer.PlaybackSpec(
+                usage = AudioAttributes.USAGE_MEDIA,
+                contentType = AudioAttributes.CONTENT_TYPE_MUSIC,
+            ),
+            EarconPlayer.playbackSpecFor(useCommunicationUsage = false),
+        )
+        assertEquals(
+            EarconPlayer.PlaybackSpec(
+                usage = AudioAttributes.USAGE_VOICE_COMMUNICATION,
+                contentType = AudioAttributes.CONTENT_TYPE_SONIFICATION,
+            ),
+            EarconPlayer.playbackSpecFor(useCommunicationUsage = true),
+        )
+
+        val scoPinned = AtomicBoolean(false)
+        val observedSpecs = CopyOnWriteArrayList<Pair<Earcon, EarconPlayer.PlaybackSpec>>()
+        val latch = CountDownLatch(2)
+        val player = EarconPlayer(
+            context = null,
+            useCommunicationUsage = { scoPinned.get() },
+            playbackSpecObserver = { earcon, spec ->
+                observedSpecs.add(earcon to spec)
+                latch.countDown()
+            },
+        )
+        try {
+            player.play(Earcon.ARMED)
+            scoPinned.set(true)
+            player.play(Earcon.REC_START)
+
+            assertTrue("Expected both earcon playback specs", latch.await(3, TimeUnit.SECONDS))
+            assertEquals(2, observedSpecs.size)
+            assertEquals(
+                Earcon.ARMED to EarconPlayer.PlaybackSpec(
+                    usage = AudioAttributes.USAGE_MEDIA,
+                    contentType = AudioAttributes.CONTENT_TYPE_MUSIC,
+                ),
+                observedSpecs[0],
+            )
+            assertEquals(
+                Earcon.REC_START to EarconPlayer.PlaybackSpec(
+                    usage = AudioAttributes.USAGE_VOICE_COMMUNICATION,
+                    contentType = AudioAttributes.CONTENT_TYPE_SONIFICATION,
+                ),
+                observedSpecs[1],
+            )
+        } finally {
+            player.release()
+        }
     }
 }

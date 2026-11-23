@@ -41,7 +41,7 @@ class DictationException(
 data class DictationOptions(
     val provider: String = "local",
     val language: String = "en",
-    val correct: Boolean = true,
+    val correct: Boolean = false,
 )
 
 interface DictationSession {

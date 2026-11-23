@@ -73,10 +73,16 @@ class PttStateMachineTest {
             startRec.effects,
         )
 
-        // 2nd single tap: RECORDING -> TRANSCRIBING_SEND
+        // 2nd single tap: RECORDING -> TRANSCRIBING_SEND (releases SCO immediately for SEND_GRACE AVRCP undo)
         val stopRec = sm.dispatch(PttEvent.SingleTap)
         assertEquals(PttState.TRANSCRIBING_SEND, stopRec.current)
-        assertEquals(listOf(PttEffect.StopRecording), stopRec.effects)
+        assertEquals(
+            listOf(
+                PttEffect.StopRecording,
+                PttEffect.ReleaseBluetoothAudio,
+            ),
+            stopRec.effects,
+        )
 
         // TranscriptReady -> SEND_GRACE (2.5s window)
         val transcript = sm.dispatch(PttEvent.TranscriptReady("run unit tests"))
@@ -155,12 +161,13 @@ class PttStateMachineTest {
         sm.dispatch(PttEvent.SingleTap)
         assertEquals(PttState.RECORDING, sm.currentState)
 
-        // DoubleTap stops and stages
+        // DoubleTap stops, releases SCO immediately, and stages
         val stage = sm.dispatch(PttEvent.DoubleTap)
         assertEquals(PttState.TRANSCRIBING_STAGE, stage.current)
         assertEquals(
             listOf(
                 PttEffect.StopRecording,
+                PttEffect.ReleaseBluetoothAudio,
                 PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
             ),
             stage.effects,
@@ -417,6 +424,7 @@ class PttStateMachineTest {
         assertEquals(
             listOf(
                 PttEffect.StopRecording,
+                PttEffect.ReleaseBluetoothAudio,
                 PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
             ),
             stopAppend.effects,
@@ -550,5 +558,24 @@ class PttStateMachineTest {
         val armedErr = sm.dispatch(PttEvent.Error("Unauthorized", isAuthExpired = true))
         assertEquals(PttState.ERROR, armedErr.current)
         assertTrue(armedErr.effects.contains(PttEffect.PlayEarcon(Earcon.AUTH_EXPIRED)))
+    }
+
+    @Test
+    fun `StageCapture from RECORDING stops recording, releases Bluetooth audio, and plays STAGED_PAUSE`() {
+        val sm = PttStateMachine()
+        sm.dispatch(PttEvent.Arm())
+        sm.dispatch(PttEvent.SingleTap)
+        assertEquals(PttState.RECORDING, sm.currentState)
+
+        val stage = sm.dispatch(PttEvent.StageCapture)
+        assertEquals(PttState.TRANSCRIBING_STAGE, stage.current)
+        assertEquals(
+            listOf(
+                PttEffect.StopRecording,
+                PttEffect.ReleaseBluetoothAudio,
+                PttEffect.PlayEarcon(Earcon.STAGED_PAUSE),
+            ),
+            stage.effects,
+        )
     }
 }

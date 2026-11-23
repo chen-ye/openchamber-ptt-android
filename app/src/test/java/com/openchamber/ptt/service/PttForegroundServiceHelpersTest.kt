@@ -1,5 +1,7 @@
 package com.openchamber.ptt.service
 
+import com.openchamber.ptt.audio.ScoDropEvent
+import com.openchamber.ptt.audio.ScoDropSource
 import com.openchamber.ptt.storage.PinnedSession
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -158,5 +160,53 @@ class PttForegroundServiceHelpersTest {
         assertTrue(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(ttsDoneToIdle))
         assertTrue(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(discardToDraft))
         assertFalse(PttForegroundService.shouldCheckAutoSpeakAfterIdleReturn(whileRecording))
+    }
+
+    @Test
+    fun `resolveScoDropAction maps active SCO drops cleanly by state, BT availability, and interruption`() {
+        val btButtonDrop = ScoDropEvent(
+            source = ScoDropSource.COMMUNICATION_DEVICE,
+            btScoStillAvailable = true,
+            interruptedByFocusOrCall = false,
+        )
+        val btDisconnected = ScoDropEvent(
+            source = ScoDropSource.SCO_AUDIO_BROADCAST,
+            btScoStillAvailable = false,
+            interruptedByFocusOrCall = false,
+        )
+        val focusInterrupted = ScoDropEvent(
+            source = ScoDropSource.COMMUNICATION_DEVICE,
+            btScoStillAvailable = true,
+            interruptedByFocusOrCall = true,
+        )
+
+        assertEquals(
+            PttForegroundService.ScoDropAction.TRIGGER_STOP_SEND,
+            PttForegroundService.resolveScoDropAction(PttState.RECORDING, btButtonDrop),
+        )
+        assertEquals(
+            PttForegroundService.ScoDropAction.TRIGGER_BARGE_IN,
+            PttForegroundService.resolveScoDropAction(PttState.SPEAKING_TTS, btButtonDrop),
+        )
+        assertEquals(
+            PttForegroundService.ScoDropAction.TRIGGER_BARGE_IN,
+            PttForegroundService.resolveScoDropAction(PttState.STAGED_DRAFT_SPEAKING, btButtonDrop),
+        )
+        assertEquals(
+            PttForegroundService.ScoDropAction.RELEASE_ONLY,
+            PttForegroundService.resolveScoDropAction(PttState.SEND_GRACE, btButtonDrop),
+        )
+        assertEquals(
+            PttForegroundService.ScoDropAction.RELEASE_ONLY,
+            PttForegroundService.resolveScoDropAction(PttState.RECORDING, btDisconnected),
+        )
+        assertEquals(
+            PttForegroundService.ScoDropAction.RELEASE_ONLY,
+            PttForegroundService.resolveScoDropAction(PttState.RECORDING, focusInterrupted),
+        )
+        assertEquals(
+            PttForegroundService.ScoDropAction.IGNORE,
+            PttForegroundService.resolveScoDropAction(PttState.ARMED_IDLE, focusInterrupted),
+        )
     }
 }
