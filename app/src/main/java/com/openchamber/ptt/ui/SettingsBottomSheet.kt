@@ -336,6 +336,8 @@ internal fun SettingsBottomSheet(
     onToggleSttFallback: (Boolean) -> Unit,
     quickTurnDirectAnswer: Boolean,
     onToggleQuickTurnDirectAnswer: (Boolean) -> Unit,
+    quickTranscriptCleanup: Boolean,
+    onToggleQuickTranscriptCleanup: (Boolean) -> Unit,
     mlKitAdvancedStatus: MlKitStatusReport?,
     mlKitBasicStatus: MlKitStatusReport?,
     mlKitDownloadStatus: String?,
@@ -698,6 +700,43 @@ internal fun SettingsBottomSheet(
                         }
                         Switch(
                             checked = quickTurnDirectAnswer,
+                            onCheckedChange = null,
+                        )
+                    }
+                }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .toggleable(
+                            value = quickTranscriptCleanup,
+                            role = Role.Switch,
+                            onValueChange = onToggleQuickTranscriptCleanup,
+                        ),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Quick-mode transcript cleanup",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                text = "Remove filled pauses and stutters with the small model in direct mode (off sends raw speech verbatim)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = quickTranscriptCleanup,
                             onCheckedChange = null,
                         )
                     }

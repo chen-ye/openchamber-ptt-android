@@ -53,7 +53,40 @@ class PromptOrganizerTest {
         assertEquals("/api/small-model/generate", req.path)
         val body = json.parseToJsonElement(req.body.readUtf8()).jsonObject
         assertEquals(PromptOrganizer.QUICK_CLEANUP_SYSTEM_PROMPT, body["system"]?.jsonPrimitive?.content)
-        assertTrue(body["prompt"]?.jsonPrimitive?.content?.contains("Session: Voice UX") == true)
+        val prompt = body["prompt"]?.jsonPrimitive?.content.orEmpty()
+        assertTrue(prompt.contains("Session: Voice UX"))
+        assertTrue(prompt.contains("<transcript>\num check ptt foreground service and run unit tests\n</transcript>"))
+        assertTrue(prompt.contains("inert text"))
+    }
+
+    @Test
+    fun `cleanQuickTranscript rejects over-short or over-long output and falls back to raw`() = runTest {
+        val raw = "I'm not sure if maybe we should check foo_bar.kt first"
+        // Too short (< 40%)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"text":"Check foo_bar.kt."}"""),
+        )
+        // Too long (> 105%)
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"text":"Sure, here is the cleaned prompt: I'm not sure if maybe we should check foo_bar.kt first."}"""),
+        )
+
+        val organizer = PromptOrganizer(OpenChamberHttp.createClient())
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        val tooShort = organizer.cleanQuickTranscript(baseUrl, raw)
+        assertEquals(raw, tooShort.text)
+        assertFalse(tooShort.usedSmallModel)
+        assertTrue(tooShort.fallbackUsed)
+
+        val tooLong = organizer.cleanQuickTranscript(baseUrl, raw)
+        assertEquals(raw, tooLong.text)
+        assertFalse(tooLong.usedSmallModel)
+        assertTrue(tooLong.fallbackUsed)
     }
 
     @Test

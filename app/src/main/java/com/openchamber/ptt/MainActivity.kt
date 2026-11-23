@@ -762,6 +762,10 @@ private fun OpenChamberPttScreen(
             onToggleQuickTurnDirectAnswer = { enabled ->
                 cockpit.toggleQuickTurnDirectAnswer(enabled)
             },
+            quickTranscriptCleanup = cockpit.quickTranscriptCleanup,
+            onToggleQuickTranscriptCleanup = { enabled ->
+                cockpit.toggleQuickTranscriptCleanup(enabled)
+            },
             mlKitAdvancedStatus = mlKitAdvancedStatus,
             mlKitBasicStatus = mlKitBasicStatus,
             mlKitDownloadStatus = mlKitDownloadStatus,

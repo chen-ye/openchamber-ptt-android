@@ -56,6 +56,7 @@ data class ServerVoiceOverride(
     val sttEngine: SttEngine? = null,
     val sttFallbackToParakeet: Boolean? = null,
     val quickTurnDirectAnswer: Boolean? = null,
+    val quickTranscriptCleanup: Boolean? = null,
 )
 
 @Serializable
@@ -482,6 +483,27 @@ class TokenStore(
             overrideUpdate = { it.copy(quickTurnDirectAnswer = enabled) },
         )
 
+    fun getQuickTranscriptCleanup(): Boolean = prefs.getBoolean(KEY_QUICK_TRANSCRIPT_CLEANUP, false)
+
+    fun setQuickTranscriptCleanup(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_QUICK_TRANSCRIPT_CLEANUP, enabled).apply()
+        notifyChanged()
+    }
+
+    fun getEffectiveQuickTranscriptCleanup(serverId: String? = getActiveServer()?.id): Boolean =
+        effectiveSetting(
+            serverId = serverId,
+            overridePick = { it.quickTranscriptCleanup },
+            globalPick = ::getQuickTranscriptCleanup,
+        )
+
+    fun saveQuickTranscriptCleanup(enabled: Boolean, customServerId: String? = null) =
+        updateSetting(
+            customServerId = customServerId,
+            globalSave = { setQuickTranscriptCleanup(enabled) },
+            overrideUpdate = { it.copy(quickTranscriptCleanup = enabled) },
+        )
+
     fun getOrCreateInstallId(): String {
         val existing = prefs.getString(KEY_INSTALL_ID, null)?.takeIf { it.isNotBlank() }
         if (existing != null) return existing
@@ -677,6 +699,7 @@ class TokenStore(
         private const val KEY_STT_ENGINE = "stt_engine"
         private const val KEY_STT_FALLBACK_PARAKEET = "stt_fallback_parakeet"
         private const val KEY_QUICK_TURN_DIRECT_ANSWER = "quick_turn_direct_answer"
+        private const val KEY_QUICK_TRANSCRIPT_CLEANUP = "quick_transcript_cleanup"
         const val DEFAULT_TTS_VOICE = "Kore"
         private const val KEY_INSTALL_ID = "install_id"
         private const val KEY_STAGED_DRAFTS = "staged_drafts_v1"

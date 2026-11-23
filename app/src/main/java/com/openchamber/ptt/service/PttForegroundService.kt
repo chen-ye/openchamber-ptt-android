@@ -832,16 +832,20 @@ class PttForegroundService : Service() {
     }
 
     fun dispatch(event: PttEvent): PttTransition =
-        dispatchInternal(event, requiredStates = null)
+        dispatchInternal(event, requiredStates = null, requiredPinGeneration = null)
             ?: error("Unconstrained dispatch must return a transition")
 
     private fun dispatchInternal(
         event: PttEvent,
         requiredStates: Set<PttState>?,
+        requiredPinGeneration: Long?,
     ): PttTransition? {
         val transition = synchronized(dispatchLock) {
             val current = stateMachine.currentState
             if (requiredStates != null && current !in requiredStates) {
+                return null
+            }
+            if (requiredPinGeneration != null && !bluetoothAudioRouter.isCurrentPinGeneration(requiredPinGeneration)) {
                 return null
             }
             val tr = stateMachine.dispatch(event)
@@ -868,6 +872,7 @@ class PttForegroundService : Service() {
                 val tr = dispatchInternal(
                     PttEvent.SingleTap,
                     requiredStates = setOf(PttState.RECORDING),
+                    requiredPinGeneration = drop.pinGeneration,
                 )
                 if (tr != null) {
                     voiceUxLogger.log(
@@ -883,6 +888,7 @@ class PttForegroundService : Service() {
                 val tr = dispatchInternal(
                     PttEvent.SingleTap,
                     requiredStates = setOf(PttState.SPEAKING_TTS, PttState.STAGED_DRAFT_SPEAKING),
+                    requiredPinGeneration = drop.pinGeneration,
                 )
                 if (tr != null) {
                     voiceUxLogger.log(
@@ -894,18 +900,21 @@ class PttForegroundService : Service() {
                 }
             }
             ScoDropAction.RELEASE_ONLY -> {
+                if (!bluetoothAudioRouter.isCurrentPinGeneration(drop.pinGeneration)) {
+                    return
+                }
                 val reason = when {
                     drop.interruptedByFocusOrCall -> "sco_drop_interrupted"
                     !drop.btScoStillAvailable -> "sco_drop_bt_unavailable"
                     else -> "sco_drop_released"
                 }
+                bluetoothAudioRouter.releaseIfGeneration(drop.pinGeneration)
                 voiceUxLogger.log(
                     category = VoiceUxLogger.CAT_GESTURE,
                     event = reason,
                     sessionKey = activeSessionKey(),
                     metrics = mapOf("source" to drop.source.name, "state" to current.name),
                 )
-                bluetoothAudioRouter.release()
             }
             ScoDropAction.IGNORE -> Unit
         }
@@ -1190,7 +1199,13 @@ class PttForegroundService : Service() {
                     return@startBurst
                 }
 
-                agentTurnRunner.finalizeQuickTranscript(rawTranscript)
+                agentTurnRunner.finalizeQuickTranscript(
+                    serverId = sid,
+                    serverUrl = url,
+                    sessionKey = TokenStore.sessionKeyFor(sid, session),
+                    pinnedSession = session,
+                    rawTranscript = rawTranscript,
+                )
             },
             onFailure = { failedServerId, t ->
                 handleUnauthorizedIfNeeded(failedServerId, t)

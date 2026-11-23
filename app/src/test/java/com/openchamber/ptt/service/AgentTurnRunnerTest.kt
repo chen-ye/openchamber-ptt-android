@@ -932,11 +932,61 @@ class AgentTurnRunnerTest {
                 )
 
                 val raw = "  um actually check foo_bar.kt --no-verify please  "
-                harness.runner.finalizeQuickTranscript(raw)
+                assertFalse(harness.store.getEffectiveQuickTranscriptCleanup(harness.serverId))
+                harness.runner.finalizeQuickTranscript(
+                    serverId = harness.serverId,
+                    serverUrl = baseUrl,
+                    sessionKey = harness.sessionKey,
+                    pinnedSession = PinnedSession("ses_1", "/proj", "Payments"),
+                    rawTranscript = raw,
+                )
 
                 assertEquals(0, smallModelHits.get())
                 assertEquals("um actually check foo_bar.kt --no-verify please", harness.pendingQuickTranscript)
                 assertEquals("um actually check foo_bar.kt --no-verify please", harness.lastTranscript)
+                assertEquals(PttState.SEND_GRACE, harness.stateMachine.currentState)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun `finalizeQuickTranscript runs small-model cleanup when quickTranscriptCleanup is enabled`() =
+        runBlocking {
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+            try {
+                val smallModelHits = AtomicInteger(0)
+                val baseUrl = server.url("/").toString().trimEnd('/')
+                server.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse {
+                        if (request.path == OpenChamberHttp.SMALL_MODEL_GENERATE_PATH) {
+                            smallModelHits.incrementAndGet()
+                            return MockResponse()
+                                .setResponseCode(200)
+                                .setBody("""{"text":"maybe check foo_bar.kt --no-verify please"}""")
+                        }
+                        return MockResponse().setResponseCode(404)
+                    }
+                }
+                val harness = createHarness(
+                    scope = scope,
+                    baseUrl = baseUrl,
+                    initialState = PttState.TRANSCRIBING_SEND,
+                )
+                harness.store.saveQuickTranscriptCleanup(true)
+
+                val raw = "  um maybe check foo_bar.kt --no-verify please  "
+                harness.runner.finalizeQuickTranscript(
+                    serverId = harness.serverId,
+                    serverUrl = baseUrl,
+                    sessionKey = harness.sessionKey,
+                    pinnedSession = PinnedSession("ses_1", "/proj", "Payments"),
+                    rawTranscript = raw,
+                )
+
+                assertEquals(1, smallModelHits.get())
+                assertEquals("maybe check foo_bar.kt --no-verify please", harness.pendingQuickTranscript)
+                assertEquals("maybe check foo_bar.kt --no-verify please", harness.lastTranscript)
                 assertEquals(PttState.SEND_GRACE, harness.stateMachine.currentState)
             } finally {
                 scope.cancel()

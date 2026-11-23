@@ -141,6 +141,8 @@ internal class VoiceCockpitState(
         private set
     var quickTurnDirectAnswer by mutableStateOf(tokenStore.getEffectiveQuickTurnDirectAnswer())
         private set
+    var quickTranscriptCleanup by mutableStateOf(tokenStore.getEffectiveQuickTranscriptCleanup())
+        private set
 
     var mlKitTtsStatus by mutableStateOf<MlKitStatusReport?>(null)
         private set
@@ -245,6 +247,7 @@ internal class VoiceCockpitState(
         sttEngine = tokenStore.getEffectiveSttEngine(serverId)
         sttFallbackToParakeet = tokenStore.getEffectiveSttFallbackToParakeet(serverId)
         quickTurnDirectAnswer = tokenStore.getEffectiveQuickTurnDirectAnswer(serverId)
+        quickTranscriptCleanup = tokenStore.getEffectiveQuickTranscriptCleanup(serverId)
     }
 
     fun syncServerStateFromStore() {
@@ -520,6 +523,7 @@ internal class VoiceCockpitState(
                     sttEngine = sttEngine,
                     sttFallbackToParakeet = sttFallbackToParakeet,
                     quickTurnDirectAnswer = quickTurnDirectAnswer,
+                    quickTranscriptCleanup = quickTranscriptCleanup,
                 ),
             )
         } else {
@@ -555,6 +559,12 @@ internal class VoiceCockpitState(
     fun toggleQuickTurnDirectAnswer(enabled: Boolean) {
         quickTurnDirectAnswer = enabled
         tokenStore.saveQuickTurnDirectAnswer(enabled, customServerId)
+        syncServerStateFromStore()
+    }
+
+    fun toggleQuickTranscriptCleanup(enabled: Boolean) {
+        quickTranscriptCleanup = enabled
+        tokenStore.saveQuickTranscriptCleanup(enabled, customServerId)
         syncServerStateFromStore()
     }
 

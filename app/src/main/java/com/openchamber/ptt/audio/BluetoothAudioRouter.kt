@@ -22,6 +22,7 @@ data class ScoDropEvent(
     val source: ScoDropSource,
     val btScoStillAvailable: Boolean,
     val interruptedByFocusOrCall: Boolean,
+    val pinGeneration: Long = 0L,
 )
 
 internal interface AudioRoutingPlatform {
@@ -127,6 +128,8 @@ private class AndroidAudioRoutingPlatform(
             }.getOrDefault(false)
         }
 
+        if (!isScoAvailable()) return false
+
         @Suppress("DEPRECATION")
         return runCatching {
             audioManager.isBluetoothScoOn = true
@@ -177,6 +180,8 @@ class BluetoothAudioRouter internal constructor(
     private var scoConfirmedFromEvent: Boolean = false
     private var dropReportedForCurrentPin: Boolean = false
     private var pinnedAtElapsedMs: Long = 0L
+    private var pinGeneration: Long = 0L
+    private var focusGeneration: Long = 0L
     private var audioFocusInterrupted: Boolean = false
 
     @Volatile
@@ -193,8 +198,12 @@ class BluetoothAudioRouter internal constructor(
         onAudioFocusChange: (Int) -> Unit = {},
     ): Boolean {
         synchronized(lock) {
-            audioFocusInterrupted = false
-            requestTransientFocusLocked(forCommunication = pinSco, onAudioFocusChange = onAudioFocusChange)
+            pinGeneration++
+            val focusGranted = requestTransientFocusLocked(
+                forCommunication = pinSco,
+                onAudioFocusChange = onAudioFocusChange,
+            )
+            audioFocusInterrupted = !focusGranted
             return if (pinSco) {
                 pinBluetoothScoLocked()
             } else {
@@ -217,10 +226,26 @@ class BluetoothAudioRouter internal constructor(
 
     fun release() {
         synchronized(lock) {
-            audioFocusInterrupted = false
-            clearScoRoutingLocked()
-            platform.abandonTransientFocus()
+            releaseLocked()
         }
+    }
+
+    fun releaseIfGeneration(generation: Long) {
+        synchronized(lock) {
+            if (pinGeneration != generation) return
+            releaseLocked()
+        }
+    }
+
+    internal fun isCurrentPinGeneration(generation: Long): Boolean =
+        synchronized(lock) { pinGeneration == generation }
+
+    private fun releaseLocked() {
+        pinGeneration++
+        focusGeneration++
+        audioFocusInterrupted = false
+        clearScoRoutingLocked()
+        platform.abandonTransientFocus()
     }
 
     fun startMonitoring(onScoDropped: (ScoDropEvent) -> Unit) {
@@ -257,16 +282,19 @@ class BluetoothAudioRouter internal constructor(
                 ContextCompat.RECEIVER_EXPORTED,
             )
             scoStateReceiver = receiver
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && audioManager != null) {
-                commDeviceObserverHandle = Api31CommDeviceObserver.register(
-                    audioManager = audioManager,
-                    executor = ContextCompat.getMainExecutor(ctx),
-                ) { deviceType ->
-                    handleCommunicationDeviceChanged(deviceType)
-                }
-            }
             monitorsRegistered = true
+
+            val mgr = audioManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && mgr != null) {
+                commDeviceObserverHandle = runCatching {
+                    Api31CommDeviceObserver.register(
+                        audioManager = mgr,
+                        executor = ContextCompat.getMainExecutor(ctx),
+                    ) { deviceType ->
+                        handleCommunicationDeviceChanged(deviceType)
+                    }
+                }.getOrNull()
+            }
         }
     }
 
@@ -292,8 +320,14 @@ class BluetoothAudioRouter internal constructor(
         }
     }
 
-    internal fun handleAudioFocusChange(focusChange: Int) {
+    internal fun handleAudioFocusChange(
+        focusChange: Int,
+        expectedFocusGeneration: Long? = null,
+    ) {
         synchronized(lock) {
+            if (expectedFocusGeneration != null && expectedFocusGeneration != focusGeneration) {
+                return
+            }
             when (focusChange) {
                 AudioManager.AUDIOFOCUS_LOSS,
                 AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
@@ -326,11 +360,13 @@ class BluetoothAudioRouter internal constructor(
             dropReportedForCurrentPin = true
             val btAvailable = platform.isScoAvailable()
             val interrupted = audioFocusInterrupted || isCallAudioMode(platform.getMode())
+            val generation = pinGeneration
             clearActiveScoFlagsLocked()
             eventToEmit = ScoDropEvent(
                 source = ScoDropSource.COMMUNICATION_DEVICE,
                 btScoStillAvailable = btAvailable,
                 interruptedByFocusOrCall = interrupted,
+                pinGeneration = generation,
             )
         }
         onScoDroppedListener?.invoke(eventToEmit)
@@ -361,7 +397,7 @@ class BluetoothAudioRouter internal constructor(
                         scoConfirmedFromEvent = false
                         return null
                     }
-                    if (!scoConfirmedActive && previousState != AudioManager.SCO_AUDIO_STATE_CONNECTED) {
+                    if (!scoConfirmedActive) {
                         return null
                     }
                     if (!scoConfirmedFromEvent && isWithinSettleWindowLocked()) {
@@ -374,11 +410,13 @@ class BluetoothAudioRouter internal constructor(
                     dropReportedForCurrentPin = true
                     val btAvailable = platform.isScoAvailable()
                     val interrupted = audioFocusInterrupted || isCallAudioMode(platform.getMode())
+                    val generation = pinGeneration
                     clearActiveScoFlagsLocked()
                     eventToEmit = ScoDropEvent(
                         source = ScoDropSource.SCO_AUDIO_BROADCAST,
                         btScoStillAvailable = btAvailable,
                         interruptedByFocusOrCall = interrupted,
+                        pinGeneration = generation,
                     )
                 }
 
@@ -392,16 +430,19 @@ class BluetoothAudioRouter internal constructor(
     private fun requestTransientFocusLocked(
         forCommunication: Boolean,
         onAudioFocusChange: (Int) -> Unit,
-    ): Boolean = platform.requestTransientFocus(forCommunication) { focusChange ->
-        handleAudioFocusChange(focusChange)
-        onAudioFocusChange(focusChange)
+    ): Boolean {
+        val gen = ++focusGeneration
+        return platform.requestTransientFocus(forCommunication) { focusChange ->
+            handleAudioFocusChange(focusChange, expectedFocusGeneration = gen)
+            onAudioFocusChange(focusChange)
+        }
     }
 
     private fun pinBluetoothScoLocked(): Boolean {
         val alreadyOnSco = if (platform.sdkInt >= Build.VERSION_CODES.S) {
             platform.getCurrentCommunicationDeviceType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
         } else {
-            legacyScoStarted
+            legacyScoStarted && scoConfirmedActive
         }
 
         if (previousAudioMode == null) {
@@ -472,7 +513,7 @@ class BluetoothAudioRouter internal constructor(
             audioManager: AudioManager,
             executor: java.util.concurrent.Executor,
             onDeviceTypeChanged: (Int?) -> Unit,
-        ): AudioManager.OnCommunicationDeviceChangedListener {
+        ): Any {
             val listener = AudioManager.OnCommunicationDeviceChangedListener { device ->
                 onDeviceTypeChanged(device?.type)
             }

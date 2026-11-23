@@ -117,12 +117,41 @@ internal class AgentTurnRunner(
     val isPlaybackActive: Boolean
         get() = synchronized(turnLock) { playbackJob?.isActive == true }
 
-    fun finalizeQuickTranscript(rawTranscript: String) {
+    suspend fun finalizeQuickTranscript(
+        serverId: String,
+        serverUrl: String,
+        sessionKey: String,
+        pinnedSession: PinnedSession,
+        rawTranscript: String,
+    ) {
+        val trimmedRaw = rawTranscript.trim()
+        val finalQuick = if (tokenStore.getEffectiveQuickTranscriptCleanup(serverId)) {
+            val cleanupResult = promptOrganizer.cleanQuickTranscript(
+                serverUrl = serverUrl,
+                rawTranscript = trimmedRaw,
+                sessionLabel = PttForegroundService.formatSpeechSessionLabel(pinnedSession),
+            )
+            voiceUxLogger.log(
+                category = VoiceUxLogger.CAT_ORGANIZE,
+                event = "quick_cleanup",
+                sessionKey = sessionKey,
+                metrics = mapOf(
+                    "latencyMs" to cleanupResult.latencyMs,
+                    "timedOut" to cleanupResult.timedOut,
+                    "fallbackUsed" to cleanupResult.fallbackUsed,
+                    "inputChars" to trimmedRaw.length,
+                    "outputChars" to cleanupResult.text.length,
+                ),
+            )
+            cleanupResult.text.ifBlank { trimmedRaw }
+        } else {
+            trimmedRaw
+        }
+
         if (currentState() != PttState.TRANSCRIBING_SEND) {
             return
         }
 
-        val finalQuick = rawTranscript.trim()
         setPendingQuickTranscript(finalQuick)
         updateLastTranscript(finalQuick)
         syncActiveBubble(null)
