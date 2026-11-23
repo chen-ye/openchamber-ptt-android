@@ -4,12 +4,13 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.media.MediaPlayer
 import android.os.Build
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
-import java.io.File
+import com.openchamber.ptt.audio.AudioCodecDecoder
+import com.openchamber.ptt.audio.AudioOutputCoordinator
+import com.openchamber.ptt.audio.AudioPreroll
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -30,9 +31,6 @@ import kotlin.coroutines.resumeWithException
 
 internal interface PcmTrackPlayer {
     suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean = false)
-    suspend fun playEncoded(bytes: ByteArray, useCommunicationUsage: Boolean = false) {
-        throw UnsupportedOperationException("Encoded audio playback is not supported by this player")
-    }
     fun stopNow()
 }
 
@@ -56,6 +54,7 @@ data class TtsSpeakStats(
     val spokenChars: Int,
     val engine: TtsEngine,
     val kind: String = "reply",
+    val prerollMs: Int = 0,
 )
 
 class TtsPlayer internal constructor(
@@ -69,6 +68,10 @@ class TtsPlayer internal constructor(
     private val openAiVoiceProvider: () -> String = { VoicePipelineDefaults.DEFAULT_OPENAI_VOICE },
     private val inputModeProvider: () -> TtsInputMode = { TtsInputMode.SUMMARIZED },
     private val detailLevelProvider: () -> SpokenDetailLevel = { SpokenDetailLevel.BALANCED },
+    private val encodedAudioDecoder: (ByteArray, String?) -> WavAudio = { bytes, contentType ->
+        AudioCodecDecoder.decodeEncodedBytes(bytes, contentType).toWavAudio()
+    },
+    private val audioOutputCoordinator: AudioOutputCoordinator? = null,
     private val onStatusEvent: (String) -> Unit = {},
     private val onSpokenTextSynthesized: ((String) -> Unit)? = null,
     private val onSpeakStats: ((TtsSpeakStats) -> Unit)? = null,
@@ -83,12 +86,13 @@ class TtsPlayer internal constructor(
         systemVoiceNameProvider: () -> String? = { null },
         inputModeProvider: () -> TtsInputMode = { TtsInputMode.SUMMARIZED },
         detailLevelProvider: () -> SpokenDetailLevel = { SpokenDetailLevel.BALANCED },
+        audioOutputCoordinator: AudioOutputCoordinator? = null,
         onStatusEvent: (String) -> Unit = {},
         onSpokenTextSynthesized: ((String) -> Unit)? = null,
         onSpeakStats: ((TtsSpeakStats) -> Unit)? = null,
     ) : this(
         ttsClient = ttsClient,
-        pcmPlayerFactory = { AndroidAudioTrackPlayer(context.applicationContext) },
+        pcmPlayerFactory = { AndroidAudioTrackPlayer() },
         systemTtsSpeaker = AndroidTextToSpeechSpeaker(
             appContext = context.applicationContext,
             preferredVoiceNameProvider = systemVoiceNameProvider,
@@ -100,6 +104,7 @@ class TtsPlayer internal constructor(
         openAiVoiceProvider = openAiVoiceProvider,
         inputModeProvider = inputModeProvider,
         detailLevelProvider = detailLevelProvider,
+        audioOutputCoordinator = audioOutputCoordinator,
         onStatusEvent = onStatusEvent,
         onSpokenTextSynthesized = onSpokenTextSynthesized,
         onSpeakStats = onSpeakStats,
@@ -153,6 +158,7 @@ class TtsPlayer internal constructor(
             var lastStatusCode: Int? = null
             var played = false
             var usedEngine: TtsEngine? = null
+            var usedPrerollMs = 0
 
             for (option in enabledPipeline) {
                 ensureGenerationActive(myGeneration)
@@ -162,17 +168,61 @@ class TtsPlayer internal constructor(
                         TtsEngine.MLKIT_GENAI -> {
                             val speaker = mlKitTtsSpeaker
                                 ?: throw TtsException(message = "ML Kit GenAI TTS speaker not configured")
+                            ensureGenerationActive(myGeneration)
+                            val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
+                            ensureGenerationActive(myGeneration)
                             val routeLabel = if (useComm) "SCO" else "Media"
                             onStatusEvent("ML Kit GenAI TTS ($routeLabel)")
                             if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
-                            speaker.speak(spokenText, useComm)
+                            var playbackStarted = false
+                            try {
+                                audioOutputCoordinator?.onSpeechPlaybackStarted()
+                                playbackStarted = true
+                                if (prerollMs > 0) {
+                                    val wakeupWav = AudioPreroll.createDitheredSilenceWav(
+                                        durationMs = prerollMs,
+                                        sampleRate = ON_DEVICE_PREROLL_SAMPLE_RATE_HZ,
+                                        channels = 1,
+                                    )
+                                    playParsedWav(wakeupWav, myGeneration, useComm)
+                                    ensureGenerationActive(myGeneration)
+                                }
+                                speaker.speak(spokenText, useComm)
+                            } finally {
+                                if (playbackStarted) {
+                                    audioOutputCoordinator?.onSpeechPlaybackFinished()
+                                }
+                            }
+                            usedPrerollMs = prerollMs
                             true
                         }
                         TtsEngine.ANDROID_SYSTEM -> {
+                            ensureGenerationActive(myGeneration)
+                            val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
+                            ensureGenerationActive(myGeneration)
                             val routeLabel = if (useComm) "SCO" else "Media"
                             onStatusEvent("Android System TTS ($routeLabel)")
                             if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
-                            systemTtsSpeaker.speak(spokenText, useComm)
+                            var playbackStarted = false
+                            try {
+                                audioOutputCoordinator?.onSpeechPlaybackStarted()
+                                playbackStarted = true
+                                if (prerollMs > 0) {
+                                    val wakeupWav = AudioPreroll.createDitheredSilenceWav(
+                                        durationMs = prerollMs,
+                                        sampleRate = ON_DEVICE_PREROLL_SAMPLE_RATE_HZ,
+                                        channels = 1,
+                                    )
+                                    playParsedWav(wakeupWav, myGeneration, useComm)
+                                    ensureGenerationActive(myGeneration)
+                                }
+                                systemTtsSpeaker.speak(spokenText, useComm)
+                            } finally {
+                                if (playbackStarted) {
+                                    audioOutputCoordinator?.onSpeechPlaybackFinished()
+                                }
+                            }
+                            usedPrerollMs = prerollMs
                             true
                         }
                         TtsEngine.GEMINI_BRIDGE,
@@ -185,22 +235,37 @@ class TtsPlayer internal constructor(
                             }
                             val audio = ttsClient.synthesizeWithEngine(serverUrl, spokenText, engineVoice, engine)
                             ensureGenerationActive(myGeneration)
+                            val wav = if (isRiffWav(audio.bytes)) {
+                                WavParser.parse(audio.bytes)
+                            } else {
+                                withContext(ioDispatcher) {
+                                    ensureGenerationActive(myGeneration)
+                                    encodedAudioDecoder(audio.bytes, audio.contentType)
+                                }
+                            }
+                            ensureGenerationActive(myGeneration)
+                            val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
+                            ensureGenerationActive(myGeneration)
+                            val playableWav = AudioPreroll.prependDitheredPreroll(wav, prerollMs)
                             if (notifySpokenSummary) onSpokenTextSynthesized?.invoke(spokenText)
                             val routeLabel = if (useComm) "SCO" else "Media"
-                            if (isRiffWav(audio.bytes)) {
-                                val wav = WavParser.parse(audio.bytes)
-                                ensureGenerationActive(myGeneration)
-                                val durSec = if (wav.sampleRate > 0 && wav.channels > 0 && wav.bitsPerSample > 0) {
-                                    wav.pcmData.size.toDouble() / (wav.sampleRate * wav.channels * (wav.bitsPerSample / 8))
-                                } else {
-                                    0.0
-                                }
-                                onStatusEvent("${engine.title} (${wav.sampleRate}Hz, ${"%.1f".format(durSec)}s, $routeLabel)")
-                                playParsedWav(wav, myGeneration, useComm)
+                            val durSec = if (wav.sampleRate > 0 && wav.channels > 0 && wav.bitsPerSample > 0) {
+                                wav.pcmData.size.toDouble() / (wav.sampleRate * wav.channels * (wav.bitsPerSample / 8))
                             } else {
-                                onStatusEvent("${engine.title} (${audio.contentType}, $routeLabel)")
-                                playEncodedAudio(audio.bytes, myGeneration, useComm)
+                                0.0
                             }
+                            onStatusEvent("${engine.title} (${wav.sampleRate}Hz, ${"%.1f".format(durSec)}s, $routeLabel)")
+                            var playbackStarted = false
+                            try {
+                                audioOutputCoordinator?.onSpeechPlaybackStarted()
+                                playbackStarted = true
+                                playParsedWav(playableWav, myGeneration, useComm)
+                            } finally {
+                                if (playbackStarted) {
+                                    audioOutputCoordinator?.onSpeechPlaybackFinished()
+                                }
+                            }
+                            usedPrerollMs = prerollMs
                             true
                         }
                     }
@@ -238,6 +303,7 @@ class TtsPlayer internal constructor(
                         spokenChars = spokenText.length,
                         engine = usedEngine,
                         kind = kind,
+                        prerollMs = usedPrerollMs,
                     ),
                 )
             }
@@ -249,9 +315,20 @@ class TtsPlayer internal constructor(
     suspend fun playWav(wavBytes: ByteArray) {
         val wav = WavParser.parse(wavBytes)
         val myGeneration = beginPlaybackSession()
+        var playbackStarted = false
         try {
-            playParsedWav(wav, myGeneration, useCommunicationUsage())
+            val useComm = useCommunicationUsage()
+            ensureGenerationActive(myGeneration)
+            val prerollMs = audioOutputCoordinator?.awaitCueDrainAndResolvePrerollMs(useComm) ?: 0
+            ensureGenerationActive(myGeneration)
+            val playableWav = AudioPreroll.prependDitheredPreroll(wav, prerollMs)
+            audioOutputCoordinator?.onSpeechPlaybackStarted()
+            playbackStarted = true
+            playParsedWav(playableWav, myGeneration, useComm)
         } finally {
+            if (playbackStarted) {
+                audioOutputCoordinator?.onSpeechPlaybackFinished()
+            }
             endPlaybackSession(myGeneration)
         }
     }
@@ -279,33 +356,6 @@ class TtsPlayer internal constructor(
         stop()
         runCatching { mlKitTtsSpeaker?.shutdown() }
         runCatching { systemTtsSpeaker.shutdown() }
-    }
-
-    private suspend fun playEncodedAudio(
-        bytes: ByteArray,
-        myGeneration: Long,
-        useComm: Boolean,
-    ) {
-        if (bytes.isEmpty()) return
-
-        val player = pcmPlayerFactory()
-        synchronized(lock) {
-            if (released || playbackGeneration != myGeneration) {
-                throw CancellationException("TTS stopped")
-            }
-            activeTrackPlayer = player
-        }
-        try {
-            withContext(ioDispatcher) {
-                player.playEncoded(bytes, useComm)
-            }
-        } finally {
-            synchronized(lock) {
-                if (activeTrackPlayer === player) {
-                    activeTrackPlayer = null
-                }
-            }
-        }
     }
 
     private suspend fun playParsedWav(
@@ -377,6 +427,7 @@ class TtsPlayer internal constructor(
     }
     companion object {
         private const val TAG = "TtsPlayer"
+        private const val ON_DEVICE_PREROLL_SAMPLE_RATE_HZ = 24_000
 
         suspend fun querySystemTtsVoices(context: Context): List<SystemTtsVoiceSummary> =
             withContext(Dispatchers.IO) {
@@ -438,13 +489,10 @@ class TtsPlayer internal constructor(
     }
 }
 
-private class AndroidAudioTrackPlayer(
-    private val appContext: Context,
-) : PcmTrackPlayer {
+private class AndroidAudioTrackPlayer : PcmTrackPlayer {
     private val stopped = AtomicBoolean(false)
     private val trackLock = Any()
     private var audioTrack: AudioTrack? = null
-    private var mediaPlayer: MediaPlayer? = null
 
     override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
         if (stopped.get() || wav.pcmData.isEmpty()) return
@@ -551,77 +599,13 @@ private class AndroidAudioTrackPlayer(
         }
     }
 
-    override suspend fun playEncoded(bytes: ByteArray, useCommunicationUsage: Boolean) {
-        if (stopped.get() || bytes.isEmpty()) return
-
-        val tempFile = File.createTempFile("tts_", ".audio", appContext.cacheDir)
-        try {
-            tempFile.writeBytes(bytes)
-            val completion = CompletableDeferred<Unit>()
-            val attributes = AudioAttributes.Builder()
-                .setUsage(
-                    if (useCommunicationUsage) {
-                        AudioAttributes.USAGE_VOICE_COMMUNICATION
-                    } else {
-                        AudioAttributes.USAGE_MEDIA
-                    },
-                )
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-
-            val mp = MediaPlayer().apply {
-                setAudioAttributes(attributes)
-                setDataSource(tempFile.absolutePath)
-                setOnCompletionListener { completion.complete(Unit) }
-                setOnErrorListener { _, what, extra ->
-                    completion.completeExceptionally(
-                        IllegalStateException("MediaPlayer error ($what/$extra)"),
-                    )
-                    true
-                }
-                prepare()
-            }
-
-            synchronized(trackLock) {
-                if (stopped.get()) {
-                    runCatching { mp.release() }
-                    throw CancellationException("TTS stopped")
-                }
-                mediaPlayer = mp
-            }
-
-            try {
-                mp.start()
-                completion.await()
-            } finally {
-                synchronized(trackLock) {
-                    if (mediaPlayer === mp) {
-                        mediaPlayer = null
-                    }
-                }
-                runCatching {
-                    if (mp.isPlaying) mp.stop()
-                }
-                runCatching { mp.release() }
-            }
-        } finally {
-            runCatching { tempFile.delete() }
-        }
-    }
-
     override fun stopNow() {
         stopped.set(true)
-        val (track, mp) = synchronized(trackLock) { audioTrack to mediaPlayer }
+        val track = synchronized(trackLock) { audioTrack }
         track?.let {
             runCatching { it.pause() }
             runCatching { it.flush() }
             runCatching { it.stop() }
-        }
-        mp?.let {
-            runCatching {
-                if (it.isPlaying) it.stop()
-            }
-            runCatching { it.release() }
         }
     }
 

@@ -5,14 +5,8 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.util.Log
 import androidx.annotation.RawRes
 import com.openchamber.ptt.R
-import java.io.ByteArrayOutputStream
-import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -55,6 +49,8 @@ class EarconPlayer internal constructor(
     @Suppress("unused") private val streamType: Int = AudioManager.STREAM_MUSIC,
     private val volumePercent: Int = DEFAULT_VOLUME_PERCENT,
     private val useCommunicationUsage: () -> Boolean = { false },
+    private val onCuePlaybackStarted: ((durationMs: Int) -> Unit)? = null,
+    private val onCuePlaybackStopped: (() -> Unit)? = null,
     private val clipObserver: ((Earcon, DecodedClip) -> Unit)? = null,
     private val playbackSpecObserver: ((Earcon, PlaybackSpec) -> Unit)? = null,
 ) {
@@ -63,11 +59,15 @@ class EarconPlayer internal constructor(
         streamType: Int = AudioManager.STREAM_MUSIC,
         volumePercent: Int = DEFAULT_VOLUME_PERCENT,
         useCommunicationUsage: () -> Boolean = { false },
+        onCuePlaybackStarted: ((durationMs: Int) -> Unit)? = null,
+        onCuePlaybackStopped: (() -> Unit)? = null,
     ) : this(
         context = context,
         streamType = streamType,
         volumePercent = volumePercent,
         useCommunicationUsage = useCommunicationUsage,
+        onCuePlaybackStarted = onCuePlaybackStarted,
+        onCuePlaybackStopped = onCuePlaybackStopped,
         clipObserver = null,
         playbackSpecObserver = null,
     )
@@ -89,6 +89,9 @@ class EarconPlayer internal constructor(
     }
     private var activeTrack: AudioTrack? = null
     private var activeReleaseFuture: ScheduledFuture<*>? = null
+    private var activeEarcon: Earcon? = null
+    private var stopGeneration: Long = 0L
+    private var cueActive: Boolean = false
     private val decodedClips = ConcurrentHashMap<Earcon, DecodedClip>()
 
     @Volatile
@@ -106,19 +109,30 @@ class EarconPlayer internal constructor(
 
     fun play(earcon: Earcon) {
         val useCommunication = useCommunicationUsage()
+        var wasActive = false
+        var myStopGeneration = 0L
         val exec = synchronized(lock) {
             if (released) return
-            stopActiveTrackLocked()
+            wasActive = stopActiveTrackLocked()
+            activeEarcon = earcon
+            myStopGeneration = stopGeneration
             playExecutor
         } ?: return
 
+        if (wasActive) {
+            onCuePlaybackStopped?.invoke()
+        }
+
         exec.execute {
-            if (released) return@execute
+            val stillValid = synchronized(lock) { !released && stopGeneration == myStopGeneration }
+            if (!stillValid) return@execute
             val clip = decodedClips[earcon] ?: appContext?.let { ctx ->
-                decodeRawOgg(ctx, rawResFor(earcon))?.also { decodedClips.putIfAbsent(earcon, it) }
+                decodeRawOgg(ctx, rawResFor(earcon), myStopGeneration)?.also { decodedClips.putIfAbsent(earcon, it) }
             } ?: synthesizeFallbackClip(earcon)
+            val activeForPlay = synchronized(lock) { !released && stopGeneration == myStopGeneration }
+            if (!activeForPlay) return@execute
             clipObserver?.invoke(earcon, clip)
-            playClip(earcon, clip, useCommunication)
+            playClip(earcon, clip, useCommunication, myStopGeneration)
         }
     }
 
@@ -128,19 +142,48 @@ class EarconPlayer internal constructor(
         return true
     }
 
+    fun stop() {
+        val wasActive = synchronized(lock) {
+            stopGeneration += 1L
+            stopActiveTrackLocked()
+        }
+        if (wasActive) {
+            onCuePlaybackStopped?.invoke()
+        }
+    }
+
+    fun stopUnless(keep: Earcon) {
+        val wasActive = synchronized(lock) {
+            if (activeEarcon == keep) {
+                false
+            } else {
+                stopGeneration += 1L
+                stopActiveTrackLocked()
+            }
+        }
+        if (wasActive) {
+            onCuePlaybackStopped?.invoke()
+        }
+    }
+
     fun release() {
         val preloadToShutdown: ExecutorService?
         val playToShutdown: ExecutorService?
         val schedulerToShutdown: ScheduledExecutorService?
+        val wasActive: Boolean
         synchronized(lock) {
             released = true
+            stopGeneration += 1L
             preloadToShutdown = preloadExecutor
             preloadExecutor = null
             playToShutdown = playExecutor
             playExecutor = null
             schedulerToShutdown = releaseScheduler
             releaseScheduler = null
-            stopActiveTrackLocked()
+            wasActive = stopActiveTrackLocked()
+        }
+        if (wasActive) {
+            onCuePlaybackStopped?.invoke()
         }
         runCatching { preloadToShutdown?.shutdownNow() }
         runCatching { playToShutdown?.shutdownNow() }
@@ -148,15 +191,19 @@ class EarconPlayer internal constructor(
         decodedClips.clear()
     }
 
-    private fun stopActiveTrackLocked() {
+    private fun stopActiveTrackLocked(): Boolean {
         activeReleaseFuture?.cancel(false)
         activeReleaseFuture = null
+        activeEarcon = null
         val prev = activeTrack
         activeTrack = null
+        val wasCueActive = cueActive
+        cueActive = false
         if (prev != null) {
             runCatching { prev.stop() }
             runCatching { prev.release() }
         }
+        return wasCueActive
     }
 
     private fun synthesizeFallbackClip(earcon: Earcon): DecodedClip {
@@ -190,6 +237,7 @@ class EarconPlayer internal constructor(
         earcon: Earcon,
         clip: DecodedClip,
         useCommunication: Boolean,
+        myStopGeneration: Long,
     ) {
         if (clip.pcmBytes.isEmpty()) return
         val spec = playbackSpecFor(useCommunication)
@@ -219,14 +267,18 @@ class EarconPlayer internal constructor(
                 .build()
         }.getOrNull() ?: return
 
+        var prevWasActive = false
         val scheduler = synchronized(lock) {
-            if (released) {
+            if (released || stopGeneration != myStopGeneration) {
                 runCatching { track.release() }
                 return
             }
-            stopActiveTrackLocked()
+            prevWasActive = stopActiveTrackLocked()
             activeTrack = track
             releaseScheduler
+        }
+        if (prevWasActive) {
+            onCuePlaybackStopped?.invoke()
         }
 
         val started = try {
@@ -250,18 +302,48 @@ class EarconPlayer internal constructor(
             return
         }
 
+        val shouldNotifyStart = synchronized(lock) {
+            if (!released && activeTrack === track && stopGeneration == myStopGeneration) {
+                cueActive = true
+                true
+            } else {
+                false
+            }
+        }
+        if (shouldNotifyStart) {
+            onCuePlaybackStarted?.invoke(clip.durationMs)
+        } else {
+            synchronized(lock) {
+                if (activeTrack === track) {
+                    activeTrack = null
+                }
+            }
+            runCatching { track.stop() }
+            runCatching { track.release() }
+            return
+        }
+
         val delayMs = clip.durationMs.toLong().coerceAtLeast(40L) + 40L
         val future = runCatching {
             scheduler.schedule(
                 {
-                    synchronized(lock) {
+                    val shouldNotifyStop = synchronized(lock) {
                         if (activeTrack === track) {
                             activeTrack = null
                             activeReleaseFuture = null
+                            activeEarcon = null
+                            val wasCueActive = cueActive
+                            cueActive = false
+                            wasCueActive
+                        } else {
+                            false
                         }
                     }
                     runCatching { track.stop() }
                     runCatching { track.release() }
+                    if (shouldNotifyStop) {
+                        onCuePlaybackStopped?.invoke()
+                    }
                 },
                 delayMs,
                 TimeUnit.MILLISECONDS,
@@ -277,133 +359,24 @@ class EarconPlayer internal constructor(
         }
     }
 
-    private fun decodeRawOgg(context: Context, @RawRes resId: Int): DecodedClip? {
-        val extractor = MediaExtractor()
-        var codec: MediaCodec? = null
-        return try {
-            context.resources.openRawResourceFd(resId).use { afd ->
-                extractor.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-            }
-            var audioTrackIndex = -1
-            var inputFormat: MediaFormat? = null
-            for (i in 0 until extractor.trackCount) {
-                val fmt = extractor.getTrackFormat(i)
-                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
-                if (mime.startsWith("audio/")) {
-                    audioTrackIndex = i
-                    inputFormat = fmt
-                    break
-                }
-            }
-            if (audioTrackIndex < 0 || inputFormat == null) return null
-            val mime = inputFormat.getString(MediaFormat.KEY_MIME) ?: return null
-            extractor.selectTrack(audioTrackIndex)
-
-            var sampleRate = if (inputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
-                inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-            } else {
-                44_100
-            }
-            var channelCount = if (inputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-            } else {
-                1
-            }
-
-            codec = MediaCodec.createDecoderByType(mime)
-            codec.configure(inputFormat, null, null, 0)
-            codec.start()
-
-            val pcmOut = ByteArrayOutputStream()
-            val bufferInfo = MediaCodec.BufferInfo()
-            var sawInputEos = false
-            var sawOutputEos = false
-
-            while (!sawOutputEos && !released) {
-                if (!sawInputEos) {
-                    val inIdx = codec.dequeueInputBuffer(10_000L)
-                    if (inIdx >= 0) {
-                        val inputBuffer = codec.getInputBuffer(inIdx)
-                        if (inputBuffer != null) {
-                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                            if (sampleSize < 0) {
-                                codec.queueInputBuffer(
-                                    inIdx,
-                                    0,
-                                    0,
-                                    0L,
-                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM,
-                                )
-                                sawInputEos = true
-                            } else {
-                                val pts = extractor.sampleTime.coerceAtLeast(0L)
-                                codec.queueInputBuffer(inIdx, 0, sampleSize, pts, 0)
-                                extractor.advance()
-                            }
-                        }
-                    }
-                }
-
-                val outIdx = codec.dequeueOutputBuffer(bufferInfo, 10_000L)
-                when {
-                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        val outFmt = codec.outputFormat
-                        if (outFmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
-                            sampleRate = outFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                        }
-                        if (outFmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                            channelCount = outFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        }
-                    }
-                    outIdx >= 0 -> {
-                        val outBuffer = codec.getOutputBuffer(outIdx)
-                        if (outBuffer != null && bufferInfo.size > 0) {
-                            outBuffer.position(bufferInfo.offset)
-                            outBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                            val chunk = ByteArray(bufferInfo.size)
-                            outBuffer.get(chunk)
-                            // Ensure little-endian PCM16 order if platform buffer used big-endian
-                            if (outBuffer.order() == ByteOrder.BIG_ENDIAN) {
-                                var i = 0
-                                while (i + 1 < chunk.size) {
-                                    val tmp = chunk[i]
-                                    chunk[i] = chunk[i + 1]
-                                    chunk[i + 1] = tmp
-                                    i += 2
-                                }
-                            }
-                            pcmOut.write(chunk)
-                        }
-                        codec.releaseOutputBuffer(outIdx, false)
-                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            sawOutputEos = true
-                        }
-                    }
-                }
-            }
-
-            val pcmBytes = pcmOut.toByteArray()
-            if (pcmBytes.isEmpty()) return null
-            val bytesPerSecond = sampleRate * channelCount.coerceAtLeast(1) * 2
-            val durationMs = if (bytesPerSecond > 0) {
-                ((pcmBytes.size * 1000L) / bytesPerSecond).toInt().coerceAtLeast(20)
-            } else {
-                250
-            }
-            DecodedClip(
-                pcmBytes = pcmBytes,
-                sampleRateHz = sampleRate,
-                channelCount = channelCount.coerceIn(1, 2),
-                durationMs = durationMs,
-            )
-        } catch (t: Throwable) {
-            runCatching { Log.w(TAG, "Failed decoding earcon raw resource $resId; using fallback tone", t) }
-            null
-        } finally {
-            runCatching { codec?.stop() }
-            runCatching { codec?.release() }
-            runCatching { extractor.release() }
-        }
+    private fun decodeRawOgg(
+        context: Context,
+        @RawRes resId: Int,
+        expectedStopGeneration: Long? = null,
+    ): DecodedClip? {
+        val pcmClip = AudioCodecDecoder.decodeRawResource(
+            context = context,
+            resId = resId,
+            shouldStop = {
+                released || (expectedStopGeneration != null && synchronized(lock) { stopGeneration != expectedStopGeneration })
+            },
+        ) ?: return null
+        return DecodedClip(
+            pcmBytes = pcmClip.pcmBytes,
+            sampleRateHz = pcmClip.sampleRateHz,
+            channelCount = pcmClip.channelCount.coerceIn(1, 2),
+            durationMs = pcmClip.durationMs.coerceAtLeast(20),
+        )
     }
 
     internal data class DecodedClip(
@@ -424,7 +397,6 @@ class EarconPlayer internal constructor(
     )
 
     companion object {
-        private const val TAG = "EarconPlayer"
         private const val DEFAULT_VOLUME_PERCENT = 85
         private const val SYNTH_SAMPLE_RATE_HZ = 16_000
 

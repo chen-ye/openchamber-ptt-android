@@ -24,6 +24,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import androidx.media.session.MediaButtonReceiver
+import com.openchamber.ptt.audio.AudioOutputCoordinator
 import com.openchamber.ptt.audio.BluetoothAudioRouter
 import com.openchamber.ptt.audio.Earcon
 import com.openchamber.ptt.audio.EarconPlayer
@@ -111,6 +112,7 @@ class PttForegroundService : Service() {
             _pinBluetoothSco.value = value
         }
 
+    private lateinit var audioOutputCoordinator: AudioOutputCoordinator
     private lateinit var earconPlayer: EarconPlayer
     private lateinit var bluetoothAudioRouter: BluetoothAudioRouter
     private lateinit var gestureDetector: MediaButtonGestureDetector
@@ -148,9 +150,12 @@ class PttForegroundService : Service() {
         serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
         bluetoothAudioRouter = BluetoothAudioRouter(this)
+        audioOutputCoordinator = AudioOutputCoordinator()
         earconPlayer = EarconPlayer(
             context = applicationContext,
             useCommunicationUsage = { bluetoothAudioRouter.isScoPinned },
+            onCuePlaybackStarted = { durationMs -> audioOutputCoordinator.onCueStarted(durationMs) },
+            onCuePlaybackStopped = { audioOutputCoordinator.onCueStopped() },
         )
         val notificationManager = getSystemService(NotificationManager::class.java)
         notificationBuilder = PttNotificationBuilder(this, notificationManager)
@@ -178,6 +183,7 @@ class PttForegroundService : Service() {
             systemVoiceNameProvider = { tokenStore.getSystemTtsVoice() },
             inputModeProvider = { tokenStore.getEffectiveTtsInputMode() },
             detailLevelProvider = { tokenStore.getEffectiveSpokenDetailLevel() },
+            audioOutputCoordinator = audioOutputCoordinator,
             onStatusEvent = { info -> _lastTtsInfo.value = info },
             onSpokenTextSynthesized = { spoken ->
                 val msgId = activeSpokenMessageId ?: sessionResponseController.feedState.value.speakingMessageId
@@ -202,6 +208,7 @@ class PttForegroundService : Service() {
                         "rawChars" to stats.rawChars,
                         "spokenChars" to stats.spokenChars,
                         "engine" to stats.engine.name,
+                        "prerollMs" to stats.prerollMs,
                     ),
                 )
             },
@@ -1043,7 +1050,12 @@ class PttForegroundService : Service() {
                 PttEffect.ReleaseWakeAndWifiLocks -> releaseWakeAndWifiLocks()
                 PttEffect.PinBluetoothAudio -> bluetoothAudioRouter.configureForPtt(pinSco = pinBluetoothSco)
                 PttEffect.ReleaseBluetoothAudio -> bluetoothAudioRouter.release()
-                PttEffect.StartRecording -> startBurstRecording()
+                PttEffect.StartRecording -> {
+                    if (::earconPlayer.isInitialized) {
+                        earconPlayer.stopUnless(Earcon.REC_START)
+                    }
+                    startBurstRecording()
+                }
                 PttEffect.StopRecording -> audioBurstRecorder.requestStop()
                 PttEffect.DiscardRecording -> cancelBurstRecording()
                 PttEffect.StopTts -> {
@@ -1150,8 +1162,18 @@ class PttForegroundService : Service() {
         if (::sessionResponseController.isInitialized) {
             sessionResponseController.setSpeakingMessage(null)
         }
-        if (::ttsPlayer.isInitialized) {
-            ttsPlayer.stop()
+        if (::audioOutputCoordinator.isInitialized) {
+            audioOutputCoordinator.stopAll(
+                earconPlayer = if (::earconPlayer.isInitialized) earconPlayer else null,
+                ttsPlayer = if (::ttsPlayer.isInitialized) ttsPlayer else null,
+            )
+        } else {
+            if (::earconPlayer.isInitialized) {
+                earconPlayer.stop()
+            }
+            if (::ttsPlayer.isInitialized) {
+                ttsPlayer.stop()
+            }
         }
     }
 

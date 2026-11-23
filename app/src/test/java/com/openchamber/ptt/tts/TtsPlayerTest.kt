@@ -1,5 +1,6 @@
 package com.openchamber.ptt.tts
 
+import com.openchamber.ptt.audio.AudioOutputCoordinator
 import com.openchamber.ptt.network.OpenChamberHttp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -476,5 +477,139 @@ class TtsPlayerTest {
         assertEquals(1, stats.size)
         assertEquals(TtsInputMode.RAW, stats.first().inputMode)
         assertEquals(TtsEngine.GEMINI_BRIDGE, stats.first().engine)
+        assertEquals(0, stats.first().prerollMs)
+    }
+
+    @Test
+    fun `OPENAI_CLOUD decodes non-WAV audio_mpeg via encodedAudioDecoder with cold-sink preroll then warm follow-up`() = runTest {
+        val fakeMp3Bytes = byteArrayOf(0x49, 0x44, 0x33, 0x03, 0x00, 0x01, 0x02, 0x03)
+        val decodedPcm = byteArrayOf(0x10, 0x20, 0x30, 0x40, 0x50, 0x60)
+        val decodedWav = WavAudio(
+            sampleRate = 24_000,
+            channels = 1,
+            bitsPerSample = 16,
+            pcmData = decodedPcm,
+            audioFormat = WavAudio.FORMAT_PCM,
+        )
+
+        repeat(2) {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setHeader("Content-Type", "audio/mpeg")
+                    .setBody(Buffer().write(fakeMp3Bytes)),
+            )
+        }
+
+        val playedWavs = mutableListOf<WavAudio>()
+        val decodedArgs = mutableListOf<Pair<ByteArray, String?>>()
+        val stats = mutableListOf<TtsSpeakStats>()
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playedWavs += wav
+            }
+
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) = Unit
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        var nowMs = 10_000L
+        val coordinator = AudioOutputCoordinator(clockElapsedMs = { nowMs })
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.OPENAI_CLOUD, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+            encodedAudioDecoder = { bytes, contentType ->
+                decodedArgs += bytes to contentType
+                decodedWav
+            },
+            audioOutputCoordinator = coordinator,
+            onSpeakStats = { stats += it },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+
+        // First cold utterance -> 160ms preroll prepended
+        player.speak(baseUrl, "First cold utterance.")
+        nowMs += 200L
+        // Immediate warm follow-up -> 0ms preroll
+        player.speak(baseUrl, "Second warm utterance.")
+
+        assertEquals(2, decodedArgs.size)
+        assertArrayEquals(fakeMp3Bytes, decodedArgs[0].first)
+        assertEquals("audio/mpeg", decodedArgs[0].second)
+
+        assertEquals(2, playedWavs.size)
+        val expectedPrerollBytes = (24_000 * 160 / 1000) * 1 * 2
+        assertEquals(expectedPrerollBytes + decodedPcm.size, playedWavs[0].pcmData.size)
+        assertArrayEquals(
+            decodedPcm,
+            playedWavs[0].pcmData.copyOfRange(expectedPrerollBytes, playedWavs[0].pcmData.size),
+        )
+        assertArrayEquals(decodedPcm, playedWavs[1].pcmData)
+
+        assertEquals(2, stats.size)
+        assertEquals(160, stats[0].prerollMs)
+        assertEquals(0, stats[1].prerollMs)
+    }
+
+    @Test
+    fun `on-device engine plays 160ms wakeup buffer when cold and skips when warm`() = runTest {
+        val playedWakeups = mutableListOf<WavAudio>()
+        val spokenTexts = mutableListOf<String>()
+        val stats = mutableListOf<TtsSpeakStats>()
+
+        val fakeTrack = object : PcmTrackPlayer {
+            override suspend fun play(wav: WavAudio, useCommunicationUsage: Boolean) {
+                playedWakeups += wav
+            }
+
+            override fun stopNow() = Unit
+        }
+        val fakeSystemTts = object : SystemTtsSpeaker {
+            override suspend fun speak(text: String, useCommunicationUsage: Boolean) {
+                spokenTexts += text
+            }
+
+            override fun stop() = Unit
+            override fun shutdown() = Unit
+        }
+
+        var nowMs = 5_000L
+        val coordinator = AudioOutputCoordinator(clockElapsedMs = { nowMs })
+        val player = TtsPlayer(
+            ttsClient = TtsClient(OpenChamberHttp.createClient()),
+            pcmPlayerFactory = { fakeTrack },
+            systemTtsSpeaker = fakeSystemTts,
+            ioDispatcher = Dispatchers.Unconfined,
+            pipelineProvider = { listOf(TtsEngineOption(TtsEngine.ANDROID_SYSTEM, enabled = true)) },
+            inputModeProvider = { TtsInputMode.RAW },
+            audioOutputCoordinator = coordinator,
+            onSpeakStats = { stats += it },
+        )
+
+        val baseUrl = server.url("/").toString().trimEnd('/')
+        player.speak(baseUrl, "Cold system TTS.")
+        nowMs += 100L
+        player.speak(baseUrl, "Warm system TTS.")
+
+        assertEquals(listOf("Cold system TTS.", "Warm system TTS."), spokenTexts)
+        assertEquals(1, playedWakeups.size)
+        assertEquals(24_000, playedWakeups[0].sampleRate)
+        assertEquals(1, playedWakeups[0].channels)
+        assertEquals(16, playedWakeups[0].bitsPerSample)
+        assertEquals((24_000 * 160 / 1000) * 2, playedWakeups[0].pcmData.size)
+
+        assertEquals(2, stats.size)
+        assertEquals(160, stats[0].prerollMs)
+        assertEquals(0, stats[1].prerollMs)
     }
 }

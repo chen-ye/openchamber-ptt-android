@@ -111,4 +111,21 @@ class EarconPlayerTest {
             player.release()
         }
     }
+
+    @Test
+    fun `public constructor accepts cue lifecycle hooks and stop is safe without active track`() {
+        val player = EarconPlayer(
+            context = null,
+            useCommunicationUsage = { false },
+            onCuePlaybackStarted = { _ -> },
+            onCuePlaybackStopped = {},
+        )
+        try {
+            player.play(Earcon.ARMED)
+            player.stop()
+            player.stop()
+        } finally {
+            player.release()
+        }
+    }
 }
